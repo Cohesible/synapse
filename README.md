@@ -34,3 +34,19 @@ irm https://synap.sh/install.ps1 | iex
 ## Getting Started
 
 See [Quick Start](./docs/getting-started.md#quick-start) for basic instructions. 
+
+
+## Attributions
+
+The core functionality of Synapse is built on top of several amazing projects:
+* [TypeScript](https://github.com/microsoft/TypeScript)
+* [esbuild](https://github.com/evanw/esbuild)
+* [Node.js](https://github.com/nodejs/node)
+* [Terraform 1.5.5](https://github.com/hashicorp/terraform/tree/v1.5.5)
+
+And it wouldn't have been possible to create Synapse without them and their contributors!
+
+Each cloud target also uses their respective SDK + Terraform provider. The AWS target uses:
+* [AWS SDK for JavaScript v3](https://github.com/aws/aws-sdk-js-v3)
+* [Terraform AWS Provider](https://github.com/hashicorp/terraform-provider-aws)
+
