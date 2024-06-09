@@ -9,9 +9,9 @@ Features:
 * Node.js compatible JavaScript runtime
 * Cloud agnostic libraries - write once, deploy anywhere
 * Deploy locally or to the cloud (only AWS at this time)
+* [A testing framework](docs/testing.md)
 * Novel programming paradigm - Resource-driven programming
     * Define and manage resources directly in your code
-* Testing framework via `synapse:test`
 
 ## Installation
 
