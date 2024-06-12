@@ -23,5 +23,7 @@ jobs:
       - run: synapse --version
       - run: cd integrations/local && synapse compile && synapse publish --local
         name: Build
+      - run: rm -rf "$SYNAPSE_INSTALL/app/packages/synapse-local"
+      - run: cp -r "$SYNAPSE_INSTALL/cache/packages/linked/synapse-local" "$SYNAPSE_INSTALL/app/packages/synapse-local"
       - run: cd test/conformance && synapse compile && synapse test && synapse destroy
         name: Test
