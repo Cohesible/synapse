@@ -1,0 +1,11 @@
+{
+    "name": "synapse-local",
+    "exports": {
+        ".": "./src/index.ts"
+    },
+    "synapse": {
+        "config": {
+            "sharedLib": true
+        }
+    }
+}

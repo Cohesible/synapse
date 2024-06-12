@@ -12,6 +12,7 @@ Features:
 * [A testing framework](docs/testing.md)
 * Novel programming paradigm - Resource-driven programming
     * Define and manage resources directly in your code
+* Fine-grained permission modeling via symbolic execution
 
 ## Installation
 
