@@ -122,7 +122,7 @@ export class Bucket implements storage.Bucket {
     public async get(key: string): Promise<Uint8Array>
     public async get(key: string, encoding: storage.Encoding): Promise<string>
     public async get(key: string, encoding?: storage.Encoding): Promise<Uint8Array | string> {
-        throw new Error('Broken')
+        throw new Error('Broken') 
     }
 
     public async put(key: string, blob: string | Uint8Array): Promise<void> {
