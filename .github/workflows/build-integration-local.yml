@@ -1,8 +1,5 @@
 on: 
   pull_request: 
-    types:
-      - opened
-      - edited
     branches:
       - main
     paths: 
