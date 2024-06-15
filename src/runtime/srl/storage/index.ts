@@ -49,6 +49,16 @@ export interface OriginOptions {
     allowedMethods: string[]
 }
 
+/** @internal */
+export interface CDNProps {
+    readonly bucket: Bucket
+    readonly indexKey?: string
+    readonly domain?: HostedZone
+    readonly additionalRoutes?: OriginOptions[]
+    readonly middleware?: HttpHandler<any, any, Response>
+    readonly compress?: boolean
+}
+
 //# resource = true
 /** @internal */
 export declare class CDN {

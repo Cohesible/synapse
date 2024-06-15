@@ -27,8 +27,6 @@ export interface FunctionOptions {
     imageCommands?: string[]
     external?: string[]
     /** @internal */
-    extraFiles?: [string, string][]
-    /** @internal */
     memory?: number // Vendor option?
     timeout?: number
     /** @internal */

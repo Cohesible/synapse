@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# This script is based on Bun's install script
+
 if [[ ${OS:-} = Windows_NT ]]; then
     echo 'error: install synapse using Windows Subsystem for Linux or use the Powershell script'
     exit 1

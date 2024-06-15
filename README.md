@@ -51,3 +51,4 @@ Each cloud target also uses their respective SDK + Terraform provider. The AWS t
 * [AWS SDK for JavaScript v3](https://github.com/aws/aws-sdk-js-v3)
 * [Terraform AWS Provider](https://github.com/hashicorp/terraform-provider-aws)
 
+A few things were also inspired by [Bun](https://github.com/oven-sh/bun). Most notably is the usage of Zig.

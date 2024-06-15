@@ -233,29 +233,47 @@ async function maybeUseGithubArtifact(ref: string, target: QualifiedBuildTarget,
         throw new Error(`Not implemented: ${parsed.type}`)
     }
 
+    async function downloadAndExtract(url: string) {
+        const archive = await github.fetchData(url)
+
+        const files = await listFilesInZip(archive)
+        if (files.length === 0) {
+            throw new Error(`Archive contains no files: ${url}`)
+        }
+    
+        const file = await extractFileFromZip(archive, files[0])
+    
+        return file
+    }
+
+    // TODO: consolidate os/arch normalization
+    const arch = target.arch === 'aarch64' ? 'arm64' : target.arch === 'x64' ? 'amd64' : target.arch
+    const getName = (arch: string, zip?: boolean) => `${name}-${target.os}-${arch}${zip ? '.zip' : ''}`
+
+    try {
+        const latest = await github.getRelease(parsed.owner, parsed.repository)
+        const match = latest.assets.find(a => a.name.endsWith(getName(arch, true)))
+            ?? latest.assets.find(a => a.name.endsWith(getName(target.arch, true)))
+
+        if (!match) {
+            throw new Error(`Asset not found: ${getName(target.arch, true)}`)
+        }
+
+        return downloadAndExtract(match.browser_download_url)
+    } catch(e) {
+        getLogger().log('Failed to get aritfact from release', e)
+    }
+
     const artifacts = (await github.listArtifacts(parsed.owner, parsed.repository)).sort(
         (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
     )
 
-    // TODO: consolidate os/arch normalization
-    const arch = target.arch === 'aarch64' ? 'arm64' : target.arch === 'x64' ? 'amd64' : target.arch
-    const match = artifacts.find(a => a.name.endsWith(`${name}-${target.os}-${arch}`)) 
-        ?? artifacts.find(a => a.name.endsWith(`${name}-${target.os}-${target.arch}`))
-
+    const match = artifacts.find(a => a.name.endsWith(getName(arch))) ?? artifacts.find(a => a.name.endsWith(getName(target.arch)))
     if (!match) {
         return
     }
 
-    const archive = await github.fetchData(match.archive_download_url)
-
-    const files = await listFilesInZip(archive)
-    if (files.length === 0) {
-        throw new Error(`Archive contains no files: ${match.archive_download_url}`)
-    }
-
-    const file = await extractFileFromZip(archive, files[0])
-
-    return file
+    return downloadAndExtract(match.archive_download_url)
 }
 
 interface NodeBuildOptions {
@@ -461,14 +479,6 @@ export async function createPackageForRelease(pkgDir: string, dest: string, targ
     const pruned = await createMergedView(programId, deploymentId)
 
     for (const f of Object.keys(pruned.files)) {
-        // XXX: dump all `.wasm` and `.node` files to `dist`
-        if (f.endsWith('.wasm') || f.endsWith('.node')) {
-            await fs.writeFile(
-                path.resolve(dest, 'dist', path.basename(f)),
-                await programFs.readFile(f)
-            )
-        }
-
         if (isIntegration && (f.endsWith('.js') || f.endsWith('.d.ts')) || f === 'package.json') {
             filesToKeep.push(f)
         }
@@ -880,9 +890,8 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.    
 `.trim()
 
-    const nodeLicense = await github.downloadRepoFile('Cohesible', 'synapse-node-private', 'LICENSE')
-
-    const terraformLicense = await github.downloadRepoFile('Cohesible', 'synapse-terraform-private', 'LICENSE')
+    const nodeLicense = await github.downloadRepoFile('Cohesible', 'node', 'LICENSE')
+    const terraformLicense = await github.downloadRepoFile('Cohesible', 'terraform', 'LICENSE')
 
     const synapseLicense = `
 Copyright (c) Cohesible, Inc.

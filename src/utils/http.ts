@@ -77,7 +77,7 @@ export function createRequester(baseUrl: string, listener?: DownloadProgressList
     function request(route: string, body?: any, unzip = false, opt?: { etag?: string; maxAge?: number; acceptGzip?: boolean, abortController?: AbortController; headers?: Record<string, string>; alwaysJson?: boolean }) {
         const [method, path] = route.split(' ')
         const url = new URL(path, baseUrl)
-
+        const err = new Error()
         opt?.abortController?.signal.throwIfAborted()
 
         const doReq = () => new Promise<any>((resolve, reject) => {
@@ -132,6 +132,7 @@ export function createRequester(baseUrl: string, listener?: DownloadProgressList
                         return reject(Object.assign(new Error(buffer.join('')), {
                             headers: resp.headers,
                             statusCode: resp.statusCode,
+                            stack: err.stack,
                         }))
                     }
 

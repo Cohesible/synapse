@@ -54,3 +54,4 @@ The tarballs in this directory contain services (or rather, service stubs) that 
 1. It's difficult to open-source _live_ services (but Synapse _will_ make it easier!)
 2. They may become apart of a strategy to help fund the development of Synapse
 
+Right now only "quotes" does anything. The rest are stubs and will fail if used. 

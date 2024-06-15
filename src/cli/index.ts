@@ -4,7 +4,7 @@ import * as cs from '..'
 import * as path from 'node:path'
 import { getLogger } from '../logging'
 import { LogLevel, logToFile, logToStderr, purgeOldLogs, validateLogLevel } from './logger'
-import { CancelError, runWithContext, setContext } from '../execution'
+import { CancelError, getCurrentVersion, runWithContext, setContext, setCurrentVersion } from '../execution'
 import { RenderableError, colorize, getDisplay, printJson, printLine } from './ui'
 import { showUsage, executeCommand, runWithAnalytics, removeInternalCommands } from './commands'
 import { getCiType } from '../utils'
@@ -75,29 +75,27 @@ function getLogLevel(): LogLevel | 'off' | undefined {
 }
 
 const isSea = !!process.env['BUILDING_SEA']
-const revision = process.env['GITHUB_SHA']
 const isProdBuild = process.env.SYNAPSE_ENV === 'production'
 
-let semver = '0.0.1'
 if (isSea) {
     const pkgPath = process.env.CURRENT_PACKAGE_DIR
         ? path.resolve(process.env.CURRENT_PACKAGE_DIR, 'package.json')
         : path.resolve(__dirname, '..', 'package.json')
 
     const pkgJson = JSON.parse(readFileSync(pkgPath, 'utf-8'))
-    semver = pkgJson.version
+    setCurrentVersion(pkgJson.version, process.env['GITHUB_SHA'])
 }
 
 export function main(...args: string[]) {
     const arg0 = args[0]
     if (arg0 === '--version') {
+        const version = getCurrentVersion()
         if (args[1] === '--json') {
-            const version = { semver, revision }
             process.stdout.write(JSON.stringify(version, undefined, 4) + '\n')
         } else {
             const includeRevision = !isProdBuild || args[1] === '--revision'
-            const version = `synapse ${semver}${(revision && includeRevision) ? `-${revision}` : ''}`
-            process.stdout.write(version + '\n')
+            const versionStr = `synapse ${version.semver}${(version.revision && includeRevision) ? `-${version.revision}` : ''}`
+            process.stdout.write(versionStr + '\n')
         }
         return
     }

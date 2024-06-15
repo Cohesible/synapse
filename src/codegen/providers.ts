@@ -96,7 +96,7 @@ function createNameMapper(mappings = Object.create(null) as Record<string, any>)
         return [first, ...rest.map(capitalize)].join('')
     }
 
-    function addType(str: string, type: string) {
+    function addType(str: string, type: string | number) {
         const [first, ...rest] = str.split('_')
         const mapped = [first, ...rest.map(capitalize)].join('')
         if (typeof mappings[mapped] === 'string') {
@@ -105,7 +105,7 @@ function createNameMapper(mappings = Object.create(null) as Record<string, any>)
             mappings[mapped] = { '': '' }
         }
 
-        mappings[mapped]['__type'] = type
+        mappings[mapped]['_'] = type
     }
 
     function createSubmapper(suffix: string) {
@@ -184,7 +184,30 @@ function createGenerator(
 
         const ref = ts.factory.createTypeReferenceNode(interfaces.get(key)!.name)
 
-        // TODO: if `max_items` is 1 then we shouldn't create an array node
+        function getType() {
+            switch (data.nesting_mode) {
+                case 'set':
+                case 'list':
+                    // Apparently older versions of the Terraform provider schema only supported nested
+                    // lists/sets of objects instead of single objects. This lack of expressiveness meant
+                    // implementations resorted to using lists/sets limited to 1 item instead.
+                    if (data.max_items === 1) {
+                        // TODO: replace the TF JSON format with something custom that avoids all of these issues
+                        if (variance === 'out') {
+                            // This alone appears to add ~300kB (or around 10%) to the AWS provider output
+                            mapper.addType(name, 1) // `set`/`list` are effectively treated the same
+                        }
+                        return ref
+                    }
+                    return ts.factory.createArrayTypeNode(ref)
+
+                case 'map':
+                    return ts.factory.createTypeReferenceNode('Record', [ts.factory.createTypeReferenceNode('string'), ref])
+
+                default:
+                    return ref
+            }
+        }
 
         return ts.factory.createPropertySignature(
             [ts.factory.createModifier(ts.SyntaxKind.ReadonlyKeyword)],
@@ -192,11 +215,7 @@ function createGenerator(
             // I guess it's always optional?
             !data.min_items ? ts.factory.createToken(ts.SyntaxKind.QuestionToken) : undefined,
             // hasRequiredField(data.block) ? undefined : ts.factory.createToken(ts.SyntaxKind.QuestionToken),
-            (data.nesting_mode === 'list' || data.nesting_mode === 'set') 
-                ? ts.factory.createArrayTypeNode(ref)
-                : data.nesting_mode === 'map' 
-                    ? ts.factory.createTypeReferenceNode('Record', [ts.factory.createTypeReferenceNode('string'), ref]) 
-                    : ref
+            getType()
         )
     }
     

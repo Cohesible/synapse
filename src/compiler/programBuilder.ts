@@ -1,7 +1,7 @@
 import ts from 'typescript'
 import * as path from 'node:path'
 import type { TfJson } from 'synapse:terraform'
-import { CompilerHost, CompilerOptions, Platform, readSources, synth } from './host'
+import { CompilerHost, CompilerOptions, readSources, synth } from './host'
 import { JsonFs } from '../system'
 import { createTransformer, getModuleBindingId, getTransformDirective } from './transformer'
 import { SourceMapHost, getNullTransformationContext } from '../static-solver/utils'

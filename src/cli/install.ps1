@@ -7,6 +7,8 @@ param(
   [Switch]$Uninstall = $false
 );
 
+# This script is based on Bun's install script
+
 if ($env:PROCESSOR_ARCHITECTURE -ne "AMD64") {
   Write-Output "Synapse is currently only available for x86 64-bit Windows.`n"
   return 1

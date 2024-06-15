@@ -485,9 +485,7 @@ function createNpmPackageRepo(opt?: NpmRepoOptions): NpmPackageRepository {
     }
 
     async function getPackageJson(name: string, version: string) {
-        const pkg = await manifestRepo.getPackageJson(name, version).catch(e => {
-            throw new Error(`Failed to get package "${name}@${version}"`, { cause: e })
-        })
+        const pkg = await manifestRepo.getPackageJson(name, version)
 
         return pkg
     }
@@ -859,7 +857,7 @@ function createSprRepoWrapper(
     }
 
     async function resolvePattern(spec: string, pattern: string) {
-        if (pattern.startsWith(toolPrefix)) {
+        if (spec.startsWith(toolPrefix)) {
             return toolRepo.resolvePattern(spec, pattern)
         }
 
@@ -3459,45 +3457,6 @@ export function createPackageInstaller(params?: PackageInstallerParams) {
         return dest
     }
 
-    async function downloadSynapseTool(name: string, version?: string) {
-        const tool = await packages.client.getTool(name)
-        
-        // FIXME
-        const latest = Object.values(tool.versions).pop()
-        if (!latest) {
-            throw new Error(`Tool has no published versions`)
-        }
-
-        const resp = await packages.client.getToolData(latest[0].hash)
-        const data = Buffer.from(resp.data, 'base64')
-        const dataHash = createHash('sha512').update(data).digest('base64url')
-        if (dataHash !== latest[0].packageDataHash) {
-            throw new Error(`Integrity check failed for package "${name}"`) // FIXME: could have a better error
-        }
-
-
-        const resolvedVersion = latest[0].version
-        const dest = path.resolve(getToolsDirectory(), `${name}-${latest[0].hash.slice(0, 16)}`)
-
-        const files = extractTarball(await gunzip(data))
-        await Promise.all(files.map(async f => {
-            const absPath = path.resolve(dest, f.path)
-            await fs.writeFile(absPath, f.contents)
-        }))
-
-        await fs.writeFile(
-            path.resolve(dest, 'package.json'), 
-            JSON.stringify(latest[0].packageFile, undefined, 4)
-        )
-
-        return {
-            hash: latest[0].hash,
-            version: resolvedVersion,
-            destination: dest,
-            entrypoint: latest[0].entrypoint,
-        }
-    }
-
     async function downloadSynapseProvider(info: PackageInfo, dest = getPackageDest(packagesDir, info)) {
         const name = info.name
         const source = info.resolved!.url
@@ -3807,7 +3766,6 @@ export function createPackageInstaller(params?: PackageInstallerParams) {
     return {
         getImportMap,
         installProviderTypes,
-        downloadSynapseTool,
         downloadPackage: downloadPackage,
 
         getPublishedMappings,
@@ -4167,7 +4125,6 @@ export async function createPackageService(moduleResolver: ModuleResolver, repo 
         getImportMap: installer.getImportMap,
         loadIndex,
         registerPointerDependencies,
-        downloadSynapseTool: installer.downloadSynapseTool,
     }
 }
 

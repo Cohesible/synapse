@@ -1127,18 +1127,29 @@ export function createProxy<T = unknown>(
                 return undefined
             }
 
-            const exp = !isNaN(Number(prop))
+            // `mappings['_']` contains type info
+            // `1` means we need to automatically index it
+            // Obfuscation isn't the goal here. The values used minimizes generated code size.
+            const inner = mappings['_'] === 1
+                ? { kind: ExpressionKind.ElementAccess, expression, element: {
+                    kind: ExpressionKind.NumberLiteral,
+                    value: 0,
+                } }
+                : expression
+
+            const val = Number(prop)
+            const exp = !isNaN(val)
                 ? {
                     kind: ExpressionKind.ElementAccess,
-                    expression,
+                    expression: inner,
                     element: {
                         kind: ExpressionKind.NumberLiteral,
-                        value: Number(prop),
+                        value: val,
                     }
                 }
                 : {
                     kind: ExpressionKind.PropertyAccess,
-                    expression,
+                    expression: inner,
                     member: mapKey(prop, mappings),
                 }
 

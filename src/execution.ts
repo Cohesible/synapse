@@ -104,3 +104,16 @@ export function getSelfPathOrThrow() {
 }
 
 export class CancelError extends Error {}
+
+
+// This is mutable and may be set at build-time
+let semver = '0.0.1'
+let revision: string | undefined
+export function setCurrentVersion(_semver: string, _revision?: string) {
+    semver = _semver
+    revision = _revision
+}
+
+export function getCurrentVersion() {
+    return { semver, revision }
+}

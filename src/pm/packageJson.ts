@@ -16,6 +16,7 @@ export interface PackageJson {
     readonly main?: string
     readonly files?: string[]
     readonly bin?: string | Record<string, string>
+    readonly types?: string | Record<string, string> // TODO: can this be an object?
     readonly module?: string
     readonly version?: string
     readonly private?: boolean

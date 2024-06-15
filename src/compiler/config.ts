@@ -270,6 +270,12 @@ function resolvePackageEntrypoints(pkg: PackageJson, dir: string, rootDir: strin
         res.module = resolve(res.module)
     }
 
+    if (res.types) {
+        if (typeof res.types === 'string' ) {
+            res.types = resolve(res.types)
+        }
+    }
+
     if (res.bin) {
         if (typeof res.bin === 'string') {
             res.bin = resolve(res.bin)
