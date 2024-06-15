@@ -1,0 +1,23 @@
+{
+    "compilerOptions": {
+      "target": "ES2022",
+      "module": "NodeNext",
+      "moduleResolution": "NodeNext",
+      "resolveJsonModule": true,
+      "checkJs": false,
+      "declaration": true,
+      "sourceMap": true,
+      "outDir": "./dist",
+      "rootDir": ".",
+      "esModuleInterop": true,
+      "forceConsistentCasingInFileNames": true,
+      "strict": true,
+      "declarationMap": true,
+      "skipLibCheck": true,
+      "alwaysStrict": true,
+      "allowArbitraryExtensions": true,
+    },
+    "include": ["src"],
+    "exclude": ["**/*.d.zig.ts"]
+  }
+  

@@ -1,0 +1,42 @@
+{
+    "name": "synapse",
+    "version": "0.0.3",
+    "bin": "./src/cli/index.ts",
+    "dependencies": {
+        "esbuild": "^0.20.2",
+        "typescript": "~5.4.5"
+    },
+    "devDependencies": {
+        "@types/node": "^20.11.27",
+        "postject": "github:Cohesible/postject",
+        "@cohesible/auth": "file:packages/auth.tgz",
+        "@cohesible/quotes": "file:packages/quotes.tgz",
+        "@cohesible/resources": "file:packages/resources.tgz"
+    },
+    "engines": {
+        "node": "22.1.0"
+    },
+    "scripts": {
+        "compileSelf": "synapse compile --no-synth && synapse publish --local"
+    },
+    "files": [
+        "dist"
+    ],
+    "synapse": {
+        "config": {
+            "target": "local",
+            "zigFiles": [
+                "src/zig/ast.zig",
+                "src/zig/fs-ext.zig",
+                "src/zig/util.zig"
+            ]
+        },
+        "binaryDependencies": {
+            "node": "https://github.com/Cohesible/node.git",
+            "terraform": "https://github.com/Cohesible/terraform.git"
+        },
+        "devTools": {
+            "zig": "0.12.0"
+        }
+    }
+}
