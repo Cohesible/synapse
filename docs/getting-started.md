@@ -49,6 +49,42 @@ Everything else still works the same. We can run our program just like before:
 synapse run
 ```
 
+## The Standard Resource Library (SRL)
+
+Synapse contains built-in interfaces for common cloud resources. These are split into broad categories and are found within `synapse:srl/*` modules.
+
+### `synapse:srl/compute`
+
+Everything involving running/executing code:
+* `Function` - simplest unit of compute; a "serverless" function
+* `HttpService` - creates an HTTP(S) endpoint. Routes can be added via the method `addRoute`. Routes follow the format `[method] [path-pattern]` e.g. `GET /hello/{name}` will match a GET request to `/hello/world`. Path parameters can be accessed using the first parameter of the route callback `req.pathParameters`:
+
+```ts
+import { HttpService } from 'synapse:srl/compute'
+
+const service = new HttpService() 
+service.addRoute('GET /hello/{name}', req => {
+    return new Response(`hello, ${req.pathParameters.name}`)
+})
+
+export async function main() {
+    const resp = await fetch(`${service.invokeUrl}/hello/world`).then(r => r.text())
+    console.log(resp)
+}
+```
+
+### `synapse:srl/storage`
+
+Resources for holding state:
+* `Bucket` - most basic form of storage; a blob store
+* `Table` - a simple database table, can mostly be used like `Map`
+* `Queue` - LIFO queue
+* `Counter` - atomic integer store
+
+### `synapse:srl/net`
+
+Resources specific to networking. Currently only contains `HostedZone` for describing DNS zones.
+
 ## Important Commands
 
 ### `deploy`
