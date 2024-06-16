@@ -7,7 +7,7 @@ import * as srl from 'synapse:srl'
 
 // TODO: providers in Terraform should be treated as a special kind of 
 // resource rather than a separate class entirely. This will solve many
-// problems as well as enable all sorts of useful functionality.
+// problems as well as enable all sorts of useful functionality. 
 export class Provider extends aws.AwsProvider {
     static readonly [core.contextType] = 'aws'
 
