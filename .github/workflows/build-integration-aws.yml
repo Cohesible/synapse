@@ -1,0 +1,36 @@
+on: 
+  pull_request: 
+    branches:
+      - main
+    paths: 
+      - "!.github/**"
+      - .github/workflows/build-integration-aws.yml
+      - integrations/aws/**
+  
+jobs: 
+  run_test: 
+    runs-on: 
+      - ubuntu-latest
+    permissions: 
+      contents: read
+    steps:
+      - uses: actions/checkout@v3
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with: 
+          aws-region: us-west-2
+          role-to-assume: ${{ vars.TEST_IAM_ROLE }}
+      - run: curl -fsSL https://synap.sh/install | bash
+      - run: echo "SYNAPSE_INSTALL=$HOME/.synapse" >> "$GITHUB_ENV"
+      - run: echo "${SYNAPSE_INSTALL}/bin" >> "$GITHUB_PATH"
+      - run: synapse --version
+      - run: cd integrations/aws && synapse compile && synapse publish --local
+        name: Build Integration
+      - run: cd test/conformance && synapse compile --target aws
+        name: Compile Test Suite
+      - run: synapse test
+        name: Run Tests
+      - if: success() || failure()
+        run: synapse destroy
+        name: Clean-up
+  
