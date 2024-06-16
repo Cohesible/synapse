@@ -1,5 +1,5 @@
 on: 
-  pull_request: 
+  push: 
     branches:
       - main
     paths: 
@@ -11,7 +11,8 @@ jobs:
   run_test: 
     runs-on: 
       - ubuntu-latest
-    permissions: 
+    permissions:
+      id-token: write
       contents: read
     steps:
       - uses: actions/checkout@v3
