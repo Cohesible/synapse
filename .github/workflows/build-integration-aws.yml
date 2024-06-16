@@ -29,9 +29,9 @@ jobs:
         name: Build Integration
       - run: cd test/conformance && synapse compile --target aws
         name: Compile Test Suite
-      - run: synapse test
+      - run: cd test/conformance && synapse test
         name: Run Tests
       - if: success() || failure()
-        run: synapse destroy
+        run: cd test/conformance && synapse destroy
         name: Clean-up
   
