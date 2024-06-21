@@ -24,6 +24,7 @@
     ],
     "synapse": {
         "config": {
+            "exposeInternal": true,
             "target": "local",
             "zigFiles": [
                 "src/zig/ast.zig",

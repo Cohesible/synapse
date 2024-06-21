@@ -45,6 +45,8 @@ export class Role {
     public readonly resource: aws.IamRole
     private readonly policies: InlinePolicy[] = []
     private readonly managedPolicyArns: string[] = []
+    private estimatedPolicySize = 0
+    private aggregatePolicy: ManagedPolicy | undefined
 
     public constructor(...args: ConstructorParameters<typeof aws.IamRole>) {
         this.resource = new aws.IamRole({
@@ -71,16 +73,34 @@ export class Role {
     }
 
     public addPolicy(policy: InlinePolicy) {
-        if (policy.policy) {
-            const size = getEstimatedSize(policy.policy)
-            if (size && size > maxInlinePolicySize*0.8) {
-                const managedPolicy = new aws.IamPolicy({ policy: policy.policy })
-                this.managedPolicyArns.push(managedPolicy.arn)
-            } else {
-                this.policies.push(policy)
-            }
-        } else {
+        if (!policy.policy) {
             core.getLogger().log(`Skipped adding policy "${policy.name}" because it contains no statements`)
+            return
+        }
+    
+        const size = getEstimatedSize(policy.policy)
+        if (size) {
+            this.estimatedPolicySize += size
+        }
+
+        if (this.estimatedPolicySize < maxInlinePolicySize*0.8) {
+            this.policies.push(policy)
+            return
+        }
+
+        this.estimatedPolicySize -= size
+        const statements = getSourceStatements(policy.policy)
+        if (!statements) {
+            const managedPolicy = new aws.IamPolicy({ policy: policy.policy, namePrefix: 'synapse-' })
+            this.managedPolicyArns.push(managedPolicy.arn)
+            return
+        }
+
+        if (!this.aggregatePolicy) {
+            this.aggregatePolicy = new ManagedPolicy(statements)
+            this.managedPolicyArns.push(this.aggregatePolicy.arn)
+        } else {
+            this.aggregatePolicy.addStatements(statements)
         }
     }
 }
@@ -97,6 +117,7 @@ export async function assumeRole(role: string | Role, sessionName?: string) {
 // This is the default quota, I think it can be increased?
 const maxInlinePolicySize = 10240
 const estimatedSize = Symbol.for('synapse.estimatedSize')
+const sourceStatements = Symbol.for('synapse.aws.sourceStatements')
 
 // We're more likely to overestimate rather than underestimate
 function getEstimatedSize(data: any): number | undefined {
@@ -118,6 +139,12 @@ function getEstimatedSize(data: any): number | undefined {
     }
 }
 
+function getSourceStatements(data: any): Statement[] | undefined {
+    if ((typeof data === 'object' && !!data) || typeof data === 'function') {
+        return data[sourceStatements]
+    }
+}
+
 export function createSerializedPolicy(statements: Statement[]): string {
     if (statements.length === 0) {
         return ''
@@ -130,13 +157,40 @@ export function createSerializedPolicy(statements: Statement[]): string {
 
     return Object.assign(
         Fn.jsonencode(policy), 
-        { [estimatedSize]: getEstimatedSize(policy) }
+        { 
+            [estimatedSize]: getEstimatedSize(policy),
+            [sourceStatements]: statements,
+        }
+    )
+}
+
+function isEquivalent(a: Statement, b: Statement) {
+    // TODO: handle conditions
+    if (a.Condition || b.Condition) {
+        return false
+    }
+
+    return (
+        a.Effect === b.Effect &&
+        a.Action === b.Action &&
+        a.Resource === b.Resource
     )
 }
 
 export class ManagedPolicy extends aws.IamPolicy {
-    constructor(statements: Statement[]) {
-        super({ policy: createSerializedPolicy(statements) })
+    constructor(private readonly statements: Statement[]) {
+        super({ 
+            policy: createSerializedPolicy(statements),
+            namePrefix: 'synapse-',
+        })
+    }
+
+    public addStatements(statements: Statement[]) {
+        for (const s of statements) {
+            if (!this.statements.some(other => isEquivalent(s, other))) {
+                this.statements.push(s)
+            }
+        }
     }
 }
 

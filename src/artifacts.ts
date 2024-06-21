@@ -5,7 +5,7 @@ import type { ExternalValue, PackageInfo } from './runtime/modules/serdes'
 import { getLogger, runTask } from './logging'
 import { Mutable, acquireFsLock, createRwMutex, createTrie, deepClone, getHash, isNonNullable, keyedMemoize, memoize, sortRecord, throwIfNotFileNotFoundError, tryReadJson } from './utils'
 import type { TerraformPackageManifest, TfJson } from './runtime/modules/terraform'
-import { BuildTarget, Deployment, Program, getBuildDir, getProgramIdFromDeployment, getRootDir, getRootDirectory, getTargetDeploymentIdOrThrow, getWorkingDir, getWorkingDirectory, resolveProgramBuildTarget } from './workspaces'
+import { BuildTarget, Deployment, Program, getBuildDir, getProgramIdFromDeployment, getRemoteProjectId, getRootDir, getRootDirectory, getTargetDeploymentIdOrThrow, getWorkingDir, resolveProgramBuildTarget } from './workspaces'
 import {  NpmPackageInfo } from './pm/packages'
 import { TargetsFile, readPointersFile } from './compiler/host'
 import { TarballFile } from './utils/tar'
@@ -53,6 +53,7 @@ export interface Head {
     readonly isTest?: boolean
     readonly isRollback?: boolean
     readonly previousCommit?: string
+    readonly commitHash?: string
 }
 
 export interface SerializedTemplate {
@@ -3081,6 +3082,48 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
 
     const pendingHeadWrites = new Map<string, Promise<Head | undefined>>()
 
+    let headsJson: Promise<Record<string, string>> | Record<string, string>
+    async function readHeadsJson(): Promise<Record<string, string>> {
+        const data = await fs.readFile(path.resolve(buildDir, 'heads.json'), 'utf-8').catch(throwIfNotFileNotFoundError)
+        if (!data) {
+            return {}
+        }
+
+        return JSON.parse(data)
+    }
+
+    function getHeadsJson(): typeof headsJson {
+        if (headsJson) {
+            return headsJson
+        }
+
+        return headsJson = readHeadsJson()
+    }
+
+    let writeAgain = false
+    let pendingHeadsWrite: Promise<void> | undefined
+    function writeHeadsJson() {
+        if (!headsJson) {
+            return
+        }
+
+        const doWrite = async () => {
+            await fs.writeFile(path.resolve(buildDir, 'heads.json'), JSON.stringify(headsJson))
+            if (writeAgain) {
+                writeAgain = false
+                await doWrite()
+            }
+        }
+
+        if (!pendingHeadsWrite) {
+            return pendingHeadsWrite = doWrite().finally(() => {
+                pendingHeadsWrite = undefined
+            })
+        }
+
+        writeAgain = true
+    }
+
     function readHead(id: string): Promise<Head | undefined> {
         if (pendingHeadWrites.has(id)) {
             return pendingHeadWrites.get(id)!
@@ -3250,13 +3293,6 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
     function writeDataSync(hash: string, data: Uint8Array) {
         return _writeData(hash, data, false)
     }
-
-    // .catch(async e => {
-    //     if ((e as any).message === 'Unexpected end of JSON input') {
-    //         await deleteData(hash)
-    //     }
-    //     throw e
-    // })
 
     async function readManifest(hash: string) {
         return await readJsonRaw<ArtifactStoreManifest>(root, hash)
@@ -3934,26 +3970,10 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
             id,
             storeHash: hash,
             timestamp: new Date().toISOString(),
-            previousCommit: headData?.previousCommit,
+            previousCommit: headData?.commitHash ?? headData?.previousCommit,
         }
 
         await putHead(h)
-    }
-
-    function isRedundantCommit(proposed: Head, previous?: Head) {
-        if (!previous) {
-            return false
-        }
-
-        if (proposed.timestamp === previous.timestamp) {
-            return true
-        }
-
-        return (
-            proposed.storeHash === previous.storeHash &&
-            proposed.programHash === previous.programHash &&
-            proposed.isRollback === previous.isRollback
-        )
     }
 
     async function commit(id: string, programHash?: string, isRollback?: boolean, isTest?: boolean) {
@@ -3964,20 +3984,16 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
             return
         }
 
-        const previous = head.previousCommit 
-            ? await readJsonRaw<Head>(root, head.previousCommit) 
-            : undefined
-
-        const proposed: Head = { ...head, programHash, isRollback, isTest }
-        if (isRedundantCommit(proposed, previous)) {
-            return head
+        if (!head.commitHash) {
+            const proposed = sortRecord({ ...head, programHash, isRollback, isTest }) as any as Head
+            const hash = await writeJsonRaw(root, proposed)
+            const newHead = { ...proposed, commitHash: hash }
+            await putHead(newHead)
+    
+            return newHead
         }
 
-        const hash = await writeJsonRaw(root, proposed)
-        const newHead = { ...head, previousCommit: hash }
-        await putHead(newHead)
-
-        return newHead
+        return head
     }
 
     async function putHead(head: Head) {
@@ -4597,7 +4613,7 @@ export async function shutdownRepos() {
 export function getProgramFs(id?: string) {
     if (!id) {
         const buildDir = getBuildDir()
-        const workingDirectory = getWorkingDirectory()
+        const workingDirectory = getWorkingDir()
         const { programId } = getBuildTargetOrThrow()
     
         return getRootFs(programId, buildDir, workingDirectory)
@@ -4613,7 +4629,7 @@ export function getDeploymentFs(id?: string, programId?: string, projectId?: str
     if (!id) {
         const { deploymentId } = getBuildTargetOrThrow()
         const buildDir = getBuildDir()
-        const workingDirectory = getWorkingDirectory()
+        const workingDirectory = getWorkingDir()
         if (!deploymentId) {
             throw new Error(`No deployment id found`)
         }
@@ -4822,11 +4838,28 @@ export async function syncRemote(projectId: string, programId: string, deploymen
     const localProcessHead = await repo.commitHead(deploymentId)
 
     await syncHeads(repo, remote, localProcessHead, remoteProcessHead)
+}
 
-    // const remoteProgramHead = await remote.getHead(programId)
-    // const localProgramHead = await repo.commitHead(programId)
+async function readData(repo: DataRepository, hash: string) {
+    const data = await repo.readData(hash).catch(throwIfNotFileNotFoundError)
+    if (data || !shouldUseRemote) {
+        return data
+    }
 
-    // await syncHeads(repo, remote, localProgramHead, remoteProgramHead)
+    const projId = await getRemoteProjectId(getBuildTargetOrThrow().projectId)
+    if (!projId) {
+        getLogger().log(`No remote project found while reading object "${hash}"`)
+        return
+    }
+
+    const remote = createRemoteArtifactRepo(repo, projId)
+
+    return remote.getObject(hash).catch(e => {
+        if ((e as any).statusCode === 404 || (e as any).status === 404) {
+            throw Object.assign(new Error((e as any).message), { code: 'ENOENT' })
+        }
+        throw e
+    })
 }
 
 /** @deprecated */
@@ -5203,6 +5236,10 @@ export function getDeploymentStore(deploymentId: string, repo = getDataRepositor
 export async function listCommits(id = getTargetDeploymentIdOrThrow(), repo = getDataRepository(), max = 25) {
     const commits: Head[] = []
     const start = await repo.getHead(id)
+    if (start && start.commitHash) {
+        commits.push(start)
+    }
+
     let head = start
     while (commits.length < max) {
         if (head?.previousCommit) {
@@ -5216,22 +5253,17 @@ export async function listCommits(id = getTargetDeploymentIdOrThrow(), repo = ge
         }
     }
 
-    // We don't include the first node if it hasn't been committed yet
-    // XXX: this is a hack to support rolling back from a pulled commit
-    // if (start && commits[0] && start.previousCommit !== commits[0].previousCommit && start.programHash) {
-    //     commits.unshift(start)
-    // }
-
     return commits
 }
+
 
 export async function putState(state: TfState, procFs = getDeploymentFs()) {
     await writeState(procFs, state)
 }
 
-export async function saveMoved(moved: { from: string; to: string }[]) {
+export async function saveMoved(moved: { from: string; to: string }[], template?: SerializedTemplate | TfJson) {
     const fs = getProgramFs()
-    const template: SerializedTemplate | TfJson = await fs.readJson('[#synth]template.json')
+    template ??= await fs.readJson('[#synth]template.json')
     await fs.writeJson('[#synth]template.json', { ...template, moved })
 }
 
@@ -5245,6 +5277,10 @@ export async function getPreviousDeploymentProgramHash() {
     const h = await repo.getHead(deploymentId)
     if (!h) {
         return
+    }
+
+    if (h.commitHash && h.programHash) {
+        return h.programHash
     }
 
     const c = h.previousCommit

@@ -643,6 +643,7 @@ export async function synth(entrypoints: string[], deployables: string[], opt: S
     const bt = getBuildTargetOrThrow()
     ;(bt as Mutable<typeof bt>).deploymentId = deploymentId
     process.env.SYNAPSE_ENV = bt.environmentName // XXX: not clean
+    process.env.SYNAPSE_TARGET = opt.deployTarget ?? 'local'
 
     const store = await afs.getCurrentProgramStore().getSynthStore()
     const vfs = toFs(bt.workingDirectory, store.afs, getFs())

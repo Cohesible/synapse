@@ -16,7 +16,6 @@ export class Queue<T = string>  {
     public on(eventType: 'message', cb: (message: T) => Promise<void> | void) {
         const handler = forwardEvent(cb)
         const fn = new LambdaFunction(handler, {
-            name: cb.name,
             timeout: this.resource.visibilityTimeoutSeconds,
         })
         const event = new aws.LambdaEventSourceMapping({

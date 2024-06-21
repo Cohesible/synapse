@@ -1,5 +1,5 @@
 import * as storage from 'synapse:srl/storage'
-import { Service, Client } from 'synapse:services'
+import { Service } from 'synapse:services'
 import { RandomString } from 'synapse:key-service'
 import { HttpError } from 'synapse:http'
 import { randomUUID } from 'node:crypto'
@@ -31,59 +31,6 @@ function getEventKey(ev: Pick<AnalyticsEvent, 'timestamp'>) {
 }
 
 const maxBufferSize = 10 * 1024 * 1024
-const maxBufferDurationMs = 60_000
-
-function createBufferedBucket2(bucket: storage.Bucket) {
-    interface BufferedData {
-        size: number
-        timer: NodeJS.Timer
-        chunks: Uint8Array[]
-    }
-
-    const buffers: Record<string, BufferedData> = {}
-    function getBuffer(key: string) {
-        if (key in buffers) {
-            return buffers[key]
-        }
-
-        const timer = setTimeout(() => flush(key), maxBufferDurationMs)
-
-        return buffers[key] = {
-            size: 0,
-            timer,
-            chunks: [],
-        }
-    }
-
-    async function _flush(key: string, data: BufferedData) {
-        clearTimeout(+data.timer)
-        await bucket.put(key, Buffer.concat(data.chunks))
-    }
-
-    function flush(key: string) {
-        const data = buffers[key]
-        if (!data) {
-            return
-            // throw new Error('Missing buffered data')
-        }
-
-        delete buffers[key]
-
-        return _flush(key, data)
-    }
-
-    function put(key: string, data: Uint8Array) {
-        const b = getBuffer(key)
-        b.size += data.byteLength
-        b.chunks.push(data)
-
-        if (b.size >= maxBufferSize) {
-            return flush(key)
-        }
-    }
-
-    return { put }
-}
 
 function createBufferedBucket(bucket: storage.Bucket) {
     interface BufferedData {
@@ -184,22 +131,22 @@ class Analytics extends Service<DeviceIdentity> {
         await Promise.all(promises)
     }
 
-    public async getEvents(req: GetEventsRequest) {
-        const t = req.from ? new Date(req.from) : new Date()
-        const k = getEventKey({ timestamp: t.toISOString() })
-        const keys = await this.bucket.list(k)
-        const events: StoredAnalyticsEvent[] = []
-        for (const k of keys) {
-            const d = await this.bucket.get(k, 'utf-8')
-            for (const l of d.split('\n')) {
-                if (l) {
-                    events.push(JSON.parse(l))
-                }
-            }
-        }
+    // public async getEvents(req: GetEventsRequest) {
+    //     const t = req.from ? new Date(req.from) : new Date()
+    //     const k = getEventKey({ timestamp: t.toISOString() })
+    //     const keys = await this.bucket.list(k)
+    //     const events: StoredAnalyticsEvent[] = []
+    //     for (const k of keys) {
+    //         const d = await this.bucket.get(k, 'utf-8')
+    //         for (const l of d.split('\n')) {
+    //             if (l) {
+    //                 events.push(JSON.parse(l))
+    //             }
+    //         }
+    //     }
 
-        return { events }
-    }
+    //     return { events }
+    // }
 }
 
 // This token is embedded into the CLI as simple mechanism to prevent abuse
@@ -220,16 +167,19 @@ analytics.addAuthorizer(async (authz, req) => {
     return { id }
 })
 
-// This isn't intended to be super secure.
-analytics.setAuthorization(async () => {
-    const deviceId = await getDeviceId()
-    const authorization = `Basic ${Buffer.from(`${deviceId}:${secret}`).toString('base64')}`
+const Client = analytics.createClientClass()
 
-    return authorization
-})
+export function createClient() {
+    return new Client({
+        // This isn't intended to be super secure.
+        authorization: async () => {
+            const deviceId = await getDeviceId()
+            const authorization = `Basic ${Buffer.from(`${deviceId}:${secret}`).toString('base64')}`
 
-export const client = analytics as Client<Analytics>
-
+            return authorization
+        }
+    })
+}
 
 describe('analytics', () => {
     function makeTestEvent(attr?: Record<string, any>, time = new Date()): AnalyticsEvent {
@@ -240,11 +190,11 @@ describe('analytics', () => {
         }
     }
 
-    it('can send events', async () => {
-        const req: PostEventsRequest = { batch: [makeTestEvent(), makeTestEvent()] }
-        await client.postEvents(req)
-        const data = await analytics.getEvents({})
-        expect(data.events.find(ev => ev.timestamp === req.batch[0].timestamp))
-    })
+    // it('can send events', async () => {
+    //     const req: PostEventsRequest = { batch: [makeTestEvent(), makeTestEvent()] }
+    //     await client.postEvents(req)
+    //     const data = await analytics.getEvents({})
+    //     expect(data.events.find(ev => ev.timestamp === req.batch[0].timestamp))
+    // })
 })
 

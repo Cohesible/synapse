@@ -31,7 +31,7 @@ jobs:
         name: Compile Test Suite
       - run: cd test/conformance && synapse test
         name: Run Tests
-      - if: success() || failure()
+      - if: always()
         run: cd test/conformance && synapse destroy
         name: Clean-up
   

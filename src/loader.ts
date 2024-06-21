@@ -1073,7 +1073,7 @@ function createFakeModule(id: string, ctx: ContextStorage) {
 
                 // XXX: bind context to the instance if `permissions` exists
                 const ctor = _newTarget ?? _target
-                if (Symbol.for('permissions') in ctor) {
+                if (Symbol.for('synapse.permissions') in ctor) {
                     const contexts = Object.fromEntries(Object.entries(ctx.getNamedContexts()).map(([k, v]) => [k, v[0]]))
                     Object.assign(result, { [kBoundContext]: contexts })
                 }
@@ -1411,11 +1411,11 @@ function createSerializationProxy(
 
             // XXX: bind context to the instance if `permissions` exists
             const ctor = _newTarget ?? _target
-            if (result && typeof result === 'object' && Symbol.for('permissions') in ctor) {
+            if (result && typeof result === 'object' && Symbol.for('synapse.permissions') in ctor) {
                 const contexts = Object.fromEntries(Object.entries(ctx?.getNamedContexts() ?? {}).map(([k, v]) => [k, v[0]]))
                 Object.assign(result, { [kBoundContext]: contexts })
 
-                const cm = ctor[Symbol.for('permissions')].$constructor
+                const cm = ctor[Symbol.for('synapse.permissions')].$constructor
                 if (cm !== undefined) {
                     solvePerms?.(ctor, args, result)
                 }
@@ -1596,8 +1596,8 @@ interface Context {
     readonly namedContexts: Record<string, any[]>
 }
 
-const kContext = Symbol.for('context')
-const kContextType = Symbol.for('contextType')
+const contextSym = Symbol.for('synapse.context')
+const contextTypeSym = Symbol.for('synapse.contextType')
 
 function getContextType(o: any, visited = new Set<any>()): string | undefined {
     if (!o || (typeof o !== 'object' && typeof o !== 'function') || visited.has(o)) {
@@ -1612,7 +1612,7 @@ function getContextType(o: any, visited = new Set<any>()): string | undefined {
     const unproxied = unwrapProxy(o)
     visited.add(unproxied)
 
-    return o[kContextType] ?? getContextType(unproxied.constructor, visited)
+    return o[contextTypeSym] ?? getContextType(unproxied.constructor, visited)
 }
 
 interface ContextHooks {
@@ -1646,7 +1646,7 @@ function createContextStorage(
         if (scope.contexts !== undefined) {
             for (const ctx of scope.contexts) {
                 const contextType = getContextType(ctx)
-                const contextContribution = ctx[kContext]
+                const contextContribution = ctx[contextSym]
                 if (!contextType && !contextContribution) {
                     throw new Error(`Object does not contribute a context: ${ctx}`)
                 }

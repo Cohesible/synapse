@@ -1,7 +1,6 @@
 import * as secrets from './services/secrets/index'
 import type { BackendClient } from './runtime/modules/core'
 import { getExecutionId } from './execution'
-import { processes } from '@cohesible/resources'
 import { readState } from './artifacts'
 import { getAuthClient } from './auth'
 import { getLogger } from '.'
@@ -63,8 +62,6 @@ function getBootstrapClient() {
 }
 
 function _getClient() {
-    processes.client.getState
-
     const identityClient = getAuthClient()
 
     return {

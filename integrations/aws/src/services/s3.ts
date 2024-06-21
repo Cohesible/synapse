@@ -109,6 +109,21 @@ export class Bucket implements storage.Bucket {
 
         return Promise.all(urls)
     }
+
+    public static import(name: string): Bucket {
+        const resource = new aws.S3BucketData({ bucket: name })
+        const client = new S3.S3({})
+
+        const inst = {
+            client,
+            resource,
+            id: resource.arn,
+            name,
+        }
+        Object.setPrototypeOf(inst, Bucket.prototype)
+
+        return inst as any
+    }
 }
 
 

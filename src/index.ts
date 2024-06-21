@@ -64,9 +64,6 @@ import { buildWindowsShim } from './zig/compile'
 
 export { runTask, getLogger } from './logging'
 
-// IMPORTANT: must use Terraform v1.5.5 or earlier to avoid BSL
-
-// TODO: create LZ4 async native module
 // TODO: https://github.com/pulumi/pulumi/issues/3388
 
 // Apart of refactoring story:
@@ -376,7 +373,10 @@ export async function deploy(targets: string[], opt?: DeployOpt2) {
         }
 
         return result.state
-    } finally {    
+    } finally {
+        // TODO: in theory this should happen right after saving the state to disk
+        // We just want to make sure that if `syncModule` fails, it doesn't prevent
+        // a rollback from happening.
         if (opt?.syncAfter) {
             await syncModule(deploymentId)
         }
@@ -1011,10 +1011,17 @@ export async function explain(target: string, opt?: DeployOptions & { forceRefre
     }
 }
 
-export async function show(targets: string[], opt?: DeployOptions) {
+export async function show(targets: string[], opt?: DeployOptions & { 'names-only'?: boolean }) {
     const state = await readState()
     if (!state) {
         throw new Error('No state to show')
+    }
+
+    if (opt?.['names-only']) {
+        for (const k of state.resources.map(r => `${r.type}.${r.name}`)) {
+            printLine(k)
+        }
+        return
     }
 
     if (targets.length === 0) {
@@ -1903,6 +1910,37 @@ export async function migrateIdentifiers(targets: string[], opt?: CombinedOption
     }
 }
 
+async function loadMovedIntoTemplate(fileName: string, template?: TfJson) {
+    const moved = await getFs().readFile(fileName, 'utf-8').then(JSON.parse)
+    if (typeof moved !== 'object' || !moved) {
+        throw new Error(`Moved file must contain an object`)
+    }
+
+    const checked: { from: string; to: string }[] = []
+    for (const [k, v] of Object.entries(moved)) {
+        if (typeof v !== 'string') {
+            throw new Error(`"from" is not a string: ${JSON.stringify(v)} [key: ${k}]`)
+        }
+
+        // TODO: validate that `k` is in the current state and `v` is in the current template
+
+        checked.push({
+            from: k,
+            to: v,
+        })
+    }
+
+    await saveMoved(checked, template)
+
+    for (const m of checked) {
+        printLine(`Will move: ${m.from} -> ${m.to}`)
+    }
+}
+
+export async function loadMoved(fileName: string) {
+    await loadMovedIntoTemplate(fileName)
+}
+
 export async function machineLogin(type?: string, opt?: CombinedOptions) {
     const auth = getAuth()
     await auth.machineLogin()
@@ -1936,10 +1974,10 @@ export async function setSessionDuration(target: string, opt?: CombinedOptions) 
     await auth.updateAccountConfig(acc, { sessionDuration })
 }
 
-export async function listProcesses(type?: string, opt?: CombinedOptions) {
+export async function listDeployments(type?: string, opt?: CombinedOptions) {
     const rootDir = workspaces.getRootDir()
-    const processes = await workspaces.listAllDeployments()
-    for (const [k, v] of Object.entries(processes)) {
+    const deployments = await workspaces.listAllDeployments()
+    for (const [k, v] of Object.entries(deployments)) {
         const s = await readState(getDeploymentFs(k, v.programId, v.projectId))
 
         const isRunning = s && s.resources.length > 0
@@ -2089,7 +2127,7 @@ export async function listCommitsCmd(mod: string, opt?: CombinedOptions & { useP
 export async function rollback(mod: string, opt?: CombinedOptions) {
     printLine(colorize('yellow', 'Rolling back...'))
 
-    const syncAfter = opt?.syncAfter ?? !!getCiType() // XXX: for internal use only
+    const syncAfter = opt?.syncAfter ?? !!getCiType() // XXX: for internal use only 
 
     const commits = await listCommits()
     const targetCommit = commits.filter(x => !x.isTest)[1]
@@ -2165,8 +2203,8 @@ async function compileIfNeeded(target?: string, skipSynth = true) {
         // We don't need to generate a template, we just want updated program analyses
         // TODO: mark the current compilation as "needs synth"
         await compile(
-            target ? [target] : [], 
-            stale ? { incremental: true, skipSynth, skipSummary: true } : { skipSummary: true }
+            target ? [target] : [],
+            { incremental: true, skipSummary: true, skipSynth: !!stale && skipSynth },
         )
     }
 }
@@ -2498,9 +2536,8 @@ export async function showStatus(opt?: { verbose?: boolean }) {
     }
 }
 
-async function maybeGetPkgScript(name: string, fs = getFs()) {
-    const workingDir = getWorkingDir()
-    const pkg = await getPackageJson(fs, workingDir, false)
+async function maybeGetPkgScript(name: string) {
+    const pkg = await getCurrentPkg()
     if (!pkg) {
         return
     }
@@ -2575,18 +2612,6 @@ export async function inspectBlock(target: string, opt?: any) {
     const index = JSON.parse(block.readObject(path.basename(target)).toString('utf-8'))
     checkBlock(Buffer.from(data), index)
     printLine(colorize('green', 'No issues found'))
-    // printJson(index)
-
-    // const f = index.files['full-state.json']
-    // if (f) {
-    //     const h = f.hash
-    //     const sh = f.storeHash ?? index.stores[f.store].hash
-    //     const state = JSON.parse(block.readObject(h).toString('utf-8'))
-    //     printJson(state)
-
-    //     const m = JSON.parse(block.readObject(sh).toString('utf-8'))
-    //     printJson(m)
-    // }
 }
 
 export function runUserScript(target: string) {
@@ -2595,7 +2620,12 @@ export function runUserScript(target: string) {
     return loader.loadModule(target)
 }
 
-export async function buildExecutables(opt: any = {}) {
+interface BuildExecutableOpt {
+    readonly sea?: boolean
+    readonly lazyLoad?: string[]
+}
+
+export async function buildExecutables(opt: BuildExecutableOpt) {
     const bt = getBuildTargetOrThrow()
     const pkg = await getCurrentPkg()
     if (!pkg) {
@@ -2630,25 +2660,26 @@ export async function buildExecutables(opt: any = {}) {
     // XXX: this is hard-coded to `synapse`
     const bundleOpt = pkg.data.name === 'synapse' ? {
         external, 
-        lazyLoad: ['typescript', 'esbuild', ...lazyNodeModules],
-        lazyLoad2: ['@cohesible/*'],
-    } : undefined
+        lazyLoad: ['@cohesible/*', 'typescript', 'esbuild', ...lazyNodeModules],
+        extraBuiltins: ['typescript', 'esbuild'],
+    } : opt
 
     if (pkg.data.name === 'synapse') {
         process.env.SKIP_SEA_MAIN = '1'
         process.env.CURRENT_PACKAGE_DIR = pkg.directory
     }
 
-    const assets: Record<string, string> = {}
     for (const [k, v] of Object.entries(bin)) {
         const resolved = path.resolve(bt.workingDirectory, v)
         if (!set.has(resolved)) continue
 
-        const res = await bundleExecutable(bt, resolved, undefined, undefined, { sea: true, ...bundleOpt })
-        Object.assign(assets, res.assets)
-
+        const res = await bundleExecutable(bt, resolved, undefined, undefined, { sea: opt.sea, ...bundleOpt })
         const dest = path.resolve(bt.workingDirectory, 'dist', 'bin', k)
-        await makeSea(res.outfile, await getNodePath(), dest, res.assets)
+        if (opt.sea) {
+            await makeSea(res.outfile, await getNodePath(), dest, res.assets)
+        } else {
+            // TODO: write out assets
+        }
     }
 }
 
@@ -2737,8 +2768,8 @@ export async function internalBundle(target?: string, opt: any = {}) {
         const bundleOpt = {
             external, 
             minifyKeepWhitespace: isProdBuild, 
-            lazyLoad: (isSea || opt.seaPrep) ? ['typescript', 'esbuild', ...lazyNodeModules] : [],
-            lazyLoad2: (isSea || opt.seaPrep) ? ['@cohesible/*'] : [],
+            lazyLoad: (isSea || opt.seaPrep) ? ['@cohesible/*', 'typescript', 'esbuild', ...lazyNodeModules] : [],
+            extraBuiltins: ['typescript', 'esbuild'],
         }
 
         if (isProdBuild && process.env.SKIP_SEA_MAIN) {

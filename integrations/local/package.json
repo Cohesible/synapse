@@ -5,7 +5,8 @@
     },
     "synapse": {
         "config": {
-            "sharedLib": true
+            "sharedLib": true,
+            "exposeInternal": true
         }
     }
 }

@@ -110,7 +110,7 @@ export class Gateway {
     }
 
     private addRouteInfra(route: string, handler: ReturnType<typeof wrapHandler>) {
-        const fn = new LambdaFunction(handler, { name: handler.name })
+        const fn = new LambdaFunction(handler)
 
         const integration = new aws.Apigatewayv2Integration({
             apiId: this.resource.id,
@@ -326,7 +326,7 @@ async function runHandler<T>(fn: () => Promise<T> | T): Promise<T | HttpResponse
             } as any
         }
 
-        if (typeof resp === 'number' || (typeof resp === 'object' && !!resp && typeof (resp as any).statusCode !== 'number')) {
+        if (typeof resp === 'number' || typeof resp === 'string' || (typeof resp === 'object' && !!resp && typeof (resp as any).statusCode !== 'number')) {
             return {
                 body: Buffer.from(JSON.stringify(resp)).toString('utf-8'),
                 statusCode: 200,
@@ -620,7 +620,7 @@ export class WebsocketGateway {
     }
 
     private addRouteInfra(routes: string[], handler: any) {
-        const fn = new LambdaFunction(handler, { name: handler.name })
+        const fn = new LambdaFunction(handler)
 
         for (const r of routes) {
             this.createIntegration(r, fn)

@@ -13,7 +13,7 @@ import { isBuiltin } from 'node:module'
 import { TerraformPackageManifest } from './runtime/modules/terraform'
 import { SourceMapV3, toInline } from './runtime/sourceMaps'
 import { createModuleResolverForBundling } from './runtime/rootLoader'
-import { getWorkingDirectory } from './workspaces'
+import { getWorkingDir } from './workspaces'
 import { pointerPrefix, createPointer, isDataPointer, toAbsolute, DataPointer, coerceToPointer, isNullHash, applyPointers } from './build-fs/pointers'
 import { getModuleType } from './static-solver'
 import { readKeySync } from './cli/config'
@@ -34,7 +34,7 @@ export interface BundleOptions extends MemCompileOptions {
     readonly splitting?: boolean // Does nothing without multiple entrypoints
 
     readonly lazyLoad?: string[]
-    readonly lazyLoad2?: string[]
+    readonly extraBuiltins?: string[]
     
     // TODO: maybe implement this
     // Always lazily-load deployed modules
@@ -179,7 +179,7 @@ export function createTranspiler(fs: Fs & SyncFs, resolver?: ModuleResolver, com
     const moduleTarget = getModuleType(compilerOptions?.module)
 
     async function transpile(path: string, data: string | Uint8Array, outfile: string, options?: TranspileOptions) {
-        const workingDirectory = options?.workingDirectory ?? compilerOptions?.rootDir ?? getWorkingDirectory()
+        const workingDirectory = options?.workingDirectory ?? compilerOptions?.rootDir ?? getWorkingDir()
         const withSourcemap = options?.oldSourcemap ? `${data}\n\n${toInline(options?.oldSourcemap)}` : data
         await fs.writeFile(path, withSourcemap, { fsKey: '#mem' })
         const res = await build(
@@ -363,7 +363,7 @@ export function createSerializerHost(fs: { writeDataSync: (data: Uint8Array) => 
 
 function createFsPlugin(fs: Fs & SyncFs, resolver: ModuleResolver, opt: BundleOptions): esbuild.Plugin {
     const serializerHost = opt?.serializerHost
-    const lazy3Importers = new Map<string, string>()
+    const lazyImporters = new Map<string, string>()
 
     async function resolveJsFile(args: esbuild.OnResolveArgs) {
         const resolved = resolver.getFilePath(args.path)
@@ -423,14 +423,14 @@ function createFsPlugin(fs: Fs & SyncFs, resolver: ModuleResolver, opt: BundleOp
                 }
             })
 
-            build.onResolve({ filter: /^lazy3:.*/ }, async args => {
+            build.onResolve({ filter: /^lazy-load:.*/ }, async args => {
                 const mode: 'esm' | 'cjs' = args.kind === 'import-statement' ? 'esm'
                     : args.kind === 'require-call' ? 'cjs'
                     : opt.moduleTarget ?? 'cjs'
 
                 try {
-                    const p = args.path.slice(6)
-                    const importer = lazy3Importers.get(p)
+                    const p = args.path.slice('lazy-load:'.length)
+                    const importer = lazyImporters.get(p)
                     if (!importer) {
                         throw new Error(`No importer found for path: ${p}`)
                     }
@@ -465,12 +465,8 @@ function createFsPlugin(fs: Fs & SyncFs, resolver: ModuleResolver, opt: BundleOp
                 }
 
                 if (opt.lazyLoad?.some(x => matchPattern(args.path, x))) {
+                    lazyImporters.set(args.path, args.importer)
                     return { namespace: 'lazy', path: args.path }
-                }
-
-                if (opt.lazyLoad2?.some(x => matchPattern(args.path, x))) {
-                    lazy3Importers.set(args.path, args.importer)
-                    return { namespace: 'lazy2', path: args.path }
                 }
 
                 if (isBuiltin(args.path)) {
@@ -499,16 +495,16 @@ function createFsPlugin(fs: Fs & SyncFs, resolver: ModuleResolver, opt: BundleOp
             })
 
             build.onLoad({ namespace: 'lazy', filter: /.*/ }, async args => {
-                return {
-                    loader: 'js',
-                    contents: generateLazyModule(args.path),
+                if (isBuiltin(args.path) || opt.extraBuiltins?.includes(args.path)) {
+                    return {
+                        loader: 'js',
+                        contents: generateLazyModule(args.path),
+                    }
                 }
-            })
 
-            build.onLoad({ namespace: 'lazy2', filter: /.*/ }, async args => {
                 return {
                     loader: 'js',
-                    contents: generateLazyModule(`lazy3:${args.path}`, false),
+                    contents: generateLazyModule(`lazy-load:${args.path}`, false, true),
                 }
             })
 
@@ -694,33 +690,6 @@ function createCompilerHost(options: ts.CompilerOptions, fs: SyncFs): ts.Compile
             ? ts.createSourceFile(fileName, sourceText, languageVersion)
             : undefined
     }
-
-    // function resolveModuleNames(
-    //     moduleNames: string[],
-    //     containingFile: string
-    // ): ts.ResolvedModule[] {
-    //     const resolvedModules: ts.ResolvedModule[] = [];
-    //     for (const moduleName of moduleNames) {
-    //     // try to use standard resolution
-    //     let result = ts.resolveModuleName(moduleName, containingFile, options, {
-    //         fileExists,
-    //         readFile,
-    //     });
-    //     if (result.resolvedModule) {
-    //         resolvedModules.push(result.resolvedModule);
-    //     } else {
-    //         // check fallback locations, for simplicity assume that module at location
-    //         // should be represented by '.d.ts' file
-    //         // for (const location of moduleSearchLocations) {
-    //         //     const modulePath = path.join(location, moduleName + ".d.ts");
-    //         //     if (fileExists(modulePath)) {
-    //         //         resolvedModules.push({ resolvedFileName: modulePath });
-    //         //     }
-    //         // }
-    //     }
-    //     }
-    //     return resolvedModules;
-    // }
 }
 
 function generateRawSeaAsset(hash: string) {
@@ -732,7 +701,8 @@ module.exports = { buffer, hash }
 `.trim()
 }
 
-function generateLazyModule(spec: string, obfuscate = true) {
+// The obfuscation is so `esbuild` doesn't try to re-resolve it
+function generateLazyModule(spec: string, obfuscate = true, allowDynamicLink = false) {
     function obfuscateSpec() {
         if (!obfuscate) {
             return ts.factory.createStringLiteral(spec)
@@ -745,6 +715,48 @@ function generateLazyModule(spec: string, obfuscate = true) {
             ),
             undefined,
             [...spec].map(c => c.codePointAt(0)!).map(n => createLiteral(n))
+        )
+    }
+
+    function createRequire(spec: string | ts.Expression) {
+        return ts.factory.createCallExpression(
+            ts.factory.createIdentifier('require'),
+            undefined,
+            [typeof spec === 'string' ? ts.factory.createStringLiteral(spec) : spec]
+        )
+    }
+
+    function loadModule() {
+        if (!allowDynamicLink) {
+            return createRequire(obfuscateSpec())
+        }
+
+        const req = ts.factory.createCallExpression(
+            ts.factory.createPropertyAccessExpression(
+                createRequire('node:module'),
+                'createRequire'
+            ),
+            undefined,
+            [ts.factory.createPropertyAccessExpression(
+                ts.factory.createIdentifier('process'),
+                'execPath'
+            )]
+        )
+
+        return ts.factory.createImmediatelyInvokedArrowFunction(
+            [ts.factory.createTryStatement(
+                ts.factory.createBlock([
+                    ts.factory.createReturnStatement(
+                        ts.factory.createCallExpression(req, undefined, [ts.factory.createStringLiteral(spec.slice('lazy-load:'.length))])
+                    )
+                ]),
+                ts.factory.createCatchClause(undefined, ts.factory.createBlock([
+                    ts.factory.createReturnStatement(
+                        createRequire(obfuscateSpec())
+                    )
+                ])),
+                undefined,
+            )]
         )
     }
 
@@ -764,11 +776,7 @@ function generateLazyModule(spec: string, obfuscate = true) {
                 ts.factory.createReturnStatement(ts.factory.createTrue())
             ),
 
-            createVariableStatement('mod', ts.factory.createCallExpression(
-                ts.factory.createIdentifier('require'),
-                undefined,
-                [obfuscateSpec()]
-            )),
+            createVariableStatement('mod', loadModule()),
 
             ts.factory.createExpressionStatement(
                 ts.factory.createAssignment(
@@ -1205,6 +1213,17 @@ function tryOptimization(ops: ReflectionOperation[]) {
             if (ops[1].type === 'get' && ops[1].property === 'Archive') {
                 return emptyClass
             }
+
+            if (ops[1].type === 'get' && ops[1].property === 'defer') {
+                return ts.factory.createArrowFunction(
+                    undefined, 
+                    undefined, 
+                    [ts.factory.createParameterDeclaration(undefined, undefined, 'fn')],
+                    undefined, 
+                    undefined, 
+                    ts.factory.createCallExpression(ts.factory.createIdentifier('fn'), undefined, [])
+                )
+            }
         } else if (ops.length === 3) {
             if (ops[1].type === 'get' && ops[1].property === 'defineResource' && ops[2].type === 'apply') {
                 return emptyClass
@@ -1561,7 +1580,7 @@ function renderSerializedData(
     for (const obj of Object.values(table)) {
         if (obj === null || obj === undefined) continue // Not needed anymore??
 
-        const browserImpl = platform === 'browser' ? getSymbol(obj, 'browserImpl') : undefined
+        const browserImpl = platform === 'browser' ? getSymbol(obj, 'synapse.browserImpl') : undefined
         if (browserImpl) {
             const resolved = moveableStr in browserImpl ? table[browserImpl[moveableStr].id] : browserImpl
             renderEntry({ ...resolved, id: obj.id })

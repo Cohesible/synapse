@@ -18,6 +18,7 @@ import { gzip, memoize, throwIfNotFileNotFoundError } from '../utils'
 import { getLogger } from '..'
 import { randomUUID } from 'node:crypto'
 import { createZipFromDir } from '../deploy/deployment'
+import { tmpdir } from 'node:os'
 
 
 const integrations = {
@@ -557,15 +558,14 @@ export async function createPackageForRelease(pkgDir: string, dest: string, targ
             })
 
             await getFs().writeFile(esbuildBinPath, data)
+            if (target?.sign) {
+                await sign(esbuildBinPath)
+            }
 
             return true
         }
 
         if (await maybeCopyEsbuildBinary()) {
-            if (target?.sign) {
-                // TODO: sign `esbuild`
-            }
-
             await getFs().deleteFile(path.resolve(dest, 'node_modules', '@esbuild')).catch(throwIfNotFileNotFoundError)
 
             if (target.snapshot) {
@@ -610,7 +610,6 @@ export async function createPackageForRelease(pkgDir: string, dest: string, targ
     return { pruned }
 
     // TODO: write hash list
-    // TODO: sign everything
 }
 
 function stripComments(text: string) {
@@ -657,7 +656,9 @@ export async function createArchive(dir: string, dest: string, sign?: boolean) {
         throw new Error(`Not implemented: ${path.extname(dest)}`)
     }
 
-    // TODO: notarize for darwin
+    if (process.env.APPLE_CONNECT_CREDS) {
+        await notarize(dest, JSON.parse(process.env.APPLE_CONNECT_CREDS))
+    }
 }
 
 function pruneObject(obj: Record<string, any>, s: Set<string>) {
@@ -754,14 +755,17 @@ async function codesign(fileName: string, certId: string, entitlementsPath?: str
 
 interface ConnectCreds {
     id: string
-    key: string // file path
+    key: string // base64 encoded
     issuer: string
     teamId: string
 }
 
 async function notarize(fileName: string, creds: ConnectCreds) {
+    const keyPath = path.resolve(tmpdir(), `connect-authkey-${creds.id}.p8`)
+    await getFs().writeFile(keyPath, Buffer.from(creds.key, 'base64'))
+
     const credsArgs = [
-        '--key', creds.key,
+        '--key', keyPath,
         '--key-id', creds.id,
         '--issuer', creds.issuer,
         '--team-id', creds.teamId
@@ -775,12 +779,16 @@ async function notarize(fileName: string, creds: ConnectCreds) {
         ...credsArgs,
     ]
 
-    const res = JSON.parse(await runCommand('xcrun', args)) as { id: string; status: string; message: string }
-    if (res.status === 'Invalid') {
-        const logsRaw = await runCommand('xcrun', ['notarytool', 'log', res.id, ...credsArgs])
-        const logs = JSON.parse(logsRaw)
-
-        throw new Error(`Failed to notarize: ${logsRaw}`)
+    try {
+        const res = JSON.parse(await runCommand('xcrun', args)) as { id: string; status: string; message: string }
+        if (res.status === 'Invalid') {
+            const logsRaw = await runCommand('xcrun', ['notarytool', 'log', res.id, ...credsArgs])
+            const logs = JSON.parse(logsRaw)
+    
+            throw new Error(`Failed to notarize: ${logsRaw}`)
+        }
+    } finally {
+        await getFs().deleteFile(keyPath).catch(e => getLogger().warn('Failed to delete connect key', e))
     }
 }
 
@@ -805,11 +813,8 @@ const entitlements = `
 </plist>
 `
 
+// TODO: support signing on Windows
 async function sign(fileName: string, entitlements?: string) {
-    if (process.platform !== 'darwin') {
-        return
-    }
-
     const keyId = process.env.SIGNING_KEY_ID
     if (!keyId) {
         throw new Error(`Missing environment variable: SIGNING_KEY_ID`)
@@ -820,15 +825,14 @@ async function sign(fileName: string, entitlements?: string) {
         await getFs().writeFile(entitlementsPath, entitlements)
     }
 
-    await codesign(fileName, keyId, entitlementsPath).catch(e => {
-        if ((e as any).stderr?.includes('is already signed')) {
-            return
+    await runCommand('codesign', ['--remove-signature', fileName])
+    // signtool remove /s <filename>
+
+    await codesign(fileName, keyId, entitlementsPath).finally(async () => {
+        if (entitlements && entitlementsPath) {
+            await getFs().deleteFile(entitlementsPath)
         }
     })
-
-    if (entitlements && entitlementsPath) {
-        await getFs().deleteFile(entitlementsPath)
-    }
 }
 
 export async function signWithDefaultEntitlements(fileName: string) {

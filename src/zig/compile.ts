@@ -173,7 +173,8 @@ function init() {
     if (isSea) {
         const source = require('raw-sea-asset:./${relPath}');
         const synapseInstall = process.env.SYNAPSE_INSTALL ?? path.resolve(require('node:os').homedir(), '.synapse');
-        const dest = path.resolve(synapseInstall, 'cache', 'dlls', source.hash);
+        const name = process.platform === 'win32' ? source.hash + '.synapse' : source.hash
+        const dest = path.resolve(synapseInstall, 'cache', 'dlls', name);
         const fs = require('node:fs');
         if (!fs.existsSync(dest)) {
             fs.mkdirSync(path.dirname(dest), { recursive: true });

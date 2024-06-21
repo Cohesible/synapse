@@ -5,9 +5,10 @@ import * as child_process from 'node:child_process'
 import { Bundle } from 'synapse:lib'
 import { logToFile } from '../../cli/logger'
 import { getLogger } from '../../logging'
-import { client, AnalyticsEvent } from './backend'
+import { createClient, AnalyticsEvent } from './backend'
 import { getLogsDirectory, getSocketsDirectory } from '../../workspaces'
 import { ensureDir } from '../../system'
+import { memoize } from '../../utils'
 
 const getSocketPath = () => path.resolve(getSocketsDirectory(), 'analytics.sock')
 
@@ -40,12 +41,14 @@ interface AnalyticsCommand {
 
 const hasClient = (function () {
     try {
-        client.postEvents
+        createClient()
         return true
     } catch {
         return false
     }
 })()
+
+const getClient = memoize(createClient)
 
 const getLogFile = () => path.resolve(getLogsDirectory(), 'analytics.log')
 const getStartupLogs = () => path.resolve(getLogsDirectory(), 'analytics-startup.log')
@@ -107,7 +110,7 @@ export async function startServer() {
     async function _flush() {
         while (buffer.length > 0) {
             const batch = buffer.splice(0, 25)
-            await client.postEvents({ batch })
+            await getClient().postEvents({ batch })
         }
     }
 

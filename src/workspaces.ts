@@ -9,7 +9,7 @@ import { keyedMemoize, memoize, throwIfNotFileNotFoundError, tryReadJson, tryRea
 import { glob } from './utils/glob'
 import { getBuildTarget, getBuildTargetOrThrow, getFs, isInContext } from './execution'
 import { getBackendClient } from './backendClient'
-import { projects, processes } from '@cohesible/resources'
+import { projects } from '@cohesible/resources'
 import { getPackageJson } from './pm/packageJson'
 import { randomUUID } from 'node:crypto'
 
@@ -37,7 +37,9 @@ export interface LocalWorkspace extends Workspace {
     readonly deployOptions?: DeployOptions
 }
 
-export type SynapseConfiguration = DeployOptions
+export type SynapseConfiguration = DeployOptions & {
+    readonly exposeInternal?: boolean
+}
 
 const synDirName = '.synapse'
 
@@ -441,7 +443,7 @@ async function createDeployment(): Promise<{ id: string; local?: boolean }> {
         return { id: randomUUID(), local: true }
     }
 
-    return await getProcClient().createProcess()
+    throw new Error('Remote deployments not implemented')
 }
 
 async function _createProject(name: string, params: { url: string }): ReturnType<ReturnType<typeof getClient>['createProject']> {
@@ -660,7 +662,7 @@ export function getRootDir(programId?: string) {
 
 export function getWorkingDir(programId?: string, projectId?: string) {
     if (!programId) {
-        return getWorkingDirectory()
+        return getBuildTarget()?.workingDirectory ?? process.cwd()
     }
 
     projectId ??= getBuildTargetOrThrow().projectId
@@ -687,10 +689,6 @@ export function getWorkingDir(programId?: string, projectId?: string) {
 
 export function getRootDirectory() {
     return getBuildTargetOrThrow().rootDirectory
-}
-
-export function getWorkingDirectory() {
-    return getBuildTargetOrThrow().workingDirectory
 }
 
 export function getSynapseDir() {
@@ -750,15 +748,6 @@ function getClient(): typeof projects.client {
     try {
         projects.client.listProjects
         return projects.client
-    } catch {
-        return getBackendClient() as any
-    }
-}
-
-function getProcClient(): typeof processes.client {
-    try {
-        processes.client.listProcesses
-        return processes.client
     } catch {
         return getBackendClient() as any
     }

@@ -15,9 +15,10 @@ interface LambdaOptions {
     /** @unused */
     network?: net.Network
     timeout?: number
-    /** @unused */
     name?: string
     createImage?: boolean
+    arch?: 'aarch64' | 'amd64'
+    baseImage?: string
     imageCommands?: string[]
     /** Used for bundling */
     external?: string[]
@@ -27,9 +28,9 @@ interface LambdaOptions {
     servicePrincipals?: string[]
     /** @unused */
     publish?: boolean
+    env?: Record<string, string>
 }
 
-// LAMBDA FUNCTIONS MUST BE ASYNC TO BEHAVE AS EXPECTED (but why?)
 export class LambdaFunction<T extends any[] = any[], U = unknown> implements compute.Function<T, U> {
     private readonly client = new Lambda.Lambda({})
     public readonly resource: aws.LambdaFunction
@@ -43,11 +44,12 @@ export class LambdaFunction<T extends any[] = any[], U = unknown> implements com
         })
 
         const handler = `handler.default` // XXX: this name is hard-coded in `src/server.ts`
-        const environment = {}
+        const environment = opt?.env ?? {}
 
         const policyArn = 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
         const servicePrincipals = opt?.servicePrincipals ? [...opt.servicePrincipals, 'lambda.amazonaws.com'] : 'lambda.amazonaws.com'
         const role = new Role({
+            name: opt?.name ? `${opt.name}` : undefined,
             assumeRolePolicy: JSON.stringify(spPolicy(servicePrincipals)),
             managedPolicyArns: [policyArn],
         })
@@ -66,13 +68,14 @@ export class LambdaFunction<T extends any[] = any[], U = unknown> implements com
         } : undefined
 
         if (opt?.createImage) {
-            const { repo, deployment } = createImage(handler, entryPoint, opt.imageCommands)
+            const { repo, deployment } = createImage(handler, entryPoint, opt.imageCommands, opt.baseImage, opt.name)
             const imageUri = `${repo.repositoryUrl}:${deployment.tagName}`
             const fn = new aws.LambdaFunction({
-                functionName: lib.generateIdentifier(aws.LambdaFunction, 'functionName', 64),
+                functionName: opt.name ?? lib.generateIdentifier(aws.LambdaFunction, 'functionName', 64),
                 timeout: opt?.timeout ?? 900,
                 memorySize: opt?.memory ?? 1024,
                 packageType: 'Image',
+                architectures: opt.arch === 'aarch64' ? ['arm64'] : undefined,
                 role: role.resource.arn,
                 environment: {
                     variables: {
@@ -82,7 +85,8 @@ export class LambdaFunction<T extends any[] = any[], U = unknown> implements com
                 // Image tag _must_ be provided
                 imageUri, 
                 imageConfig: {
-                    command: [handler], // XXX: for some reason Lambda won't respect the dockerfile
+                     // XXX: for some reason Lambda won't respect the dockerfile
+                    command: [`${path.basename(entryPoint.destination)}.default`],
                 },
                 publish: opt.publish,
                 reservedConcurrentExecutions: opt.reservedConcurrency,
@@ -156,11 +160,16 @@ export class LambdaFunction<T extends any[] = any[], U = unknown> implements com
         }
 
         if (resp.FunctionError) {
-            throw JSON.parse(resultString)
+            const errResp = JSON.parse(resultString) as { errorType: string; errorMessage: string; trace: string }
+            const err = new Error(errResp.errorMessage)
+            err.name = errResp.errorType
+            // Maybe do this too
+            // err.stack = err.trace 
+            throw err
         }
 
         const respObj = JSON.parse(resultString)
-        if (typeof respObj === 'object' && !!respObj && respObj.val) {
+        if (typeof respObj === 'object' && !!respObj && 'val' in respObj) {
             return deserialize(respObj.val, respObj.type)
         }
 
@@ -256,10 +265,9 @@ function deserialize(val: any, type?: any): any {
         // TODO: everything else
         // It'll be easier to focus on refining a single serdes library
         // rather than re-implementing things easier
-
-        default:
-            return val
     }
+
+    return val
 }
 
 // This serialization is _very_ simple and hardly handles
@@ -367,14 +375,14 @@ function createS3Archive(props: ArchiveProps) {
 }
 
 
-function createImage(handler: string, entrypoint: lib.Bundle, extraCommands?: string[]) {
+function createImage(handler: string, entrypoint: lib.Bundle, extraCommands?: string[], baseImage?: string, name?: string) {
     const repo = new aws.EcrRepository({
-        name: lib.generateIdentifier(aws.EcrRepository, 'name', 256),
+        name: name ?? lib.generateIdentifier(aws.EcrRepository, 'name', 256),
         forceDelete: true,
     })
 
     const dockerfile = new GeneratedDockerfile(entrypoint, { 
-        baseImage: '--platform=linux/amd64 public.ecr.aws/lambda/nodejs:18', // This base image already has `@aws-sdk`
+        baseImage: baseImage ?? '--platform=linux/amd64 public.ecr.aws/lambda/nodejs:18', // This base image already has `@aws-sdk`
         entrypoint: handler,
         workingDirectory: '$${LAMBDA_TASK_ROOT}', // Need to escape ${}
         postCopyCommands: extraCommands,

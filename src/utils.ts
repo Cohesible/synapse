@@ -1533,9 +1533,7 @@ export function createFileHasher(fs: Pick<Fs, 'readFile' | 'writeFile' | 'stat'>
         try {
             return JSON.parse(await fs.readFile(path.resolve(cacheLocation, 'files.json'), 'utf-8'))
         } catch (e) {
-            if ((e as any).code !== 'ENOENT') {
-                throw e
-            }
+            throwIfNotFileNotFoundError(e)
             return {}
         }
     }

@@ -671,12 +671,15 @@ registerTypedCommand(
     {
         internal: true, // Temporary
         args: [{ name: 'symbols', type: 'string', allowMultiple: true }],
-        options: buildTargetOptions
+        options: [
+            ...buildTargetOptions,
+            { name: 'names-only',  type: 'boolean' }
+        ]
     },
     async (...args) => {
         const [symbols, opt] = unpackArgs(args)
 
-        await synapse.show(symbols, )
+        await synapse.show(symbols, opt)
     }
 )
 
@@ -817,7 +820,7 @@ registerTypedCommand(
     'dump-fs',  
     {
         internal: true,
-        args: [{ name: 'fs', optional: true, type: createUnionType(createEnumType('program', 'process', 'package'), objectHashType) }],
+        args: [{ name: 'fs', optional: true, type: createUnionType(createEnumType('program', 'deployment', 'package'), objectHashType) }],
         options: [...buildTargetOptions, { name: 'block', type: 'boolean', hidden: true }, { name: 'debug', type: 'boolean', hidden: true, defaultValue: true }]
     },
     async (fs, opt) => {
@@ -911,8 +914,12 @@ registerTypedCommand(
     {
         hidden: true,
         args: [],
+        options: [{ name: 'lazy-load', type: 'string', allowMultiple: true }, { name: 'no-sea', type: 'boolean' }],
     },
-    (p) => synapse.buildExecutables(p)
+    (opt) => synapse.buildExecutables({
+        sea: !opt['no-sea'],
+        lazyLoad: opt['lazy-load'],
+    })
 )
 
 registerTypedCommand(
@@ -1067,11 +1074,16 @@ registerTypedCommand(
     (...args) => synapse.explain(args[0]),
 )
 
+registerTypedCommand(
+    'load-moved', 
+    { internal: true, args: [{ name: 'moves', type: 'string' }] },
+    (filename) => synapse.loadMoved(filename),
+)
 
 registerTypedCommand(
-    'list-processes', 
+    'list-deployments', 
     { internal: true },
-    (...args) => synapse.listProcesses(),
+    (...args) => synapse.listDeployments(),
 )
 
 registerTypedCommand(

@@ -51,7 +51,6 @@ interface Logger {
     log: (...args: any[]) => void
 }
 
-/** @deprecated */
 declare function __getLogger(): Logger
 
 // export interface LogEvent {
@@ -156,7 +155,7 @@ export function waitForPromise<T>(promise: Promise<T> | T): T {
     return __waitForPromise(promise)
 }
 
-/** @deprecated @internal */
+/** @internal */
 export function getLogger(): Logger {
     if (typeof __getLogger === 'undefined') {
         return console
@@ -173,9 +172,9 @@ export function getLogger(): Logger {
 // More than one get/update operation pairs on a single resource implies that
 // the resource is actually composed of more than one resource
 
-export const context = Symbol.for('context')
-export const contextType = Symbol.for('contextType')
-const permissions = Symbol.for('permissions')
+export const context = Symbol.for('synapse.context')
+export const contextType = Symbol.for('synapse.contextType')
+const permissions = Symbol.for('synapse.permissions')
 const moveable2 = Symbol.for('__moveable__2')
 
 // AWS only
@@ -416,7 +415,7 @@ export function getArtifactFs(): ArtifactFs {
     return __getArtifactFs()
 }
 
-const browserImplSym = Symbol.for('browserImpl')
+const browserImplSym = Symbol.for('synapse.browserImpl')
 export function addBrowserImplementation<T extends object | Function, U extends T>(target: T, alt: U): void {
     if (browserImplSym in target) {
         throw new Error(`Target function already has a registered browser implementation: ${(target[browserImplSym] as any).name}`)

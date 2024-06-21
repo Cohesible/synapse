@@ -4,7 +4,7 @@ import { TargetsFile, readPointersFile } from '../compiler/host'
 import { getLogger, runTask } from '../logging'
 import { synapsePrefix, providerPrefix } from '../runtime/loader'
 import type { DependencyTree, PackageInfo } from '../runtime/modules/serdes'
-import { SynapseConfiguration, getSynapseDir, getRootDirectory, getToolsDirectory, getUserSynapseDirectory, getWorkingDir, getWorkingDirectory, getGlobalCacheDirectory, resolveProgramBuildTarget, getPackageCacheDirectory } from '../workspaces'
+import { SynapseConfiguration, getSynapseDir, getRootDirectory, getToolsDirectory, getUserSynapseDirectory, getWorkingDir, getGlobalCacheDirectory, resolveProgramBuildTarget, getPackageCacheDirectory } from '../workspaces'
 import { Mutable, acquireFsLock, createHasher, createMinHeap, deepClone, escapeRegExp, getHash, gunzip, isNonNullable, isRelativeSpecifier, isRunningInVsCode, isWindows, keyedMemoize, memoize, resolveRelative, strcmp, throwIfNotFileNotFoundError, tryReadJson } from '../utils'
 import type { TerraformPackageManifest } from '../runtime/modules/terraform'
 import { ProviderConfig, createProviderGenerator, getProviderSource, listProviderVersions } from '../codegen/providers'
@@ -20,7 +20,6 @@ import { getTerraformPath } from '../deploy/deployment'
 import { TypesFileData } from '../compiler/resourceGraph'
 import { createPointer, isDataPointer, pointerPrefix, toAbsolute, toDataPointer } from '../build-fs/pointers'
 import { ImportMap, SourceInfo, expandImportMap, flattenImportMap, hoistImportMap } from '../runtime/importMaps'
-import { packages } from '@cohesible/resources'
 import { execCommand } from '../utils/process'
 import { PackageJson, ResolvedPackage, createSynapseProviderRequirement, diffPkgDeps, getCurrentPkg, getPackageJson, getRequired, isFileUrl, resolveFileSpecifier, resolveWorkspaces, runIfPkgChanged, setCompiledPkgJson } from './packageJson'
 import { QualifiedBuildTarget, resolveBuildTarget, toNodeArch, toNodePlatform } from '../build/builder'
@@ -430,7 +429,34 @@ export interface PackageRepository {
     getPackageJson(name: string, version: string): Promise<PublishedPackageJson>
 }
 
+async function extractPackage(tarball: Buffer, dest: string, requirePkgJson = true) {
+    const fs = getFs()
+    const files = extractTarball(tarball)
+    const pkgFiles = files
+        .filter(f => !!f.path.match(/[\\\/]?package\.json$/))
+        .sort((a, b) => a.path.length - b.path.length)
 
+    const root = pkgFiles[0]?.path
+    if (!root && requirePkgJson) {
+        throw new Error(`Failed to find package.json in tarball`)
+    }
+
+    const prefix = root ? root.replace(/package\.json$/, '') : undefined
+    await Promise.all(files.map(async f => {
+        if (prefix && !f.path.startsWith(prefix)) {
+            return
+        }
+
+        const trimmedPath = prefix ? f.path.slice(prefix.length) : f.path
+        const absPath = path.resolve(dest, trimmedPath)
+        if (f.contents.length > 0 && !f.path.endsWith('/')) {
+            await fs.writeFile(absPath, f.contents, { mode: f.mode })
+        } else {
+            // FIXME: set dir permissions
+            // This is a directory
+        }
+    }))
+}
 
 type ImportMap2 = ImportMap<SourceInfo>
 
@@ -572,32 +598,8 @@ function createNpmPackageRepo(opt?: NpmRepoOptions): NpmPackageRepository {
     }
 
     async function downloadPackage(url: string, dest: string) {
-        const fs = getFs()
         const tarball = await client.downloadPackage(url)
-        const files = extractTarball(tarball)
-        const pkgFiles = files
-            .filter(f => f.path === 'package.json' || !!f.path.match(/[\\\/]package\.json$/))
-            .sort((a, b) => a.path.length - b.path.length)
-
-        const root = pkgFiles[0]?.path
-        if (!root) {
-            throw new Error(`Failed to find package.json in tarball`)
-        }
-
-        const prefix = root.replace(/package\.json$/, '')
-        await Promise.all(files.map(async f => {
-            if (!f.path.startsWith(prefix)) {
-                return
-            }
-
-            const absPath = path.resolve(dest, f.path.slice(prefix.length))
-            if (f.contents.length > 0 && !f.path.endsWith('/')) {
-                await fs.writeFile(absPath, f.contents, { mode: f.mode })
-            } else {
-                // FIXME: set dir permissions
-                // This is a directory
-            }
-        }))
+        await extractPackage(tarball, dest)
     }
 
     const pending = new Map<string, Promise<{ cached: boolean; dest: string }>>()
@@ -763,7 +765,7 @@ function createSprRepoWrapper(
 
     const workspacePackages = new Map<string, { version: VersionConstraint, location: string }>()
 
-    const getPrivatePackageManifest = keyedMemoize(async function (name: string): Promise<packages.ProjectScopedPackage> {
+    const getPrivatePackageManifest = keyedMemoize(async function (name: string): Promise<any> {
         const l = path.resolve(sprCacheDir, name)
 
         try {
@@ -771,13 +773,7 @@ function createSprRepoWrapper(
         } catch (e) {
             throwIfNotFileNotFoundError(e)
 
-            const manifest = await packages.client.findProjectPackage(name, projectId)
-            if (!manifest) {
-                throw new Error(`No package named "${name}" found in current project`)
-            }
-            await fs.writeFile(l, JSON.stringify(manifest))
-    
-            return manifest
+            throw new Error(`SPR not implemented`)
         }
     })
 
@@ -869,11 +865,7 @@ function createSprRepoWrapper(
 
                 if (!(await fs.fileExists(dest))) {
                     getLogger().log(`Extracting specifier "${spec}" to:`, dest)
-                    const files = extractTarball(await gunzip(data))
-                    await Promise.all(files.map(async f => {
-                        const absPath = path.resolve(dest, f.path)
-                        await fs.writeFile(absPath, f.contents)
-                    }))
+                    await extractPackage(await gunzip(data), dest, false)
                 }
 
                 pattern = `file:${dest}`
@@ -2630,7 +2622,6 @@ export async function downloadAndInstall(
     const doResolve = () => resolveDepsGreedy(deps, repo, { oldData: previousInstallation?.importMap, validateResult: false })
     const result = await runTask('install', 'resolve deps', doResolve, 10)
 
-    //getLogger().log(`Total specifiers resolved: ${result.installed.length}`)
     const oldPackages = previousInstallation?.packages
 
     const createManifest = () => toPackageManifestFromTree(repo, result, previousInstallation?.importMap)
@@ -2646,7 +2637,7 @@ export async function downloadAndInstall(
     const doWrite = () => writeToNodeModules(getFs(), mapping, pkg.directory, oldPackages, { 
         mode, 
         hoist: false,
-        hideInternalTypes: pkg.data.name === 'synapse' ? false : undefined,
+        hideInternalTypes: pkg.data.synapse?.config?.exposeInternal ? false : undefined,
     })
 
     const res = await runTask('install', 'write node_modules', doWrite, 100)
@@ -3405,7 +3396,6 @@ export function createPackageInstaller(params?: PackageInstallerParams) {
                     await downloadGitHubPackage(info, dest)
                     break
                 case 'spr':
-                case 'cspm':
                     await downloadSynapsePackage(info, dest)
                     break
                 case 'synapse-provider':
@@ -3423,30 +3413,7 @@ export function createPackageInstaller(params?: PackageInstallerParams) {
     }
 
     async function downloadSynapsePackage(info: PackageInfo, dest = getPackageDest(packagesDir, info)) {
-        const resp = await packages.client.getPackageData(info.resolved!.url, info.version)
-        const data = Buffer.from(resp.data, 'base64')
-        const dataHash = createHash('sha512').update(data).digest('base64url')
-        if (dataHash !== info.resolved!.integrity) {
-            throw new Error(`Integrity check failed for package "${info.name}"`) // FIXME: could have a better error
-        }
 
-        const files = extractTarball(await gunzip(data))
-        if (isSnapshotTarball(files)) {
-            getLogger().log('Unpacking snapshot...')
-            await unpackSnapshotTarball(repo, files, dest)
-        } else {
-            await Promise.all(files.map(async f => {
-                const absPath = path.resolve(dest, f.path)
-                await fs.writeFile(absPath, f.contents)
-            }))
-        }
-
-        await fs.writeFile(
-            path.resolve(dest, 'package.json'), 
-            JSON.stringify(resp.packageFile, undefined, 4)
-        )
-
-        return dest
     }
 
     async function downloadToolPackage(info: PackageInfo, dest = getPackageDest(packagesDir, info)) {
@@ -3651,20 +3618,6 @@ export function createPackageInstaller(params?: PackageInstallerParams) {
         }
     }
 
-
-        //const pkgData = pkgFiles[0].contents
-        //const pkg = JSON.parse(pkgData.toString('utf-8')) as PackageJson
-
-        // const postinstall = pkg.scripts?.postinstall
-        // if (postinstall) {
-        //     if (runInstallScripts) {
-        //         getLogger().log(`Running postinstall script for package: ${info.resolved!.url}`)
-        //         await runPostInstall(postinstall, dest, pkg)
-        //     } else {
-        //         getLogger().warn(`Skipping running postinstall script for package: ${info.resolved!.url}`)
-        //     }
-        // } 
-
     async function getImportMapForPackage(pkg: PackageJson) {
         const deps = { ...pkg.dependencies, ...pkg.optionalDependencies }
         const repo = getNpmPackageRepo()
@@ -3841,7 +3794,7 @@ function getPackages(installation: Pick<InstallationAttributes, 'packages'>, wor
 const getSnapshot = keyedMemoize(loadSnapshot)
 
 export async function loadTypes() {
-    const workingDirectory = getWorkingDirectory()
+    const workingDirectory = getWorkingDir()
     const installation = await getInstallation(getProgramFs())
     const types: Record<string, TypesFileData> = {}
     const runtimeModules: Record<string, string> = {}
@@ -3966,7 +3919,7 @@ function getInstallationCached(fs: Pick<Fs, 'readFile'>) {
 
 export type PackageService = Awaited<ReturnType<typeof createPackageService>>
 export async function createPackageService(moduleResolver: ModuleResolver, repo = getDataRepository(), programFs: Pick<Fs, 'readFile'> & Pick<JsonFs, 'readJson'> = getProgramFs()) {
-    const workingDirectory = getWorkingDirectory()
+    const workingDirectory = getWorkingDir()
 
     const fs = getFs()
     const installer = createPackageInstaller({

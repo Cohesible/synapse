@@ -62,7 +62,7 @@ interface PathItem {
     readonly [name: `x-${string}`]: any | undefined;
 }
 type SchemaXORContent = (any & any & any & any & any);
-type ParameterLocation = {
+export type ParameterLocation = {
     readonly in?: "path";
     readonly style?: "matrix" | "label" | "simple";
     readonly required: true;
@@ -79,13 +79,13 @@ type ParameterLocation = {
 interface Reference {
     readonly "$ref"?: string;
 }
-interface Operation {
+export interface Operation {
     readonly tags?: string[];
     readonly summary?: string;
     readonly description?: string;
     readonly externalDocs?: ExternalDocumentation;
     readonly operationId?: string;
-    readonly parameters?: ((any & SchemaXORContent & ParameterLocation) | Reference)[];
+    readonly parameters?: ((ParameterLocation) | Reference)[];
     readonly requestBody?: RequestBody | Reference;
     readonly responses: Responses;
     readonly callbacks?: Record<string, Record<string, PathItem> | Reference>;
@@ -94,7 +94,7 @@ interface Operation {
     readonly servers?: Server[];
     readonly [name: `x-${string}`]: any | undefined;
 }
-interface RequestBody {
+export interface RequestBody {
     readonly description?: string;
     readonly content: Record<string, any>;
     readonly required?: boolean;
@@ -105,7 +105,7 @@ interface Responses {
     readonly [name: `${string}`]: (Response | Reference) | undefined;
     readonly [name: `x-${string}`]: any | undefined;
 }
-interface Response {
+export interface Response {
     readonly description: string;
     readonly headers?: Record<string, (any & SchemaXORContent) | Reference>;
     readonly content?: Record<string, any>;

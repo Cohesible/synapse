@@ -14,150 +14,42 @@ type ServiceRequest<T> = {
 }[keyof T]
 
 type Authorizer<T, R = void> = (authorization: string, request: ServiceRequest<T>) => Promise<R> | R
-type Authorization = () => Promise<string>
 
 type Promisify<T> = { [P in keyof T]: T[P] extends (...args: infer U) => infer R 
     ? R extends Promise<infer _> ? T[P]
     : (...args: U) => Promise<R> : T[P]
 }
 
-export type Client<T> = Omit<T, keyof Service>
-
-/**
- * `Service` is distinct from a normal class in that it creates
- * a "boundary" between external consumers and its internals. 
- * 
- * Normally a class is serialized in its entirety across all consumers, 
- * which may be problematic when embedded in client-side applications.
- */
-export abstract class Service<T = void> {
-    private authorizer?: Authorizer<this, T>
-    private authorization?:  () => Promise<string> | string
-    protected readonly context!: T
-
-    public constructor() {
-        this.init()
-    }
-
-    public addAuthorizer(authorizer: Authorizer<this, T>) {
-        this.authorizer = authorizer
-    }
-
-    public setAuthorization(authorization: () => Promise<string> | string) {
-        this.authorization = authorization
-    }
-
-    private init() {
-        // TODO: recursively do this operation until reaching `Service` as the proto
-        const proto = Object.getPrototypeOf(this)
-        const descriptors = Object.getOwnPropertyDescriptors(proto)
-        const client: Record<string, any> = {}
-
-        // XXX: a bit hacky. We use `defer` here because instance fields won't be initialized
-        // until after `init` returns. Normally it would be ok to capture `this` directly but
-        // in this case we cannot because we are essentially overriding the methods on the 
-        // instance. So we have to capture things indirectly instead.
-        core.defer(() => {
-            const service = new compute.HttpService({ 
-                mergeHandlers: true, 
-                auth: this.authorizer ? 'none' : 'native',
-            })
-
-            const ctor = proto.constructor
-            const self: Record<string, any> = {}
-            for (const [k, v] of Object.entries(this)) {
-                if (k in descriptors) continue
-                self[k] = v
-            }
-
-            let authz = this.authorization
-            async function getAuthorization() {
-                if (!authz) {
-                    throw new Error(`No credentials available`)
-                }
-
-                return await authz()
-            }
-            
-            client['setAuthorization'] = (fn:  () => Promise<string> | string) => void (authz = fn)
-
-            for (const [k, v] of Object.entries(descriptors)) {
-                if (k !== 'constructor' && typeof v.value === 'function') {
-                    const route = service.addRoute(`POST /__rpc/${k}`, async (req, body: { args: any[] }) => {
-                        const args = body.args
-                        if (self.authorizer) {
-                            const authorization = req.headers.get('authorization')
-                            if (!authorization) {
-                                throw new HttpError('Missing `Authorization` header', { statusCode: 401 })
-                            }
-
-                            const context = await self.authorizer(authorization, { method: k, args })
-                            const withContext = Object.assign({ context }, self)
-                            Object.setPrototypeOf(withContext, ctor.prototype) // FIXME: can we skip doing this somehow?
-
-                            return ctor.prototype[k].call(withContext, ...args)
-                        }
-
-                        Object.setPrototypeOf(self, ctor.prototype) // FIXME: can we skip doing this somehow?
-
-                        return ctor.prototype[k].call(self, ...args)
-                    })
-
-                    // Backwards compat
-                    service.addRoute(`POST /Default/__rpc/${k}`, async (req, body: { args: any[] }) => {
-                        const args = body.args
-                        if (self.authorizer) {
-                            const authorization = req.headers.get('authorization')
-                            if (!authorization) {
-                                throw new HttpError('Missing `Authorization` header', { statusCode: 401 })
-                            }
-
-                            const context = await self.authorizer(authorization, { method: k, args })
-                            const withContext = Object.assign({ context }, self)
-                            Object.setPrototypeOf(withContext, ctor.prototype) // FIXME: can we skip doing this somehow?
-
-                            return ctor.prototype[k].call(withContext, ...args)
-                        }
-
-                        Object.setPrototypeOf(self, ctor.prototype) // FIXME: can we skip doing this somehow?
-
-                        return ctor.prototype[k].call(self, ...args)
-                    })
-    
-                    if (this.authorizer) {
-                        client[k] = async (...args: any[]) => {
-                            const authorization = await getAuthorization()
-                            const fetcher = createFetcher({ headers: { authorization } })
-
-                            return fetcher.fetch(route, { args } as any)
-                        }
-                    } else {
-                        client[k] = (...args: any[]) => service.callOperation(route, { args } as any)
-                    }
-                }
-            }
-
-            Object.assign(this, client)
-        })
-    }
-}
-
-export type Client2<T> = Promisify<Omit<T, keyof Service2>>
+export type Client<T> = Promisify<Omit<T, keyof Service>>
 
 export interface ClientConfig {
     authorization?: () => Promise<string> | string
 }
 
-function createClientClass<T>(routes: Record<string, HttpRoute>): new (config?: ClientConfig) => Client2<T> {
+// We currently capture declared symbols but we don't want that here
+// So this is a way to use `core.defer` without capturing it
+const container = { defer: core.defer as typeof core.defer | undefined }
+core.defer(() => (delete container.defer))
+
+function createClientClass<T>(routes: Record<string, HttpRoute>): new (config?: ClientConfig) => Client<T> {
     class Client {
         constructor(config?: ClientConfig) {
-            for (const [k, route] of Object.entries(routes)) {
-                (this as any)[k] = async (...args: any[]) => {
-                    const authorization = await config?.authorization?.()
-                    const fetcher = createFetcher(authorization ? { headers: { authorization } } : undefined)
-    
-                    return fetcher.fetch(route, { args } as any)
+            const init = () => {
+                for (const [k, route] of Object.entries(routes)) {
+                    (this as any)[k] = async (...args: any[]) => {
+                        const authorization = await config?.authorization?.()
+                        const fetcher = createFetcher(authorization ? { headers: { authorization } } : undefined)
+        
+                        return fetcher.fetch(route, { args } as any)
+                    }
                 }
+            }
+
+            // We need to use `defer` here because `routes` is also deferred
+            if (container.defer !== undefined) {
+                container.defer(init)
+            } else {
+                init()
             }
         }
     }
@@ -170,7 +62,7 @@ interface ServiceOptions {
     readonly domain?: net.HostedZone
 }
 
-export abstract class Service2<T = void> {
+export abstract class Service<T = void> {
     #authorizer?: Authorizer<this, T>
     protected readonly context!: T
 

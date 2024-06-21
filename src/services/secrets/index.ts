@@ -9,7 +9,7 @@ import { getInmemSecretService } from './inmem'
 
 const secretsCache = new Map<string, secrets.Secret>()
 
-// XXX: WE SHOULDN'T DO THIS
+// XXX: we should not be storing this in plaintext. OS keychain would be best
 const getSecretsCacheFile = () => path.resolve(
     getGlobalCacheDirectory(), // TODO: this should be a per-project (or per-program) cache
     'secrets.json'

@@ -72,7 +72,8 @@ export class Queue<T> implements storage.Queue<T> {
 
     on(event: 'message', listener: (ev: T) => Promise<void> | void) {
         const bundle = new lib.Bundle(listener)
-        new QueueListener(this.bucket, bundle.destination)
+        const resolved = lib.resolveArtifact(bundle.destination as any, bundle.extname)
+        new QueueListener(this.bucket, resolved.filePath)
     }
 }
 

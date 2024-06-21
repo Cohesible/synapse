@@ -242,7 +242,7 @@ const original = Symbol.for('original')
 const unproxy = Symbol.for('unproxy')
 const moveable = Symbol.for('__moveable__')
 const moveable2 = Symbol.for('__moveable__2')
-const permissions = Symbol.for('permissions')
+const permissions = Symbol.for('synapse.permissions')
 const unproxyParent = Symbol.for('unproxyParent')
 const expressionSym = Symbol.for('expression')
 

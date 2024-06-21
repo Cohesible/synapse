@@ -276,7 +276,7 @@ async function multiGlob(fs: GlobHost, dir: string, patterns: Exclude<GlobCompon
         }
     
         const isGlobstar = g[0].type === 'wildcard' && g[0].value === '**'
-        const isWildcard = isGlobstar || g.some(x => x.type !== 'literal') // Case insentive -> wildcard?
+        const isWildcard = isGlobstar || g.some(x => x.type !== 'literal') // Case insensitive -> wildcard?
         if (isWildcard) {
             if (isGlobstar) {
                 globstars.add(i)
@@ -350,6 +350,11 @@ async function multiGlob(fs: GlobHost, dir: string, patterns: Exclude<GlobCompon
         const nextPatterns: number[] = []
         for (let i = 0; i < wildcardSegments.length; i++) {
             const [j, g] = wildcardSegments[i]
+
+            // '*' by itself does not match directories
+            if (g.length === 1 && g[0].type === 'wildcard' && g[0].value === '*') {
+                continue
+            }
 
             if (globstars.has(j)) {
                 if (match(j, name, g)) {

@@ -164,8 +164,8 @@ if (Symbol.asyncDispose) {
     knownSymbols.push(Symbol.asyncDispose)
 }
 
-const permissions = Symbol.for('permissions')
-const browserImpl = Symbol.for('browserImpl')
+const permissions = Symbol.for('synapse.permissions')
+const browserImpl = Symbol.for('synapse.browserImpl')
 const objectId = Symbol.for('synapse.objectId')
 
 const unproxy = Symbol.for('unproxy')
@@ -1756,7 +1756,7 @@ export function createTerraformClass<T = any>(
                 props['provider'] = getProviderForElement({ name, type })
             } else if (kind === 'provider') {
                 Object.assign(this, props)
-                // Object.defineProperty(this, Symbol.for('context'), {
+                // Object.defineProperty(this, Symbol.for('synapse.context'), {
                 //     get: () => ({ [type]: proxy })
                 // })
             }
@@ -1782,7 +1782,7 @@ export function createTerraformClass<T = any>(
     } as any
 
     if (kind === 'provider') {
-        Object.defineProperty(c, Symbol.for('contextType'), { 
+        Object.defineProperty(c, Symbol.for('synapse.contextType'), { 
             value: type,
             enumerable: true,
         })

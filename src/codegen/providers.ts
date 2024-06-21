@@ -1,6 +1,6 @@
 import ts from 'typescript'
 import * as path from 'node:path'
-import { getProviderCacheDir, getProviderTypesDirectory, getWorkingDirectory, getGlobalCacheDirectory } from '../workspaces'
+import { getProviderCacheDir, getProviderTypesDirectory, getGlobalCacheDirectory, getWorkingDir } from '../workspaces'
 import { capitalize, memoize, toAmbientDeclarationFile, toSnakeCase } from '../utils'
 import { providerPrefix } from '../runtime/loader'
 import { Fs, SyncFs } from '../system'
@@ -803,6 +803,6 @@ export function createProviderGenerator(fs: Fs & SyncFs, providerRegistryHostnam
     return { 
         generate,
         resolveProvider,
-        installTypes: (packages: Record<string, string>, workingDirectory = getWorkingDirectory()) => installTypes(fs, workingDirectory, packages),
+        installTypes: (packages: Record<string, string>, workingDirectory = getWorkingDir()) => installTypes(fs, workingDirectory, packages),
     }
 }

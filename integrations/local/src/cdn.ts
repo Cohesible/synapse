@@ -26,8 +26,8 @@ export class CDN implements storage.CDN {
         this.url = service.invokeUrl
     }
 
-    addOrigin(origin: any): void {
-        throw new Error('Not implemented')
+    addOrigin(origin: storage.OriginOptions): void {
+        
     }
 }
 

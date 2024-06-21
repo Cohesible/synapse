@@ -246,8 +246,9 @@ function getEntrypointPatterns(pkg: PackageJson) {
 function resolvePackageEntrypoints(pkg: PackageJson, dir: string, rootDir: string, opt: ts.CompilerOptions) {
     const res = { ...pkg }
     const compiledEntrypoints = new Set<string>()
+    let shouldEmitDeclarations = false
     
-    function resolve(p: string) {
+    function resolve(p: string, isPkgEntrypoint = false) {
         const resolved = resolveRelative(dir, p)
         if (opt.outDir && resolved.startsWith(opt.outDir)) {
             return p
@@ -257,17 +258,20 @@ function resolvePackageEntrypoints(pkg: PackageJson, dir: string, rootDir: strin
         const outfile = getOutputFilename(rootDir, opt, sourceFile)
         if (sourceFile !== outfile) {
             compiledEntrypoints.add(sourceFile)
+            if (opt.declaration === undefined && isPkgEntrypoint && !shouldEmitDeclarations && !!sourceFile.match(/\.tsx?$/)) {
+                shouldEmitDeclarations = true
+            }
         }
 
         return `./${makeRelative(dir, outfile)}`
     }
 
     if (res.main) {
-        res.main = resolve(res.main)
+        res.main = resolve(res.main, true)
     }
 
     if (res.module) {
-        res.module = resolve(res.module)
+        res.module = resolve(res.module, true)
     }
 
     if (res.types) {
@@ -290,14 +294,14 @@ function resolvePackageEntrypoints(pkg: PackageJson, dir: string, rootDir: strin
     if (res.exports) {
         // TODO: handle all cases
         if (typeof res.exports === 'string') {
-            res.exports = resolve(res.exports)
+            res.exports = resolve(res.exports, true)
         } else if (typeof res.exports === 'object') {
             for (const [k, v] of Object.entries(res.exports)) {
                 if (!k.startsWith('.') || typeof v !== 'string') {
                     continue
                 }
 
-                res.exports[k] = resolve(v)
+                res.exports[k] = resolve(v, true)
             }
         }
     }
@@ -305,6 +309,7 @@ function resolvePackageEntrypoints(pkg: PackageJson, dir: string, rootDir: strin
     return {
         packageJson: res,
         compiledEntrypoints: [...compiledEntrypoints].map(x => makeRelative(dir, x)),
+        shouldEmitDeclarations,
     }
 }
 
@@ -335,15 +340,10 @@ async function resolveEntrypoints(dir: string, patterns: string[], parsed: Parse
 async function resolvePackage(pkg: PackageJson, dir: string, parsed: ParsedConfig) {
     const compiled = resolvePackageEntrypoints(pkg, dir, parsed.rootDir, parsed.cmd.options)
 
-    return { pkg: compiled.packageJson, compiledEntrypoints: compiled.compiledEntrypoints }
-    // const patterns = getEntrypointPatterns(pkg)
-    // if (patterns.length === 0) {
-    //     return { pkg: compiled }
-    // }
-
-    // const entrypoints = await resolveEntrypoints(dir, patterns, parsed)
-
-    // return { pkg: compiled, entrypoints }
+    return {
+        ...compiled,
+        pkg: compiled.packageJson, 
+    }
 }
 
 // Creates a package.json file for one-off scripts/experiments/etc.
@@ -357,7 +357,8 @@ function createSyntheticPackage(opt?: CompilerOptions, targetFiles?: string[]) {
                 },
             } : undefined
         } as PackageJson,
-        compiledEntrypoints: undefined as string[] | undefined
+        compiledEntrypoints: undefined as string[] | undefined,
+        shouldEmitDeclarations: false,
     }
 }
 
@@ -387,9 +388,20 @@ export async function resolveProgramConfig(opt?: CompilerOptions, targetFiles?: 
         getPreviousPkg()
     ])
 
+    // TODO: this should happen earlier in the parsing i.e. before we hand
+    // over the options to `typescript`.
+    if (pkg?.tsconfig?.compilerOptions) {
+        Object.assign(parsed.cmd.options, pkg?.tsconfig?.compilerOptions)
+    }
+
     const resolvedPkg = pkg !== undefined
         ? await runTask('resolve', 'pkg', () => resolvePackage(pkg, bt.workingDirectory, parsed), 5) 
         : createSyntheticPackage(opt, targetFiles)
+
+    // Automatically enable declaration if we expose a typescript file in `package.json`
+    if (parsed.cmd.options.declaration === undefined && resolvedPkg.shouldEmitDeclarations) {
+        parsed.cmd.options.declaration = true
+    }
 
     const deployTarget = opt?.deployTarget ?? (previousPkg?.synapse?.config?.target ?? 'local')
     if (deployTarget) {

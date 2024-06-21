@@ -1,5 +1,8 @@
 import ts from 'typescript'
-import { isNonNullable, printNodes } from '../utils'
+import * as path from 'node:path'
+import { getFs } from '../execution'
+import { createObjectLiteral, isNonNullable, printNodes } from '../utils'
+import { OpenApiModel, Operation, ParameterLocation, RequestBody, Response } from './openapiv3'
 
 // Rough impl. of JSONSchema7
 
@@ -185,28 +188,29 @@ function normalizeName(name: string) {
     return name.split(/[_\-\$.]/).map(s => s.charAt(0).toUpperCase().concat(s.slice(1))).join('')
 }
 
-export function createSchemaGenerator(root: SchemaBase) {
-    function evalPointer(p: string) {
-        // ~0 for ~
-        // ~1 for /
+function resolveRef(root: any, p: string) {
+    // ~0 for ~
+    // ~1 for /
 
-        const parts = p.split('/').map(s => s.replace(/~0/g, '~').replace(/~1/g, '/'))
-        const first = parts.shift()
-        if (first !== '#') {
-            throw new Error('Only document-relative pointers are supported')
-        }
-        
-        let c: any = root
-        while (parts.length > 0) {
-            const s = parts.shift()!
-            if (!c) {
-                throw new Error(`Attempted to index a falsy value at segment "${s}" in pointer "${p}"`)
-            }
-            c = c[s]
-        }
-
-        return c
+    const parts = p.split('/').map(s => s.replace(/~0/g, '~').replace(/~1/g, '/'))
+    const first = parts.shift()
+    if (first !== '#') {
+        throw new Error('Only document-relative pointers are supported')
     }
+    
+    let c: any = root
+    while (parts.length > 0) {
+        const s = parts.shift()!
+        if (!c) {
+            throw new Error(`Attempted to index a falsy value at segment "${s}" in pointer "${p}"`)
+        }
+        c = c[s]
+    }
+
+    return c
+}
+
+export function createSchemaGenerator(root: SchemaBase) {
 
     function literal(val: Literal) {
         if (val === null) {
@@ -341,7 +345,7 @@ export function createSchemaGenerator(root: SchemaBase) {
             if (!declarations.has(name)) {
                 declarations.set(name, true as any)
 
-                const v = render(evalPointer(schema.$ref))
+                const v = render(resolveRef(root, schema.$ref))
                 if (ts.isTypeLiteralNode(v)) {
                     const decl = ts.factory.createInterfaceDeclaration(undefined, name, undefined, undefined, v.members)
                     declarations.set(name, decl)
@@ -367,7 +371,8 @@ export function createSchemaGenerator(root: SchemaBase) {
 
         // `anyOf` is treated the same as `oneOf`
         if (isAnyOf(schema)) {
-            return ts.factory.createUnionTypeNode(schema.anyOf.map(render).filter(isNonNullable))
+            const merged = schema.anyOf.map(s => typeof s === 'object' ? { ...schema, ...s, anyOf: undefined } : s)
+            return ts.factory.createUnionTypeNode(merged.map(render).filter(isNonNullable))
         }
 
         if (isAllOf(schema)) {
@@ -454,6 +459,170 @@ export async function generateOpenApiV3() {
 
     const sf = ts.factory.createSourceFile(
         [...generator.getDeclarations() as any, decl], 
+        ts.factory.createToken(ts.SyntaxKind.EndOfFileToken), 
+        ts.NodeFlags.None
+    )
+
+    return printNodes(sf.statements, sf)
+}
+
+function toUpperCase(s: string) {
+    return s[0].toUpperCase().concat(s.slice(1))
+}
+
+interface XGitHub {
+    githubCloudOnly: boolean
+    enabledForGitHubApps: boolean
+    category: string
+    subcategory: string
+}
+
+export async function generateGitHubApi() {
+    const doc = await fetchJson<OpenApiModel>('https://unpkg.com/@octokit/openapi@16.6.0/generated/api.github.com.json')
+
+    type Param = ParameterLocation & {
+        name: string
+        schema: any
+    }
+
+    const generator = createSchemaGenerator(doc as any) 
+
+    function getOpName(opId: string) {
+        const parts = opId.split('/')
+        const segments = parts.at(-1)!.split('-')
+        if (parts.length > 1) {
+            const subject = parts.at(-2)!
+            if (!parts.at(-1)!.includes(subject)) {
+                segments.splice(1, 0, ...subject.split('-'))
+            }
+        }
+
+        return segments.map((s, i) => i === 0 ? s : toUpperCase(s)).join('')
+    }
+
+    function renderOpResponse(name: string, op: Operation) {
+        if (op.responses['204']) {
+            return ts.factory.createTypeReferenceNode('void')
+        }
+
+        // We're just assuming the schemas are the same for all 3 statuses
+        const resp = op.responses['200'] ?? op.responses['201'] ?? op.responses['202']
+        if (!resp) {
+            return ts.factory.createTypeReferenceNode('void')
+        }
+
+        const r: Response = isRef(resp) ? resolveRef(doc, resp.$ref) : resp
+        const c = r.content?.['application/json']
+        if (!c) {
+            if (r.content?.['text/html']) {
+                return ts.factory.createTypeReferenceNode('string')
+            }
+
+            // `application/octocat-stream` lol
+
+            return ts.factory.createTypeReferenceNode('unknown')
+        }
+
+        const respName = `${toUpperCase(name)}Response`
+        const type = generator.render(c.schema)
+        if (ts.isTypeLiteralNode(type)) {
+            decls.push(ts.factory.createInterfaceDeclaration(
+                [ts.factory.createModifier(ts.SyntaxKind.ExportKeyword)], 
+                respName,
+                undefined, 
+                undefined, 
+                type.members
+            ))
+            return ts.factory.createTypeReferenceNode(respName)
+        }
+
+        return type
+    }
+
+    function renderOp(method: string, path: string, name: string, op: Operation) {
+        const requestMembers: Record<string, any> = {}
+        const required = new Set<string>()
+        const resolvedParams = (op.parameters ?? []).map(p => {
+            return (isRef(p) ? resolveRef(doc, p.$ref) : p) as Param
+        })
+        for (const r of resolvedParams) {
+            requestMembers[r.name] = generator.render(r.schema)
+            if ((r as any).required) {
+                required.add(r.name)
+            }
+        }
+
+        if (op.requestBody) {
+            const r = (isRef(op.requestBody) ? resolveRef(doc, op.requestBody.$ref) : op.requestBody) as RequestBody
+            const jsonBody = r.content['application/json']
+            if (jsonBody) {
+                requestMembers['body'] = generator.render(jsonBody.schema)
+            } else {
+                requestMembers['body'] = ts.factory.createTypeReferenceNode('ArrayBuffer') // TODO: need `BinaryLike` type
+            }
+
+            if (r.required) {
+                required.add('body')
+            }
+        }
+
+        const decls: any[] = []
+        decls.push(ts.factory.createInterfaceDeclaration(
+            [ts.factory.createModifier(ts.SyntaxKind.ExportKeyword)], 
+            `${toUpperCase(name)}Request`, 
+            undefined, 
+            undefined, 
+            Object.entries(requestMembers).map(
+                ([k, v]) => ts.factory.createPropertySignature(undefined, k, required.has(k) ? undefined : ts.factory.createToken(ts.SyntaxKind.QuestionToken), v)
+            )
+        ))
+
+        const resp = renderOpResponse(name, op)
+        const prunedParams = resolvedParams.map(r => ({...r, description: undefined, schema: undefined, examples: undefined, example: undefined, required: (r as any).required ? true : undefined }))
+        const fn = ts.factory.createFunctionDeclaration(
+            [ts.factory.createModifier(ts.SyntaxKind.ExportKeyword)], 
+            undefined,
+            name,
+            undefined,
+            [ts.factory.createParameterDeclaration(undefined, undefined, 'request', undefined, ts.factory.createTypeReferenceNode(`${toUpperCase(name)}Request`))],
+            ts.factory.createTypeReferenceNode('Promise', [resp]),
+            ts.factory.createBlock([
+                ts.factory.createReturnStatement(
+                    ts.factory.createCallExpression(
+                        ts.factory.createIdentifier('sendRequest'),
+                        undefined,
+                        [
+                            ts.factory.createStringLiteral(`https://api.github.com`),
+                            ts.factory.createStringLiteral(method),
+                            ts.factory.createStringLiteral(path),
+                            ts.factory.createArrayLiteralExpression(prunedParams.map(r => createObjectLiteral(r))),
+                            ts.factory.createIdentifier('request'),
+                        ]
+                    )
+                )
+            ], true)
+        )
+
+        decls.push(fn)
+
+        return decls
+    }
+
+    const decls: any[] = []
+    for (const [k, v] of Object.entries(doc.paths)) {
+        for (const [k2, v2] of Object.entries(v)) {
+            if (k2 === 'get' || k2 === 'post') {
+                const op = v2 as Operation
+                if (!op.operationId) continue
+
+                const name = getOpName(op.operationId)
+                decls.push(...renderOp(k2.toUpperCase(), k, name, v2 as any))
+            }
+        }
+    }
+
+    const sf = ts.factory.createSourceFile(
+        [...generator.getDeclarations() as any, ...decls], 
         ts.factory.createToken(ts.SyntaxKind.EndOfFileToken), 
         ts.NodeFlags.None
     )
@@ -598,17 +767,7 @@ export async function generateStripeWebhooks() {
     return printNodes(sf.statements, sf)
 }
 
-
-// Stripe
-// https://github.com/stripe/openapi
-//
-// Vendor extensions
-// x-expandableFields
-// x-expansionResources
-// 
-// Webhooks
-// "x-stripeEvent": {
-//    "type": "account.application.authorized"
-// }
-//
-// https://raw.githubusercontent.com/stripe/openapi/master/openapi/spec3.sdk.json
+export async function main() {
+    const res = await generateGitHubApi()
+    await getFs().writeFile(path.resolve('dist', 'github.ts'), res)
+}

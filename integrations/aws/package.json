@@ -25,7 +25,8 @@
     "types": "./src/index.d.ts",
     "synapse": {
         "config": {
-            "sharedLib": true
+            "sharedLib": true,
+            "exposeInternal": true
         },
         "providers": {
             "aws": "*"

@@ -1,4 +1,5 @@
 import * as path from 'node:path'
+import { unzipSync } from 'node:zlib'
 import { homedir } from 'node:os'
 import { getLogger } from '..'
 import { getPreviousProgramFs, getProgramFs } from '../artifacts'
@@ -7,6 +8,7 @@ import { getHash, throwIfNotFileNotFoundError, tryReadJson } from '../utils'
 import { SynapseConfiguration, getWorkingDir } from '../workspaces'
 import { getBuildTarget, getFs } from '../execution'
 import { providerPrefix } from '../runtime/loader'
+import { extractTarball } from '../utils/tar'
 
 export interface PackageJson {
     readonly os?: string[]
@@ -121,7 +123,12 @@ export function getCompiledPkgJson(fs: Pick<Fs, 'readFile'> = getProgramFs()): P
 }
 
 export async function getCurrentPkg() {
-    const cwd = getBuildTarget()?.workingDirectory ?? process.cwd()
+    const bt = getBuildTarget()
+    if (!bt) {
+        return getPackageJson(getFs(), process.cwd(), false)
+    }
+
+    const cwd = bt.workingDirectory
     const compiled = await getCompiledPkgJson()
     if (compiled) {
         return { directory: cwd, data: compiled }
@@ -289,18 +296,37 @@ function parsePkgRequest(r: string): { name: string; version?: string; scheme?: 
 }
 
 function isProbablyFilePath(name: string) {
+    if (name.endsWith('.tgz')) {
+        return true
+    }
+
     return name.startsWith('..') || name.startsWith('~') || name.startsWith('./') || name.startsWith('/') // TODO: windows backslash?
+}
+
+function maybeGetPkgJsonSync(dirOrArchive: string) {
+    if (dirOrArchive.endsWith('.tgz')) {
+        const files = extractTarball(unzipSync(getFs().readFileSync(dirOrArchive)))
+        const pkg = files.find(f => !!f.path.match(/[\\\/]?package\.json$/))
+
+        return pkg?.contents
+    }
+
+    try {
+        return getFs().readFileSync(path.resolve(dirOrArchive, 'package.json'))
+    } catch (e) {
+        throwIfNotFileNotFoundError(e)
+    }
 }
 
 export function resolveFileSpecifier(spec: string, workingDir = getWorkingDir()) {
     const absPath = path.resolve(workingDir, spec.replace('~', homedir()))
-    const pkg = getFs().readFileSync(path.resolve(absPath, 'package.json'), 'utf-8')
+    const pkg = maybeGetPkgJsonSync(absPath)
     if (!pkg) {
         throw new Error(`Not a package: ${absPath}`)
     }
     
     return {
-        specifier: JSON.parse(pkg).name ?? path.basename(absPath),
+        specifier: JSON.parse(Buffer.from(pkg).toString('utf-8')).name ?? path.basename(absPath).replace(/\..*$/, ''),
         location: `file:${path.relative(workingDir, absPath)}`,
     }
 }
