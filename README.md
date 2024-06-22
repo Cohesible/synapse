@@ -3,16 +3,16 @@
 Synapse is a toolchain for building and deploying full-stack TypeScript applications. The infrastructure that your application depends on is defined within your application itself.
 
 Features:
+* Novel programming paradigm - Resource-driven programming
+    * Define and manage resources directly in your code
+* Cloud agnostic libraries - write once, deploy anywhere
+* Deploy locally or to the cloud (only AWS at this time)
+* Fine-grained permission modeling via symbolic execution
 * Built-in TypeScript compiler and bundler
 * Incremental builds
 * Extremely fast package manager
 * Node.js compatible JavaScript runtime
-* Cloud agnostic libraries - write once, deploy anywhere
-* Deploy locally or to the cloud (only AWS at this time)
 * [A testing framework](docs/testing.md)
-* Novel programming paradigm - Resource-driven programming
-    * Define and manage resources directly in your code
-* Fine-grained permission modeling via symbolic execution
 
 ## Installation
 
