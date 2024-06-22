@@ -16,7 +16,7 @@ Features:
 
 ## Installation
 
-These commands download and execute a script that will:
+These commands download and execute [a script](src/cli/install.sh) that will:
 * Download a release compatible with your system
 * Extract to `~/.synapse`
 * Add `synapse` to your PATH
