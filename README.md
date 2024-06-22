@@ -1,6 +1,6 @@
 # Synapse
 
-Synapse is a toolchain for building and deploying full-stack TypeScript applications. The infrastructure that your application runs on is defined within your application itself.
+Synapse is a toolchain for building and deploying full-stack TypeScript applications. The infrastructure that your application depends on is defined within your application itself.
 
 Features:
 * Built-in TypeScript compiler and bundler
