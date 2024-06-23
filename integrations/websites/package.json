@@ -1,0 +1,13 @@
+{
+    "name": "synapse-websites",
+    "dependencies": {},
+    "exports": {
+        ".": "./src/host.ts"
+    },
+    "synapse": {
+        "config": {
+            "sharedLib": true,
+            "exposeInternal": true
+        }
+    }
+}
