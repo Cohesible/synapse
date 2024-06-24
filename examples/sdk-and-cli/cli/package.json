@@ -1,0 +1,7 @@
+{
+    "name": "cli",
+    "bin": "./main.ts",
+    "dependencies": {
+        "sdk": "spr:#sdk"
+    }
+}

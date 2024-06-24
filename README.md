@@ -36,6 +36,11 @@ irm https://synap.sh/install.ps1 | iex
 
 See [Quick Start](./docs/getting-started.md#quick-start) for basic instructions. 
 
+For help with specific features:
+* [Custom Resources](./docs/custom-resources.md)
+* [Environments](./docs/environments.md)
+* [Packages](./docs/packages.md)
+* [Tests](./docs/testing.md)
 
 ## Attributions
 
