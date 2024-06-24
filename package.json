@@ -1,6 +1,6 @@
 {
     "name": "synapse",
-    "version": "0.0.3",
+    "version": "0.0.6",
     "bin": "./src/cli/index.ts",
     "dependencies": {
         "esbuild": "^0.20.2",
@@ -19,9 +19,6 @@
     "scripts": {
         "compileSelf": "synapse compile --no-synth && synapse publish --local"
     },
-    "files": [
-        "dist"
-    ],
     "synapse": {
         "config": {
             "exposeInternal": true,

@@ -173,9 +173,3 @@ curl --fail --location --progress-bar --output "$tarball_path" "$synapse_uri" ||
 install_from_archive "$tarball_path"
 
 rm -r "$tarball_path"
-
-if [[ ! -z "$GITHUB_ENV" ]]; then
-    info "Probably in a GitHub runner, installing to workflow paths"
-    echo "SYNAPSE_INSTALL=$install_dir" >> "$GITHUB_ENV"
-    echo "$install_dir/bin" >> "$GITHUB_PATH"
-fi

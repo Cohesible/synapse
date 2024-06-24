@@ -3,6 +3,7 @@
 import * as os from 'node:os'
 import * as path from 'node:path'
 import * as child_process from 'node:child_process'
+import { appendFile } from 'node:fs/promises'
 import { createLocalFs, ensureDir } from '../system'
 import { readKey, setKey } from './config'
 import { createInstallCommands, installToUserPath, isSupportedShell } from '../pm/publish'
@@ -134,6 +135,17 @@ exec "$SCRIPT_DIR/${nodeRelPath}" ${nodeArgs.join(' ')}
     return dest
 }
 
+async function maybeInstallToGitHubRunner(installDir: string) {
+    if (process.env.GITHUB_ENV) {
+        console.log("Probably in a GitHub runner, installing to workflow paths")
+        await appendFile(process.env.GITHUB_ENV, `SYNAPSE_INSTALL=${installDir}\n`)
+
+        if (process.env.GITHUB_PATH) {
+            await appendFile(process.env.GITHUB_PATH, `${path.resolve(installDir, 'bin')}\n`)
+        }    
+    }
+}
+
 async function finishInstall(installDir: string, pkgDir: string, shell?: string) {
     const fs = createLocalFs()
     const newTfPath = getToolPath(pkgDir, 'terraform')
@@ -174,6 +186,8 @@ async function finishInstall(installDir: string, pkgDir: string, shell?: string)
         }
         throw new Error(`Failed to run Synapse: ${out.stdout + '\n' + out.stderr}`)
     }
+
+    await maybeInstallToGitHubRunner(installDir)
 
     if (process.platform === 'win32') {
         return

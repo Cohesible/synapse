@@ -3,10 +3,12 @@ import { getLogger } from '../..'
 import { ParsedPlan, getChangeType, mapResource } from '../../deploy/deployment'
 import { DeployEvent, DeploySummaryEvent, FailedDeployEvent } from '../../logging'
 import { SymbolNode, SymbolGraph, renderSymbol, MergedGraph, renderSymbolLocation } from '../../refactoring'
-import { Color, colorize, createTreeView, format, getDisplay, getSpinnerFrame, printLine, Spinner, spinners, stripAnsi, TreeItem } from '../ui'
+import { Color, colorize, format, getDisplay, getSpinnerFrame, printLine, Spinner, spinners, stripAnsi, print, ControlKey } from '../ui'
 import { keyedMemoize } from '../../utils'
 import { getWorkingDir } from '../../workspaces'
 import { resourceIdSymbol } from '../../deploy/server'
+import { CancelError } from '../../execution'
+import { TfState } from '../../deploy/state'
 
 interface ResourceInfo {
     internal?: boolean
@@ -573,4 +575,65 @@ export function renderSummary(ev: DeploySummaryEvent) {
     lines.push('')
 
     return lines.join('\n')
+}
+
+export async function promptDestroyConfirmation(reason: string, state: TfState) {
+    const display = getDisplay()
+    const tty = display.writer.tty
+    if (!tty) {
+        throw new Error('Cannot prompt for confirmation without a tty')
+    }
+
+    const warning = `${reason} Are you sure you want to destroy this deployment?`
+    printLine(colorize('brightYellow', warning))
+    print(`(y/N): `)
+    // TODO: show what will be deleted
+
+    await new Promise<void>(r => setTimeout(r, 100))
+    await display.writer.flush()
+
+    display.writer.showCursor()
+
+    const resp = await new Promise<string>((resolve, reject) => {
+        let buf = ''
+        const l = tty.onKeyPress(ev => {
+            switch (ev.key) {
+                case ControlKey.DEL:
+                case ControlKey.Backspace:
+                    if (buf.length !== 0) {
+                        buf = buf.slice(0, -1)
+                        display.writer.moveCursor(-1, 0)
+                        display.writer.clearLine(1)
+                    }
+                    break
+
+                case ControlKey.ESC:
+                    print(buf)
+                    buf = ''
+                    // Fallsthrough
+
+                case ControlKey.Enter:
+                    resolve(buf)
+                    l.dispose()
+                    print(buf)
+                    display.writer.hideCursor()
+                    break
+
+                default:
+                    if (typeof ev.key === 'string') {
+                        buf += ev.key
+                        display.writer.write(ev.key)
+                    }
+
+                    break
+            }
+        })
+    })
+
+    const trimmed = resp.trim().toLowerCase()
+    if (!trimmed || trimmed.startsWith('n') || (trimmed !== 'y' && trimmed !== 'yes')) {
+        throw new CancelError('Cancelled destroy')
+    }
+
+    await display.getOverlayedView().clearScreen()
 }

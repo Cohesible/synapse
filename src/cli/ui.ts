@@ -338,12 +338,15 @@ interface ViewData {
     }
 }
 
-enum ControlKey {
+export enum ControlKey {
+    Backspace = 8,
     Enter = 13,
     UpArrow,
     DownArrow,
     RightArrow,
     LeftArrow,
+    ESC = 27,
+    DEL = 127,
 }
 
 interface SignalEvent {
@@ -373,6 +376,11 @@ function registerTty() {
         ['C'.charCodeAt(0)]: ControlKey.RightArrow,
         ['D'.charCodeAt(0)]: ControlKey.LeftArrow,
     }
+
+    controlKeys[ControlKey.Backspace] = ControlKey.Backspace
+    controlKeys[ControlKey.ESC] = ControlKey.ESC
+    controlKeys[ControlKey.DEL] = ControlKey.DEL
+    controlKeys[ControlKey.Enter] = ControlKey.Enter
 
     function handleInput(d: Buffer) {
         let isEscapeCode = false
@@ -409,6 +417,11 @@ function registerTty() {
                 }
             } else if (d[i] > 0x1f && d[i] < 0x7f) {
                 emitter.emit('keypress', { key: String.fromCharCode(d[i]) } satisfies KeyPressEvent)
+            } else {
+                const key = controlKeys[d[i]]
+                if (key !== undefined) {
+                    emitter.emit('keypress', { key } satisfies KeyPressEvent)
+                }
             }
         }
     }
@@ -873,7 +886,17 @@ export function createDisplay() {
 
         }
 
-        return { write: (text: string) => write(text, true), writeLine, createRow, createFooter, dispose }
+        async function clearScreen() {
+            clearTimeout(t)
+            spans.length = 0
+            if (screenTop !== undefined) {
+                writer.cursorTo(0, screenTop)
+                writer.clearScreenDown()
+            }
+            await writer.flush()
+        }
+
+        return { write: (text: string) => write(text, true), writeLine, createRow, createFooter, dispose, clearScreen }
     }
 
     function cancelPending(data: ViewData) {
@@ -1082,6 +1105,7 @@ export function createDisplay() {
             createFooter: text => createDisplayRow(text),
             createRow: (text) => createDisplayRow(text),
             dispose: async () => {},
+            clearScreen: async () => {},
         }
     }
 
@@ -1116,7 +1140,7 @@ export function createDisplay() {
         }
     })
 
-    return { createView, getOverlayedView, dispose, releaseTty }
+    return { createView, getOverlayedView, dispose, releaseTty, writer }
 }
 
 export interface TreeItem {

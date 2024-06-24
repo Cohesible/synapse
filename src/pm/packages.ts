@@ -4004,7 +4004,26 @@ export async function createPackageService(moduleResolver: ModuleResolver, repo 
             }
 
             for (const [k, v] of Object.entries(res.published)) {
-                await registerPointerDependencies(v, k)
+                const mappings = await registerPointerDependencies(v, k)
+
+                // We need to bind the original pointer mappings to any exported objects
+                if (mappings) {
+                    const sourcePointers = pointers[k.replace(/.js$/, '.infra.js')]
+                    function bindMappings(mappings: ImportMap2) {
+                        for (const [k, v] of Object.entries(mappings)) {
+                            const source = v.source
+                            if (source?.type === 'artifact') {
+                                pointers[`pointer:${source.data.metadataHash}:${source.data.hash}`] = sourcePointers
+                            }
+
+                            if (v.mapping) {
+                                bindMappings(v.mapping)
+                            }
+                        }
+                    }
+
+                    bindMappings(mappings)
+                }
             }
 
             for (const [k, v] of Object.entries(res.runtimeModules)) {
@@ -4060,7 +4079,7 @@ export async function createPackageService(moduleResolver: ModuleResolver, repo 
                 getLogger().debug(`Registered published import map for module "${name}":`, pointer)
             }
 
-            return
+            return mapping?.[1]?.mapping
         }
 
         const { hash, storeHash } = pointer.resolve()

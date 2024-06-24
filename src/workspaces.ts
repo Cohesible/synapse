@@ -5,11 +5,10 @@ import { Fs, SyncFs } from './system'
 import { DeployOptions } from './deploy/deployment'
 import { Remote, findRepositoryDir, getCurrentBranch, getCurrentBranchSync, listRemotes } from './git'
 import { getLogger } from './logging'
-import { keyedMemoize, memoize, throwIfNotFileNotFoundError, tryReadJson, tryReadJsonSync } from './utils'
+import { getHash, keyedMemoize, memoize, throwIfNotFileNotFoundError, tryReadJson, tryReadJsonSync } from './utils'
 import { glob } from './utils/glob'
 import { getBuildTarget, getBuildTargetOrThrow, getFs, isInContext } from './execution'
-import { getBackendClient } from './backendClient'
-import { projects } from '@cohesible/resources'
+import * as projects from '@cohesible/resources/projects'
 import { getPackageJson } from './pm/packageJson'
 import { randomUUID } from 'node:crypto'
 
@@ -446,12 +445,12 @@ async function createDeployment(): Promise<{ id: string; local?: boolean }> {
     throw new Error('Remote deployments not implemented')
 }
 
-async function _createProject(name: string, params: { url: string }): ReturnType<ReturnType<typeof getClient>['createProject']> {
+async function _createProject(name: string, params: { url: string }): ReturnType<ReturnType<typeof getProjectsClient>['createProject']> {
     if (!shouldCreateRemoteProject || process.env['SYNAPSE_FORCE_NO_REMOTE']) {
-        return { id: randomUUID(), kind: 'project', programs: {}, owner: '' }
+        return { id: randomUUID(), kind: 'project', programs: {}, owner: '', serial: 0 }
     }
 
-    return getClient().createProject(name, params)
+    return getProjectsClient().createProject(name, params)
 }
 
 async function getOrCreateApp(state: ProjectState, bt: BuildTarget) {
@@ -472,6 +471,8 @@ async function getOrCreateApp(state: ProjectState, bt: BuildTarget) {
     return app
 }
 
+const getProjectsClient = memoize(() => projects.createClient())
+
 async function updateProjectState(state: ProjectState) {
     await setProjectState(state)
 
@@ -479,7 +480,7 @@ async function updateProjectState(state: ProjectState) {
         const ents = await getEntities()
         const remote = ents.projects[state.id]?.remote
         if (remote) {
-            await projects.client.updateProject(remote, {
+            await getProjectsClient().updateProject(remote, {
                 apps: state.apps,
                 packages: state.packages,
                 programs: state.programs,
@@ -744,15 +745,6 @@ async function findProjectFromDir(dir: string) {
     }
 }
 
-function getClient(): typeof projects.client {
-    try {
-        projects.client.listProjects
-        return projects.client
-    } catch {
-        return getBackendClient() as any
-    }
-}
-
 async function createProject(rootDir: string, remotes?: Omit<Remote, 'headBranch'>[]) {
     if (!remotes) {
         getLogger().warn('No git repositories found. Creating a new project without a git repo is not recommended.')
@@ -787,7 +779,7 @@ async function listRemoteProjects() {
     if (!shouldCreateRemoteProject || process.env['SYNAPSE_FORCE_NO_REMOTE']) {
         return []
     }
-    return getClient().listProjects()
+    return getProjectsClient().listProjects()
 }
 
 export async function getRemoteProjectId(projectId: string) {
@@ -947,10 +939,26 @@ export async function deleteProject(id?: string) {
         return
     }
 
-    await projects.client.deleteProject(state.id)
+    await getProjectsClient().deleteProject(state.id)
     const ent = await getEntities()
     delete ent.projects[state.id]
     await setEntities(ent)
 
     await getFs().deleteFile(getStateFilePath(projectId))
+}
+
+export async function isPublished(programId: string) {
+    const projectId = await getCurrentProjectId()
+    const state = await getProjectState(projectId)
+    if (!state) {
+        return false
+    }
+
+    for (const [k, v] of Object.entries(state.packages)) {
+        if (v === programId) {
+            return true
+        }
+    }
+
+    return false
 }

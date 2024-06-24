@@ -23,13 +23,13 @@ import { ResolvedProgramConfig, getResolvedTsConfig, resolveProgramConfig } from
 import { createProgramBuilder, getDeployables, getEntrypointsFile, getExecutables } from './compiler/programBuilder'
 import { loadCpuProfile } from './perf/profiles'
 import { colorize, createTreeView, printJson, printLine, print, getDisplay, bold, RenderableError, dim } from './cli/ui'
-import { createDeployView, extractSymbolInfoFromPlan, groupSymbolInfoByFile, printSymbolTable, renderBetterSymbolName, renderSummary, renderSymbolWithState } from './cli/views/deploy'
+import { createDeployView, extractSymbolInfoFromPlan, groupSymbolInfoByFile, printSymbolTable, promptDestroyConfirmation, renderBetterSymbolName, renderSummary, renderSymbolWithState } from './cli/views/deploy'
 import { TfJson } from './runtime/modules/terraform'
 import { glob } from './utils/glob'
 import { createMinimalLoader } from './runtime/rootLoader'
 import { getBackendClient } from './backendClient'
 import { createCodeCache } from './runtime/utils'
-import { getBuildTarget, getBuildTargetOrThrow, getFs, getSelfPathOrThrow, isCancelled, isSelfSea, throwIfCancelled } from './execution'
+import { CancelError, getBuildTarget, getBuildTargetOrThrow, getFs, getSelfPathOrThrow, isCancelled, isSelfSea, throwIfCancelled } from './execution'
 import * as secrets from './services/secrets'
 import * as workspaces from './workspaces'
 import { createTestView } from './cli/views/test'
@@ -495,6 +495,17 @@ export async function destroy(targets: string[], opt?: CombinedOptions & { dryRu
     const template = await maybeRestoreTemplate()
     if (!template) {
         throw new Error(`No previous deployment template found`)
+    }
+
+    // TODO: add flag to skip prompt
+    // Need to update CI with a flag to auto-confirm
+    if (getCiType() !== 'github') {
+        const envName = getBuildTargetOrThrow().environmentName
+        if (envName?.includes('production')) {
+            await promptDestroyConfirmation(`The current environment "${envName}" is marked as production.`, state)
+        } else if (await workspaces.isPublished(getBuildTargetOrThrow().programId)) {
+            await promptDestroyConfirmation(`The current package has been published.`, state)
+        }
     }
 
     const programHash = await getPreviousDeploymentProgramHash()
@@ -2467,6 +2478,12 @@ export async function showStatus(opt?: { verbose?: boolean }) {
     // Projects?
     // 
 
+    const bt = getBuildTargetOrThrow()
+    if (bt.environmentName && bt.environmentName !== 'local') {
+        printLine(`env: ${colorize('cyan', bt.environmentName)}`)
+        printLine()
+    }
+
     const programFs = getProgramFs()
     const installation = await getInstallation(programFs)
     if (installation?.packages) {
@@ -2625,7 +2642,7 @@ interface BuildExecutableOpt {
     readonly lazyLoad?: string[]
 }
 
-export async function buildExecutables(opt: BuildExecutableOpt) {
+export async function buildExecutables(targets: string[], opt: BuildExecutableOpt) {
     const bt = getBuildTargetOrThrow()
     const pkg = await getCurrentPkg()
     if (!pkg) {
@@ -2886,7 +2903,6 @@ export async function internalBundle(target?: string, opt: any = {}) {
     const extname = opt.seaPrep || os === 'linux' ? '.tgz' : '.zip'
     await createArchive(outdir, `${outdir}${extname}`, shouldSign && !opt.seaPrep)
 }
-
 
 // This is to get the WS URL for Inspector
 // http://host:port/json/list

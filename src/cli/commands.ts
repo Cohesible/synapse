@@ -718,7 +718,7 @@ registerTypedCommand(
 registerTypedCommand(
     'status',  
     {
-        internal: true,
+        description: 'Shows the build state for the current program, including any files that need to be re-compiled or re-deployed.',
         options: [{ name: 'verbose', shortName: 'v', type: 'boolean' }]
     },
     opt => synapse.showStatus(opt)
@@ -913,13 +913,17 @@ registerTypedCommand(
     'build',
     {
         hidden: true,
-        args: [],
+        args: [{ name: 'target', type: typescriptFileType, allowMultiple: true }],
         options: [{ name: 'lazy-load', type: 'string', allowMultiple: true }, { name: 'no-sea', type: 'boolean' }],
     },
-    (opt) => synapse.buildExecutables({
-        sea: !opt['no-sea'],
-        lazyLoad: opt['lazy-load'],
-    })
+    (...args) => {
+        const [files, opt] = unpackArgs(args)
+        
+        return synapse.buildExecutables(files, {
+            sea: !opt['no-sea'],
+            lazyLoad: opt['lazy-load'],
+        })
+    },
 )
 
 registerTypedCommand(
@@ -1026,7 +1030,7 @@ registerTypedCommand(
             { name: 'preserveSource', type: 'boolean' },
             { name: 'libc', type: 'string' },
             { name: 'integration', type: 'string', allowMultiple: true },
-            { name: 'seaPrep', type: 'boolean' }
+            { name: 'seaPrep', type: 'boolean' },
         ]
     },
     (target, opt) => synapse.internalBundle(target, opt)

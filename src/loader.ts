@@ -1011,11 +1011,6 @@ function shouldTrap(value: any): boolean {
     return false
 }
 
-// Maybe support `CoffeeScript` 
-// https://github.com/jashkenas/coffeescript/blob/main/lib/coffeescript/register.js
-//
-// The repo is not very active though
-
 function createFakeModule(id: string, ctx: ContextStorage) {
     let trappedProto = false
 
@@ -1159,7 +1154,6 @@ const unproxy = Symbol.for('unproxy')
 const moveable2 = Symbol.for('__moveable__2')
 const unproxyParent = Symbol.for('unproxyParent')
 const kBoundContext = Symbol.for('boundContext')
-const kSourceModule = Symbol.for('kSourceModule')
 const reflectionType = Symbol.for('reflectionType')
 
 // This is an issue with React when capturing JSX elements:
@@ -1295,8 +1289,6 @@ function createSerializationProxy(
                 return value
             } else if (prop === unproxyParent) {
                 return parent
-            } else if (prop === kSourceModule) {
-                return operations[0].module
             } else if (prop === reflectionType) {
                 const moduleOverride = parent?.[Symbol.for('moduleIdOverride')] ?? value?.[Symbol.for('moduleIdOverride')]
                 if (isInfra && !moduleOverride) {
