@@ -86,21 +86,9 @@ export declare class HttpService {
     forward(req: HttpRequest, body: any): Promise<HttpResponse> 
 
     //# resource = true
-    /** @internal */
-    addRoute<U extends string = string, R = unknown>(
-        route: U,
-        handler: HttpHandler<U, string, R>,
-        opt: { rawBody: true }
-    ): HttpRoute<[...PathArgs<U>, string], R>
-
-    //# resource = true
     addRoute<P extends string = string, U = undefined, R = unknown>(
         route: P,
-        handler: HttpHandler<P, U, R>,
-        opt?: {
-            /** @internal */
-            rawBody?: boolean 
-        }
+        handler: HttpHandler<P, U, R>
     ): HttpRoute<[...PathArgs<P>, ...(U extends undefined ? [] : [body: U])], R>
 
     /** TODO */
@@ -108,18 +96,6 @@ export declare class HttpService {
     //     middleware: (req: HttpRequest<any>, body: any, next: HttpHandler<any, any>) => HttpResponse | Promise<HttpResponse>
     // ): any
 }
-
-// //# resource = true
-// export declare class WebSocketService {
-//     readonly invokeUrl: string
-//     constructor(opt?: HttpServiceOptions)
-
-//     addWebSocketRoute<P extends string = string, U = undefined, R = unknown>(
-//         route: P,
-//         handler: HttpHandler<P, U, R>,
-//         opt?: { rawBody?: boolean }
-//     ): HttpRoute<[...PathArgs<P>, ...(U extends undefined ? [] : [body: U])], R>
-// }
 
 /** @internal */
 export interface ContainerInstance {

@@ -1,5 +1,5 @@
 import * as path from 'node:path'
-import { getFs } from '../execution'
+import { getFs, getSelfPath } from '../execution'
 import { runCommand } from '../utils/process'
 import { getHash, makeExecutable, throwIfNotFileNotFoundError } from '../utils'
 import { createRequire } from 'node:module'
@@ -19,14 +19,27 @@ interface Postject {
     remove?: (filename: string, resourceName: string, options?: PostjectOptions) => Promise<boolean>
 }
 
+function loadFromRelPath() {
+    const selfPath = getSelfPath()
+    if (!selfPath) {
+        return
+    }
+
+    return createRequire(selfPath)('./postject')
+}
+
 function getPostject(): Postject {
       // This is so we can still load `postject` as an SEA
     const loadFromCwd = () => createRequire(path.resolve(process.cwd(), 'package.json'))('postject')
 
     try {
-        return require('postject')
+        return loadFromRelPath()
     } catch {
-        return loadFromCwd()
+        try {
+            return require('postject')
+        } catch {
+            return loadFromCwd()
+        }
     }
 }
 

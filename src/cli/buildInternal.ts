@@ -565,6 +565,19 @@ export async function createPackageForRelease(pkgDir: string, dest: string, targ
             return true
         }
 
+        async function maybeCopyPostjectBundle() {
+            const postject = path.resolve(dest, 'node_modules', 'postject', 'dist', 'api.js')
+            const data = await getFs().readFile(postject).catch(throwIfNotFileNotFoundError)
+            if (!data) {
+                getLogger().warn('Package `postject` not found')
+                return
+            }
+        
+            await getFs().writeFile(path.resolve(dest, 'dist', 'postject.js'), data)
+        }
+
+        await maybeCopyPostjectBundle()
+
         if (await maybeCopyEsbuildBinary()) {
             await getFs().deleteFile(path.resolve(dest, 'node_modules', '@esbuild')).catch(throwIfNotFileNotFoundError)
 

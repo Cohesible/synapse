@@ -912,9 +912,13 @@ registerTypedCommand(
 registerTypedCommand(
     'build',
     {
-        hidden: true,
+        description: 'Builds all executables in the current program.',
         args: [{ name: 'target', type: typescriptFileType, allowMultiple: true }],
-        options: [{ name: 'lazy-load', type: 'string', allowMultiple: true }, { name: 'no-sea', type: 'boolean' }],
+        options: [
+            { name: 'lazy-load', type: 'string', allowMultiple: true }, 
+            { name: 'no-sea', type: 'boolean' },
+            { name: 'synapse-path', type: 'string' }
+        ],
     },
     (...args) => {
         const [files, opt] = unpackArgs(args)
@@ -922,6 +926,7 @@ registerTypedCommand(
         return synapse.buildExecutables(files, {
             sea: !opt['no-sea'],
             lazyLoad: opt['lazy-load'],
+            synapsePath: opt['synapse-path'],
         })
     },
 )
@@ -1200,7 +1205,7 @@ registerTypedCommand(
         // isImportantCommand: true,
         description: 'Creates a new package in the current directory',
         options: [
-            { name: 'template', type: createEnumType('hello-world', 'react') }
+            { name: 'template', type: 'string' }
         ]
     },
     (opt) => synapse.init(opt)

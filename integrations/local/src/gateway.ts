@@ -331,14 +331,13 @@ export class Gateway implements compute.HttpService {
     public addRoute<P extends string = string, U = any, R = HttpResponse>(
         route: P, 
         handler: HttpHandler<P, U, R> | HttpHandler<P, string, R>,
-        opt?: { rawBody?: boolean }
     ): HttpRoute<[...PathArgs<P>, U], R> {
         const [method, path] = route.split(' ')
         if (path === undefined) {
             throw new Error(`Missing method in route: ${route}`)
         }
 
-        this.requestRouter.addRoute(route, wrapHandler(handler, this.authHandler, opt?.rawBody))
+        this.requestRouter.addRoute(route, wrapHandler(handler, this.authHandler))
 
         const pathBindings = createPathBindings(path)
 
@@ -463,13 +462,21 @@ function sendResponse(response: http.ServerResponse, data?: any, headers?: Heade
     })
 }
 
+function isJsonRequest(headers: Headers) {
+    const contentType = headers.get('content-type')
+    if (!contentType) {
+        return false
+    }
+
+    return !!contentType.match(/application\/(?:([^+\s]+)\+)?json/)
+}
+
 function wrapHandler(
     handler: HttpHandler, 
     authHandler?: HttpHandler, 
-    raw = false,
 ) {
     async function handleRequest(req: HttpRequest, data?: string) {
-        const body = (data && !raw) ? JSON.parse(data) : data
+        const body = (data && isJsonRequest(req.headers)) ? JSON.parse(data) : data
         
         if (authHandler) {
             const resp = await authHandler(req, body)

@@ -92,8 +92,18 @@ export class Bucket implements storage.Bucket {
         return { key: key, uploadId: resp.UploadId! }
     }
 
-    public async completeMultipartUpload(uploadId: string, key: string) {
-        await this.client.completeMultipartUpload({ Bucket: this.resource.bucket, Key: key, UploadId: uploadId })
+    public async completeMultipartUpload(uploadId: string, key: string, parts: string[]) {
+        await this.client.completeMultipartUpload({ 
+            Bucket: this.resource.bucket, 
+            Key: key, 
+            UploadId: uploadId,
+            MultipartUpload: {
+                Parts: parts.map((p, i) => ({
+                    PartNumber: i + 1,
+                    ETag: p,
+                })),
+            },
+        })
     }
 
     public async getMultipartUploadSignedUrls(uploadId: string, key: string, numParts: number, expiresIn = 3600) {
@@ -104,7 +114,8 @@ export class Bucket implements storage.Bucket {
         const baseReq: Omit<UploadPartRequest, 'part'> = { uploadId, bucket: this.resource.bucket, key }
         const urls: Promise<string>[] = []
         for (let i = 0; i < numParts; i++) {
-            urls.push(_getUploadPartSignedUrl(this.client, { ...baseReq, part: i + 1 }, expiresIn))
+            const url = _getUploadPartSignedUrl(this.client, { ...baseReq, part: i + 1 }, expiresIn)
+            urls.push(url)
         }
 
         return Promise.all(urls)

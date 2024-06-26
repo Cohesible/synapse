@@ -32,8 +32,16 @@ export class Gateway {
             // the below are required without an OpenApi spec
             name: generateIdentifier(aws.Apigatewayv2Api, 'name', 62),
             protocolType: 'HTTP', // | WEBSOCKET
-            disableExecuteApiEndpoint: domain !== undefined,
+
+            // TODO: we only want to disable this endpoint for gateways that
+            // start with a domain rather than when a domain is added.
+            //
+            // Otherwise this becomes a backwards incompatible change which we
+            // should strive to avoid whenever possible.
+            //
+            // disableExecuteApiEndpoint: domain !== undefined,
         })
+
         this.resource = apig
         const stageName: string = '$default'
         const stage = new aws.Apigatewayv2Stage({
@@ -61,7 +69,6 @@ export class Gateway {
     public addRoute<P extends string = string, U = any, R = HttpResponse>(
         route: P, 
         handler: HttpHandler<P, U, R> | HttpHandler<P, string, R>,
-        opt?: { rawBody?: boolean }
     ): HttpRoute<[...PathArgs<P>, U], R> {
         const [method, path] = route.split(' ')
         if (path === undefined) {
@@ -69,7 +76,7 @@ export class Gateway {
         }
 
         const authHandler = typeof this.props?.auth === 'function' ? this.props.auth : undefined
-        const wrapped = wrapHandler(handler as any, authHandler as any, opt?.rawBody, this.middleware, this.props?.allowedOrigins)
+        const wrapped = wrapHandler(handler as any, authHandler as any, this.middleware, this.props?.allowedOrigins)
         const mergeHandlers = this.props?.mergeHandlers ?? true
         if (mergeHandlers) {
             if (!this.requestRouter) {
@@ -352,10 +359,18 @@ async function runHandler<T>(fn: () => Promise<T> | T): Promise<T | HttpResponse
     }
 }
 
+function isJsonRequest(headers: Record<string, string>) {
+    const contentType = headers['content-type'] || headers['Content-Type'] // TODO: check if the headers are already normalized
+    if (!contentType) {
+        return false
+    }
+
+    return !!contentType.match(/application\/(?:([^+\s]+)\+)?json/)
+}
+
 function wrapHandler(
     handler: HttpHandler, 
     authHandler?: HttpHandler, 
-    raw = false, 
     middleware: Middleware[] = [],
     allowedOrigins?: string[]
 ) {
@@ -363,7 +378,7 @@ function wrapHandler(
         const decoded = (request.body !== undefined && request.isBase64Encoded) 
             ? Buffer.from(request.body, 'base64').toString('utf-8') 
             : request.body
-        const body = (decoded && !raw) ? JSON.parse(decoded) : decoded
+        const body = (decoded && isJsonRequest(request.headers)) ? JSON.parse(decoded) : decoded
         const stage = request.requestContext.stage
         const trimmedPath = request.rawPath.replace(`/${stage}`, '')
 

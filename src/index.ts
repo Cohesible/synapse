@@ -61,6 +61,7 @@ import { homedir } from 'node:os'
 import { createBlock, openBlock } from './build-fs/block'
 import { seaAssetPrefix } from './bundler'
 import { buildWindowsShim } from './zig/compile'
+import { openRemote } from './git'
 
 export { runTask, getLogger } from './logging'
 
@@ -2012,11 +2013,26 @@ export async function schemas(type?: string, opt?: CombinedOptions) {
     }
 }
 
+const examplesRepoUrl = 'https://github.com/Cohesible/synapse'
+async function initFromRepo(name: string, dest: string) {
+    const repo = await openRemote(examplesRepoUrl)
+    const prefix = `examples/${name}/`
+    const files = repo.files.filter(f => f.name.startsWith(prefix))
+    if (files.length === 0) {
+        throw new Error(`No example found named "${name}"`)
+    }
 
-// This inits a new package w/ scaffolding
-// `initWorkspace` initializes a non-empty directory
-// TODO: we should clone from GitHub
-export async function init(opt?: { template?: 'hello-world' | 'react' }) {
+    await Promise.all(files.map(async f => getFs().writeFile(
+        path.resolve(dest, f.name.slice(prefix.length)),
+        await f.read()
+    )))
+
+    await repo.dispose()
+
+    return files.map(f => f.name.slice(prefix.length))
+}
+
+export async function init(opt?: { template?: string }) {
     const fs = getFs()
     const dir = process.cwd()
     const dirFiles = (await fs.readDirectory(dir)).filter(f => f.name !== '.git')
@@ -2037,9 +2053,7 @@ export async function init(opt?: { template?: 'hello-world' | 'react' }) {
                 process.env['AWS_ROLE_ARN']
             )
         }
-    
-        const probablyHasAwsCredentials = await detectAwsCredentials()
-    
+        
         printLine(colorize('green', `Created files:`))
         for (const f of filesCreated) {
             printLine(colorize('green', `  ${f}`))
@@ -2048,6 +2062,10 @@ export async function init(opt?: { template?: 'hello-world' | 'react' }) {
             printLine(colorize('gray', '"node_modules" was created for better editor support'))
         }
         printLine()
+
+        if (filesCreated.find(f => f === 'README.md')) {
+            return
+        }
     
         const deployCmd = renderCmdSuggestion('deploy')
         const targetOption = colorize('gray', '--target aws')
@@ -2056,6 +2074,8 @@ export async function init(opt?: { template?: 'hello-world' | 'react' }) {
         printLine()
         printLine(`By default, your code is built for and deployed to a "local" target.`)
     
+        const probablyHasAwsCredentials = await detectAwsCredentials()
+
         if (probablyHasAwsCredentials) {
             printLine(`You can target AWS by adding ${targetOption} to a compile or deploy command.`)
             printLine(`The target is remembered for subsequent commands.`)
@@ -2082,12 +2102,9 @@ export async function init(opt?: { template?: 'hello-world' | 'react' }) {
         await getFs().writeFile(path.resolve(dir, 'package.json'), JSON.stringify(pkg, undefined, 4))
         const text = 'aW1wb3J0IHsgU3VzcGVuc2UsIHVzZVJlZiB9IGZyb20gJ3JlYWN0JwppbXBvcnQgeyBCdWNrZXQgfSBmcm9tICdzeW5hcHNlOnNybC9zdG9yYWdlJwppbXBvcnQgeyBjcmVhdGVXZWJzaXRlIH0gZnJvbSAnQGNvaGVzaWJsZS9zeW5hcHNlLXJlYWN0JwppbXBvcnQgeyB1c2VTZXJ2ZXIsIG9wZW5Ccm93c2VyIH0gZnJvbSAnQGNvaGVzaWJsZS9zeW5hcHNlLXdlYnNpdGVzJwoKY29uc3Qgd2Vic2l0ZSA9IGNyZWF0ZVdlYnNpdGUoKQpjb25zdCBidWNrZXQgPSBuZXcgQnVja2V0KCkKCmNvbnN0IGdldERhdGEgPSAoa2V5OiBzdHJpbmcpID0+IHsKICAgIHJldHVybiBidWNrZXQuZ2V0KGtleSwgJ3V0Zi04JykuY2F0Y2goZSA9PiB7CiAgICAgICAgcmV0dXJuIChlIGFzIGFueSkubWVzc2FnZQogICAgfSkKfQoKZnVuY3Rpb24gQnVja2V0Q29udGVudHMocHJvcHM6IHsgYnVja2V0S2V5OiBzdHJpbmcgfSkgewogICAgY29uc3QgZGF0YSA9IHVzZVNlcnZlcihnZXREYXRhLCBwcm9wcy5idWNrZXRLZXkpCgogICAgcmV0dXJuIDxwcmU+e2RhdGF9PC9wcmU+Cn0KCmZ1bmN0aW9uIEJ1Y2tldFBhZ2UocHJvcHM6IHsgYnVja2V0S2V5OiBzdHJpbmcgfSkgewogICAgcmV0dXJuICgKICAgICAgICA8ZGl2PgogICAgICAgICAgICA8U3VzcGVuc2UgZmFsbGJhY2s9ezxkaXY+bG9hZGluZzwvZGl2Pn0+CiAgICAgICAgICAgICAgICA8QnVja2V0Q29udGVudHMgYnVja2V0S2V5PXtwcm9wcy5idWNrZXRLZXl9Lz4KICAgICAgICAgICAgPC9TdXNwZW5zZT4KICAgICAgICA8L2Rpdj4KICAgICkKfQoKZnVuY3Rpb24gUm9vdExheW91dCh7IGNoaWxkcmVuIH06IHsgY2hpbGRyZW46IEpTWC5FbGVtZW50IHwgSlNYLkVsZW1lbnRbXSB9KSB7CiAgICByZXR1cm4gKAogICAgICAgIDxodG1sIGxhbmc9ImVuIj4KICAgICAgICAgICAgPGhlYWQ+PC9oZWFkPgogICAgICAgICAgICA8Ym9keT57Y2hpbGRyZW59PC9ib2R5PgogICAgICAgIDwvaHRtbD4KICAgICkKfQoKY29uc3QgYWRkRGF0YSA9IHdlYnNpdGUuYmluZChhc3luYyAoa2V5OiBzdHJpbmcsIGRhdGE6IHN0cmluZykgPT4gewogICAgYXdhaXQgYnVja2V0LnB1dChrZXksIGRhdGEpCn0pCgpmdW5jdGlvbiBCdWNrZXRGb3JtVGhpbmcoKSB7CiAgICBjb25zdCBrZXlSZWYgPSB1c2VSZWY8SFRNTElucHV0RWxlbWVudD4oKQogICAgY29uc3QgdmFsdWVSZWYgPSB1c2VSZWY8SFRNTElucHV0RWxlbWVudD4oKQoKICAgIGZ1bmN0aW9uIHN1Ym1pdCgpIHsKICAgICAgICBjb25zdCBrZXkgPSBrZXlSZWYuY3VycmVudC52YWx1ZQogICAgICAgIGNvbnN0IHZhbHVlID0gdmFsdWVSZWYuY3VycmVudC52YWx1ZQoKICAgICAgICBhZGREYXRhKGtleSwgdmFsdWUpLnRoZW4oKCkgPT4gewogICAgICAgICAgICB3aW5kb3cubG9jYXRpb24gPSB3aW5kb3cubG9jYXRpb24KICAgICAgICB9KQogICAgfQoKICAgIHJldHVybiAoCiAgICAgICAgPGRpdj4KICAgICAgICAgICAgPGxhYmVsPgogICAgICAgICAgICAgICAgS2V5CiAgICAgICAgICAgICAgICA8aW5wdXQgdHlwZT0ndGV4dCcgcmVmPXtrZXlSZWZ9PjwvaW5wdXQ+CiAgICAgICAgICAgIDwvbGFiZWw+CiAgICAgICAgICAgIDxsYWJlbD4KICAgICAgICAgICAgICAgIFZhbHVlCiAgICAgICAgICAgICAgICA8aW5wdXQgdHlwZT0ndGV4dCcgcmVmPXt2YWx1ZVJlZn0+PC9pbnB1dD4KICAgICAgICAgICAgPC9sYWJlbD4KICAgICAgICAgICAgPGJ1dHRvbiBvbkNsaWNrPXtzdWJtaXR9IHN0eWxlPXt7IG1hcmdpbkxlZnQ6ICcxMHB4JyB9fT5BZGQgSXRlbTwvYnV0dG9uPgogICAgICAgIDwvZGl2PgogICAgKQp9Cgphc3luYyBmdW5jdGlvbiBnZXRJdGVtcygpIHsKICAgIHJldHVybiBhd2FpdCBidWNrZXQubGlzdCgpCn0KCmNvbnN0IGRvRGVsZXRlID0gd2Vic2l0ZS5iaW5kKChrZXk6IHN0cmluZykgPT4gYnVja2V0LmRlbGV0ZShrZXkpKQoKZnVuY3Rpb24gQnVja2V0SXRlbShwcm9wczogeyBidWNrZXRLZXk6IHN0cmluZyB9KSB7CiAgICBjb25zdCBrID0gcHJvcHMuYnVja2V0S2V5CgogICAgZnVuY3Rpb24gZGVsZXRlSXRlbSgpIHsKICAgICAgICBkb0RlbGV0ZShrKS50aGVuKCgpID0+IHsKICAgICAgICAgICAgd2luZG93LmxvY2F0aW9uID0gd2luZG93LmxvY2F0aW9uCiAgICAgICAgfSkKICAgIH0KCiAgICByZXR1cm4gKAogICAgICAgIDxsaT4KICAgICAgICAgICAgPGRpdiBzdHlsZT17eyBkaXNwbGF5OiAnZmxleCcsIG1heFdpZHRoOiAnMjUwcHgnLCBtYXJnaW5Cb3R0b206ICcxMHB4JyB9fT4KICAgICAgICAgICAgICAgIDxhIGhyZWY9e2AvYnVja2V0LyR7a31gfSBzdHlsZT17eyBmbGV4OiAnZml0LWNvbnRlbnQnLCBhbGlnblNlbGY6ICdmbGV4LXN0YXJ0JyB9fT57a308L2E+CiAgICAgICAgICAgICAgICA8YnV0dG9uIG9uQ2xpY2s9e2RlbGV0ZUl0ZW19IHN0eWxlPXt7IGFsaWduU2VsZjogJ2ZsZXgtZW5kJyB9fT5EZWxldGU8L2J1dHRvbj4KICAgICAgICAgICAgPC9kaXY+CiAgICAgICAgPC9saT4KICAgICkKfQoKZnVuY3Rpb24gSXRlbUxpc3QoKSB7CiAgICBjb25zdCBpdGVtcyA9IHVzZVNlcnZlcihnZXRJdGVtcykKCiAgICBpZiAoaXRlbXMubGVuZ3RoID09PSAwKSB7CiAgICAgICAgcmV0dXJuIDxkaXY+PGI+VGhlcmUncyBub3RoaW5nIGluIHRoZSBidWNrZXQhPC9iPjwvZGl2PgogICAgfQoKICAgIHJldHVybiAoCiAgICAgICAgPHVsPgogICAgICAgICAgICB7aXRlbXMubWFwKGsgPT4gPEJ1Y2tldEl0ZW0ga2V5PXtrfSBidWNrZXRLZXk9e2t9Lz4pfQogICAgICAgIDwvdWw+CiAgICApCn0KCmZ1bmN0aW9uIEhvbWVQYWdlKCkgewogICAgcmV0dXJuICgKICAgICAgICA8ZGl2PgogICAgICAgICAgICA8QnVja2V0Rm9ybVRoaW5nPjwvQnVja2V0Rm9ybVRoaW5nPgogICAgICAgICAgICA8YnI+PC9icj4KICAgICAgICAgICAgPFN1c3BlbnNlIGZhbGxiYWNrPSdsb2FkaW5nJz4KICAgICAgICAgICAgICAgIDxJdGVtTGlzdC8+CiAgICAgICAgICAgIDwvU3VzcGVuc2U+CiAgICAgICAgPC9kaXY+CiAgICApCn0KCndlYnNpdGUuYWRkUGFnZSgnLycsIHsKICAgIGNvbXBvbmVudDogSG9tZVBhZ2UsCiAgICBsYXlvdXQ6IHsgY29tcG9uZW50OiBSb290TGF5b3V0IH0sCn0pCiAgICAKCndlYnNpdGUuYWRkUGFnZSgnL2J1Y2tldC97YnVja2V0S2V5fScsIHsKICAgIGNvbXBvbmVudDogQnVja2V0UGFnZSwKICAgIGxheW91dDogeyBjb21wb25lbnQ6IFJvb3RMYXlvdXQgfSwKfSkKCmV4cG9ydCBhc3luYyBmdW5jdGlvbiBtYWluKCkgewogICAgb3BlbkJyb3dzZXIod2Vic2l0ZS51cmwpCn0KCg=='
         await getFs().writeFile(path.resolve(dir, 'app.tsx'), Buffer.from(text, 'base64'))
-        await showInstructions(['app.tsx', 'package.json', 'tsconfig.json'])
-    
-        return
-    }
-
-    const text = `
+        await showInstructions(['app.tsx', 'package.json', 'tsconfig.json'])    
+    } else if (!opt?.template) {
+        const text = `
 import { Function } from 'synapse:srl/compute'
 
 const hello = new Function(() => {
@@ -2097,11 +2114,15 @@ const hello = new Function(() => {
 export async function main(...args: string[]) {
     console.log(await hello())
 }
-`.trimStart()
-
-    await fs.writeFile(path.resolve(dir, 'hello.ts'), text, { flag: 'wx' })
-
-    await showInstructions(['hello.ts'])
+        `.trimStart()
+        
+        await fs.writeFile(path.resolve(dir, 'hello.ts'), text, { flag: 'wx' })
+    
+        await showInstructions(['hello.ts'])
+    } else {
+        const files = await initFromRepo(opt.template, dir)
+        await showInstructions(files)
+    }
 }
 
 export async function clearCache(targetKey?: string, opt?: CombinedOptions) {
@@ -2640,6 +2661,7 @@ export function runUserScript(target: string) {
 interface BuildExecutableOpt {
     readonly sea?: boolean
     readonly lazyLoad?: string[]
+    readonly synapsePath?: string
 }
 
 export async function buildExecutables(targets: string[], opt: BuildExecutableOpt) {
@@ -2656,6 +2678,10 @@ export async function buildExecutables(targets: string[], opt: BuildExecutableOp
     }
 
     async function _getNodePath() {
+        if (opt.synapsePath) {
+            return opt.synapsePath
+        }
+
         if (isSelfSea()) {
             return process.execPath
         }
@@ -2676,24 +2702,38 @@ export async function buildExecutables(targets: string[], opt: BuildExecutableOp
     const external = ['esbuild', 'typescript', 'postject']
     // XXX: this is hard-coded to `synapse`
     const bundleOpt = pkg.data.name === 'synapse' ? {
+        sea: opt.sea,
         external, 
         lazyLoad: ['@cohesible/*', 'typescript', 'esbuild', ...lazyNodeModules],
         extraBuiltins: ['typescript', 'esbuild'],
-    } : opt
+    } : {
+        ...opt,
+        runtimeExecutable: opt.synapsePath,
+    }
 
     if (pkg.data.name === 'synapse') {
         process.env.SKIP_SEA_MAIN = '1'
         process.env.CURRENT_PACKAGE_DIR = pkg.directory
     }
 
+    const config = (await getResolvedTsConfig())?.options
+    const outDir = config?.outDir ?? 'out'
+
     for (const [k, v] of Object.entries(bin)) {
         const resolved = path.resolve(bt.workingDirectory, v)
         if (!set.has(resolved)) continue
 
-        const res = await bundleExecutable(bt, resolved, undefined, undefined, { sea: opt.sea, ...bundleOpt })
-        const dest = path.resolve(bt.workingDirectory, 'dist', 'bin', k)
+        const outfile = !config?.outDir ? path.resolve(bt.workingDirectory, 'out', v) : undefined
+
+        const res = await bundleExecutable(bt, resolved, outfile, undefined, bundleOpt)
+        const dest = path.resolve(bt.workingDirectory, outDir, 'bin', k)
+
         if (opt.sea) {
-            await makeSea(res.outfile, await getNodePath(), dest, res.assets)
+            try {
+                await makeSea(res.outfile, await getNodePath(), dest, res.assets)
+            } finally {
+                await getFs().deleteFile(res.outfile)
+            }
         } else {
             // TODO: write out assets
         }
