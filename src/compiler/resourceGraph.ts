@@ -23,7 +23,6 @@ interface SymbolNameComponents {
 
 interface ResourceInstantiation {
     readonly kind: string // FQN/Symbol
-
 }
 
 export interface TypeInfo {

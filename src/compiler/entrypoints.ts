@@ -185,7 +185,7 @@ function findInterestingSpecifiers(sf: ts.SourceFile, resolveBareSpecifier: (spe
     return { bare, zig }
 }
 
-function createSpecifierResolver(cmd: ts.ParsedCommandLine, dir: string) {
+function createSpecifierResolver(cmd: Pick<ts.ParsedCommandLine, 'options' | 'fileNames'>, dir: string) {
     const baseUrl = cmd.options.baseUrl
     const paths = cmd.options.paths
     const resolveDir = baseUrl ?? dir

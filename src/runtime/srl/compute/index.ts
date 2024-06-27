@@ -86,6 +86,13 @@ export declare class HttpService {
     forward(req: HttpRequest, body: any): Promise<HttpResponse> 
 
     //# resource = true
+    addRoute<U extends string = string, R = unknown>(
+        route: U,
+        handler: HttpHandler<U, undefined, R>,
+        opt: never // XXX: extra arg to force TypeScript into the correct signature
+    ): HttpRoute<PathArgs<U>, R>
+
+    //# resource = true
     addRoute<P extends string = string, U = undefined, R = unknown>(
         route: P,
         handler: HttpHandler<P, U, R>

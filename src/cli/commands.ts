@@ -613,7 +613,7 @@ registerTypedCommand(
         hidden: true,
         options: [
             { name: 'local', type: 'boolean' },
-            { name: 'global', type: 'boolean', hidden: true },
+            { name: 'remote', type: 'boolean', hidden: true },
             { name: 'dry-run', type: 'boolean', hidden: true },
             { name: 'skip-install', type: 'boolean', hidden: true },
             { name: 'archive', type: 'string', hidden: true },
@@ -640,7 +640,7 @@ registerTypedCommand(
         options: [
             { name: 'dry-run', type: 'boolean' }
         ],
-    },
+    }, 
     async (opt) => {
         await synapse.collectGarbage('', {
             ...opt,
@@ -765,7 +765,7 @@ registerTypedCommand(
     'import-identity',
     {
         internal: true,
-        args: [{ name: 'file', type: 'string' }],
+        args: [{ name: 'file', type: 'string', optional: true }],
         requirements: { program: false }
     },
     async (target) => {
@@ -962,11 +962,11 @@ registerTypedCommand(
 registerTypedCommand(
     'repl',  
     {
-        internal: true, // Temporary
-        args: [{ name: 'file', type: typescriptFileType }],
+        description: 'Enters an interactive REPL session, optionally using a target file. The target file\'s exports are placed in the global scope.',
+        args: [{ name: 'targetFile', type: typescriptFileType, optional: true }],
         options: buildTargetOptions,
     },
-    (a, opt) => synapse.replCommand(a)
+    (a, opt) => synapse.replCommand(a, opt),
 )
 
 registerTypedCommand(
@@ -1407,7 +1407,7 @@ async function parseArgs(args: string[], desc: CommandDescriptor) {
     const minArgs = (desc.args?.filter(x => !x.allowMultiple && !x.optional).length ?? 0) + (allowMultipleArg?.minCount ?? 0)
     const providedArgs = parsedArgs.length + invalidPositionalArgs
     if (providedArgs < minArgs) {
-        for (let i = providedArgs; i < parsedArgs.length; i++) {
+        for (let i = providedArgs; i < minArgs; i++) {
             const a = desc.args![i]
             if (a.allowMultiple) break
 
@@ -1425,7 +1425,7 @@ async function parseArgs(args: string[], desc: CommandDescriptor) {
     if (errors.length > 0) {
         throw new RenderableError('Invalid arguments', () => {
             for (const [n, e] of errors) {
-                printLine(colorize('brightRed', `${n} - ${e.message}`))
+                printLine(colorize('brightRed', `${e.message} - ${n}`))
             }
         })
     }

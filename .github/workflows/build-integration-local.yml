@@ -15,7 +15,7 @@ jobs:
       id-token: write
       contents: read
     steps:
-      - uses: Cohesible/get-credentials-action@d2795224e6f0ea7b2e41c4d3dbdb8bc3c873f450
+      - uses: Cohesible/get-credentials-action@670287aebd309e1890507ab8ee7c8ed7eefa4c10
       - uses: actions/checkout@v3
       - run: curl -fsSL https://synap.sh/install | bash
       - run: synapse --version

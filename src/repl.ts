@@ -10,9 +10,13 @@ import { SessionContext } from './deploy/deployment'
 import { pointerPrefix } from './build-fs/pointers'
 import { getDisplay } from './cli/ui'
 import { getArtifactFs } from './artifacts'
+import { getBuildTargetOrThrow } from './execution'
+import { TypeInfo } from './compiler/resourceGraph'
+import { ensureDir } from './utils'
 
 export interface ReplOptions extends CombinedOptions {
     onInit?: (instance: ReplInstance) => void
+    types?: Record<string, TypeInfo>
 }
 
 interface ReplInstance {
@@ -88,16 +92,30 @@ export async function createReplServer(
     }
 }
 
+// XXX: a "proper" solution would involve rewriting all call expressions on the target 
+// to use property access expressions instead
+// 
+// But there doesn't seem to be an easy way to transform the input besides wrapping the input
+// stream or using a custom eval function. This is simpler albeit a little hacky.
+// 
+// Copying all owned props onto the function might be an improvement
+function wrapCallable(target: any, prop: PropertyKey) {
+    const fn = function (this: any, ...args: any[]) {
+        return Reflect.apply(target[prop], this ?? target, args)
+    }
+
+    return Object.setPrototypeOf(fn, target)
+}
+
 async function createRepl(
     target: string | undefined,
     loader: ReturnType<SessionContext['createModuleLoader']>, 
     options: ReplOptions,
     socket?: net.Socket
 ) {
-    const [targetModule, loggingModule] = await Promise.all([
-        target ? loader.loadModule(target) : undefined,
-        undefined
-    ])
+    const targetModule = target ? await loader.loadModule(target) : undefined
+
+    const types = options.types
 
     const instance = repl.start({ 
         useGlobal: true,
@@ -109,8 +127,10 @@ async function createRepl(
         terminal: socket ? true : undefined,
     })
 
-    // TODO: history should be per-program
-    const historyFile = path.resolve(getUserSynapseDirectory(), 'repl-history')
+    const historyDir = path.resolve(getUserSynapseDirectory(), 'repl-history')
+    await ensureDir(historyDir)
+
+    const historyFile = path.resolve(historyDir, getBuildTargetOrThrow().programId)
     instance.setupHistory(historyFile, err => {
         if (err) {
             getLogger().error(`Failed to setup REPL history`, err)
@@ -143,7 +163,12 @@ async function createRepl(
             for (const [k, v] of Object.entries(targetModule)) {
                 if (k === '__esModule') continue
     
-                setValue(k, v)
+                const ty = types?.[k]
+                if (ty?.callable) {
+                    setValue(k, wrapCallable(v, ty.callable))
+                } else {
+                    setValue(k, v)
+                }
             }    
         }
 
@@ -166,7 +191,7 @@ async function createRepl(
 export async function enterRepl(
     target: string | undefined,
     loader: ReturnType<SessionContext['createModuleLoader']>, 
-    options: CombinedOptions
+    options: CombinedOptions & { types?: Record<string, TypeInfo> }
 ) {
     await getDisplay().releaseTty()
     const instance = await createRepl(target, loader, options)

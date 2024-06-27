@@ -31,6 +31,7 @@ import { cleanDir, fastCopyDir, removeDir } from '../zig/fs-ext'
 import { colorize, printLine } from '../cli/ui'
 import { OptimizedPackageManifest, PackageManifest, PublishedPackageJson, createManifestRepo, createMultiRegistryClient, createNpmRegistryClient } from './manifests'
 import { createGitHubPackageRepo, downloadGitHubPackage, githubPrefix } from './repos/github'
+import { createSynapsePackageRepo, sprPrefix } from './repos/spr'
 
 // legacy
 const providerRegistryHostname = ''
@@ -756,6 +757,7 @@ function createSprRepoWrapper(
     const fileRepo = createFilePackageRepo(fs, workingDirectory)
     const toolRepo = createToolRepo()
     const githubRepo = createGitHubPackageRepo()
+    const sprRepo = createSynapsePackageRepo()
 
     const _getTerraformPath = memoize(getTerraformPath)
     async function _getProviderVersions(name: string) {
@@ -802,6 +804,10 @@ function createSprRepoWrapper(
             return _getProviderVersions(name.slice(providerPrefix.length))
         }
 
+        if (name.startsWith(sprPrefix)) {
+            return sprRepo.listVersions(name.slice(sprPrefix.length))
+        }
+
         if (name.startsWith('cspm:')) {
             const manifest = await getPrivatePackageManifest(parseCspmRef(name))
 
@@ -833,6 +839,10 @@ function createSprRepoWrapper(
                     integrity: version, // TODO: use hash
                 },
             }
+        }
+
+        if (name.startsWith(sprPrefix)) {
+            return sprRepo.getPackageJson(name.slice(sprPrefix.length), version)
         }
 
         if (name.startsWith('cspm:')) {
@@ -888,6 +898,12 @@ function createSprRepoWrapper(
                 return { name: `file:${override}`, version: parseVersionConstraint('*') }
             }
 
+            if (pattern.startsWith(sprPrefix)) {
+                const resolved = await sprRepo.resolvePattern(spec, pattern)
+
+                return { name: `spr:${resolved.name}`, version: resolved.version }
+            }
+
             return { name: pattern, version: parseVersionConstraint('*') }
         }
 
@@ -934,6 +950,10 @@ function createSprRepoWrapper(
             return
         }
 
+        if (name.startsWith(sprPrefix)) {
+            return sprRepo.getDependencies(name.slice(sprPrefix.length), version)
+        }
+
         if (name.startsWith('cspm:')) {
             const manifest = await getPrivatePackageManifest(parseCspmRef(name))
             const inst = manifest.versions[version]
@@ -962,6 +982,10 @@ function createSprRepoWrapper(
 
         if (name.startsWith(toolPrefix)) {
             return 
+        }
+
+        if (name.startsWith(sprPrefix)) {
+            return
         }
 
         if (name.startsWith('cspm:')) {

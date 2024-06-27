@@ -6,7 +6,7 @@ import { LambdaFunction } from './lambda'
 import { signRequest } from '../sigv4'
 import { NodeHttpHandler } from '@smithy/node-http-handler'
 import { HostedZone } from './route53'
-import { HttpHandler, Middleware, RouteRegexp, buildRouteRegexp, matchRoutes, HttpResponse, HttpError, HttpRoute, PathArgs, createPathBindings, applyRoute, kHttpResponseBody, compareRoutes, HttpRequest } from 'synapse:http'
+import { HttpHandler, Middleware, RouteRegexp, buildRouteRegexp, matchRoutes, HttpResponse, HttpError, HttpRoute, PathArgs, createPathBindings, applyRoute, compareRoutes, HttpRequest } from 'synapse:http'
 import { createSerializedPolicy } from './iam'
 import { generateIdentifier } from 'synapse:lib'
 import * as net from 'synapse:srl/net'
@@ -307,9 +307,7 @@ async function runHandler<T>(fn: () => Promise<T> | T): Promise<T | HttpResponse
                 } as any
             }
 
-            const body = kHttpResponseBody in resp 
-                ? Buffer.from(resp[kHttpResponseBody] as Uint8Array).toString('utf-8')
-                : resp.body ? await resp.text() : undefined
+            const body = resp.body ? await resp.text() : undefined
 
             return {
                 body,
@@ -667,7 +665,7 @@ export class WebsocketGateway {
                 'Effect': 'Allow',
                 'Action': 'execute-api:ManageConnections',
                 // 'Resource': 'arn:{context.Partition}:execute-api:${context.Region}:${context.Account}:${this.resource.id}/Default/${replace(0, " ", "/")}'
-                'Resource': `arn:${context.partition}:execute-api:${context.region ?? 'us-west-2'}:${context.accountId}:*` // XXX
+                'Resource': `arn:${context.partition}:execute-api:${context.regionId}:${context.accountId}:*` // XXX
             })
             this.requestRouter!.fn.principal.addPolicy({
                 // [\w+=,.@-]+{1,128}

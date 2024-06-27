@@ -9,6 +9,7 @@ import { getHash, keyedMemoize, memoize, throwIfNotFileNotFoundError, tryReadJso
 import { glob } from './utils/glob'
 import { getBuildTarget, getBuildTargetOrThrow, getFs, isInContext } from './execution'
 import * as projects from '@cohesible/resources/projects'
+import * as registry from '@cohesible/resources/registry'
 import { getPackageJson } from './pm/packageJson'
 import { randomUUID } from 'node:crypto'
 
@@ -484,6 +485,7 @@ async function updateProjectState(state: ProjectState) {
                 apps: state.apps,
                 packages: state.packages,
                 programs: state.programs,
+                importedPackages: state.importedPackages,
             })
         }
     }
@@ -724,6 +726,7 @@ interface ProjectState {
     readonly apps: Record<projects.AppInfo['id'], projects.AppInfo>
     readonly programs: Record<Program['id'], projects.ProgramInfo>
     readonly packages: Record<string, string> // package name -> program id
+    readonly importedPackages?: Record<string, string>
 }
 
 async function findProjectFromDir(dir: string) {
@@ -775,8 +778,12 @@ async function createProject(rootDir: string, remotes?: Omit<Remote, 'headBranch
     return project
 }
 
+function isRemoteDisabled() {
+    return !process.env['SYNAPSE_FORCE_REMOTE_PROJECTS'] && (!shouldCreateRemoteProject || process.env['SYNAPSE_FORCE_NO_REMOTE'])
+}
+
 async function listRemoteProjects() {
-    if (!shouldCreateRemoteProject || process.env['SYNAPSE_FORCE_NO_REMOTE']) {
+    if (isRemoteDisabled()) {
         return []
     }
     return getProjectsClient().listProjects()
@@ -812,8 +819,7 @@ async function getOrCreateRemoteProject(dir: string, remotes?: Omit<Remote, 'hea
 }
 
 export async function initProject(dir: string, remotes?: Omit<Remote, 'headBranch'>[]) {
-    const remote = shouldCreateRemoteProject && !process.env['SYNAPSE_FORCE_NO_REMOTE'] 
-        ? await getOrCreateRemoteProject(dir, remotes) : undefined
+    const remote = !isRemoteDisabled() ? await getOrCreateRemoteProject(dir, remotes) : undefined
     const proj = { id: randomUUID(), kind: 'project', apps: remote?.apps, programs: remote?.programs, packages: remote?.packages, owner: '' }
 
     const ents = await getEntities()
@@ -883,6 +889,32 @@ export async function listPackages(projectId?: string) {
     const state = await getProjectState(projectId)
 
     return state?.packages ?? {}
+}
+
+export async function listRemotePackages(projectId?: string) {
+    projectId ??= await getCurrentProjectId()
+    const state = await getProjectState(projectId)
+    if (!state) {
+        return
+    }
+
+    const packages = state?.packages ?? {}
+    const result: Record<string, string> = {}
+
+    for (const [k, v] of Object.entries(packages)) {
+        const imported = state.importedPackages?.[k]
+        if (imported) {
+            result[k] = imported
+        }
+
+        const pkgId = getRemotePackageId(state, v)    
+        if (!pkgId) continue
+        
+        // Overrides imported packages
+        result[k] = pkgId
+    }
+
+    return result
 }
 
 export async function listDeployments(id?: string) {
@@ -961,4 +993,69 @@ export async function isPublished(programId: string) {
     }
 
     return false
+}
+
+function getRemotePackageId(state: ProjectState, programId: string) {
+    const bt = getBuildTargetOrThrow()
+    const appId = state.programs[programId]?.appId
+    if (!appId) {
+        return
+        // throw new Error(`No app id found for program: ${programId}`)
+    }
+
+    const app = state.apps[appId]
+    if (!app) {
+        throw new Error(`Missing app: ${appId}`)
+    }
+
+    const envName = bt.environmentName ?? app.defaultEnvironment ?? 'local'
+    const environment = app.environments[envName]
+    if (!environment) {
+        throw new Error(`Missing environment "${envName}" in app: ${appId}`)
+    }
+
+    return environment.packageId
+}
+
+export async function getOrCreateRemotePackage() {
+    const bt = getBuildTargetOrThrow()
+    const state = await getProjectState(bt.projectId)
+    if (!state) {
+        throw new Error(`No project state found: ${bt.projectId}`)
+    }
+
+    const appId = state.programs[bt.programId]?.appId
+    if (!appId) {
+        throw new Error(`No app id found for program: ${bt.programId}`)
+    }
+
+    const app = state.apps[appId]
+    if (!app) {
+        throw new Error(`Missing app: ${appId}`)
+    }
+
+    const envName = bt.environmentName ?? app.defaultEnvironment ?? 'local'
+    const environment = app.environments[envName]
+    if (!environment) {
+        throw new Error(`Missing environment "${envName}" in app: ${appId}`)
+    }
+
+    if (environment.packageId) {
+        return environment.packageId
+    }
+
+    if (!shouldUseRemote) {
+        throw new Error(`Unable to create new remote package for app: ${app.id}`)
+    }
+
+    getLogger().log('Creating new package for app', app.id)
+    const pkg = await registry.createClient().createPackage()
+    app.environments[envName] = {
+        ...environment,
+        packageId: pkg.id,
+    }
+
+    await updateProjectState(state)
+
+    return pkg.id
 }

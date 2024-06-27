@@ -27,11 +27,6 @@ type ExtractPattern<T extends string> = T extends `${infer P}{${infer U}}${infer
 export type CapturedPattern<T extends string> = string extends T ? Record<string, string> : { [P in ExtractPattern<T>]: string }
 type SplitRoute<T extends string> = T extends `${infer M extends HttpMethod} ${infer P}` ? [M, P] : [string, T]
 
-// type X = ExtractPattern2<'/{foo}/{bar}'>
-// type ExtractPattern2<T extends string> = T extends `${infer P}{${infer U}}${infer S}` 
-//     ? [...ExtractPattern2<P>, TrimRoute<U>, ...ExtractPattern2<S>] 
-//     : []
-
 export type PathArgs<T extends string> = T extends `${infer P}{${infer U}}${infer S}` 
     ? [...PathArgs<P>, string, ...PathArgs<S>] 
     : []
@@ -68,29 +63,6 @@ export type HttpHandler<T extends string = string, U = any, R = unknown, C = voi
 
 export type HttpFetcher<T extends string = string, U = any, R = unknown> = 
     (...args: [...PathArgs<T>, ...(U extends undefined ? [] : [body: U])]) => Promise<R>
-
-// Only used to short-circuit APIG responses
-/** @internal */
-export const kHttpResponseBody = Symbol.for('kHttpResponseBody')
-// export class JsonResponse<T> extends Response {
-//     readonly [kHttpResponseBody]: Uint8Array
-
-//     public constructor(body: T, init?: ResponseInit | undefined) {
-//         const headers = new Headers(init?.headers)
-//         if (!headers.has('content-type')) {
-//             headers.set('content-type', 'application/json')
-//         }
-
-//         const encoded = new TextEncoder().encode(JSON.stringify(body))
-//         super(encoded, { ...init, headers })
-
-//         this[kHttpResponseBody] = encoded
-//     }
-// }
-
-// export interface JsonResponse<T> {
-//     json(): Promise<T>
-// }
 
 interface BindingBase {
     from: string // JSONPath

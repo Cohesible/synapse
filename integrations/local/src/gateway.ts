@@ -5,7 +5,7 @@ import * as path from 'node:path'
 import * as stream from 'node:stream'
 import * as child_process from 'node:child_process'
 import type * as http from 'node:http'
-import { fetch, HttpError, HttpHandler, HttpRequest, HttpResponse, HttpRoute, PathArgs, RouteRegexp, buildRouteRegexp, compareRoutes, createPathBindings, kHttpResponseBody, matchRoutes } from 'synapse:http'
+import { fetch, HttpError, HttpHandler, HttpRequest, HttpResponse, HttpRoute, PathArgs, RouteRegexp, buildRouteRegexp, compareRoutes, createPathBindings, matchRoutes } from 'synapse:http'
 import { upgradeToWebsocket, WebSocket } from 'synapse:ws'
 import * as compute from 'synapse:srl/compute'
 import { randomUUID } from 'node:crypto'
@@ -388,9 +388,7 @@ async function runHandler<T>(response: http.ServerResponse, fn: () => Promise<T>
                 return await sendResponse(response, resp.body, resp.headers, resp.status)
             }
 
-            const body = kHttpResponseBody in resp 
-                ? Buffer.from(resp[kHttpResponseBody] as Uint8Array)
-                : resp.body
+            const body = resp.body
 
             return await sendResponse(response, body, resp.headers, resp.status)
         }

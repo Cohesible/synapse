@@ -173,6 +173,22 @@ synapse run -- alice
 # hello, alice!
 ```
 
+### `repl`
+
+Enters an interactive REPL session, optionally using a target file. The target file's exports are placed in the global scope.
+
+```main.ts
+export function foo() {
+    return 'foo'
+}
+```
+
+```shell
+synapse repl main.ts
+> foo()
+# 'foo'
+```
+
 ### `quote`
 
 Prints a motivational quote fetched from a public Synapse application.

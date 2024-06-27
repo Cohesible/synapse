@@ -646,16 +646,22 @@ function stripComments(text: string) {
     return result.join('\n')
 }
 
+export async function createSynapseTarball(dir: string) {
+    const files = await glob(getFs(), dir, ['**/*', '**/.synapse'])    
+    const tarball = createTarball(await Promise.all(files.map(async f => ({
+        contents: Buffer.from(await getFs().readFile(f)),
+        mode: 0o755,
+        path: path.relative(dir, f),
+    }))))
+
+    const zipped = await gzip(tarball)
+
+    return zipped
+}
+
 export async function createArchive(dir: string, dest: string, sign?: boolean) {
     if (path.extname(dest) === '.tgz') {
-        const files = await glob(getFs(), dir, ['**/*', '**/.synapse'])    
-        const tarball = createTarball(await Promise.all(files.map(async f => ({
-            contents: Buffer.from(await getFs().readFile(f)),
-            mode: 0o755,
-            path: path.relative(dir, f),
-        }))))
-    
-        const zipped = await gzip(tarball)
+        const zipped = await createSynapseTarball(dir)
         await getFs().writeFile(dest, zipped)
     } else if (path.extname(dest) === '.zip') {
         try {

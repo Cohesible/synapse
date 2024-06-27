@@ -2,20 +2,21 @@ import * as path from 'node:path'
 import { StdioOptions } from 'node:child_process'
 import { mergeBuilds, pruneBuild, consolidateBuild, commitPackages, getInstallation, writeSnapshotFile, getProgramFs, getDataRepository, getModuleMappings, loadSnapshot, dumpData, getProgramFsIndex, getDeploymentFsIndex, toFsFromIndex, copyFs, createSnapshot, getOverlayedFs, Snapshot, ReadonlyBuildFs } from '../artifacts'
 import {  NpmPackageInfo, getDefaultPackageInstaller, installFromSnapshot, testResolveDeps } from './packages'
-import { getBinDirectory, getSynapseDir, getLinkedPackagesDirectory, getToolsDirectory, getUserEnvFileName, getWorkingDir, listPackages, resolveProgramBuildTarget, SynapseConfiguration, getUserSynapseDirectory, setPackage, BuildTarget, findDeployment } from '../workspaces'
-import { gzip, isNonNullable, keyedMemoize, linkBin, makeExecutable, memoize, throwIfNotFileNotFoundError, tryReadJson } from '../utils'
+import { getBinDirectory, getSynapseDir, getLinkedPackagesDirectory, getToolsDirectory, getUserEnvFileName, getWorkingDir, listPackages, resolveProgramBuildTarget, SynapseConfiguration, getUserSynapseDirectory, setPackage, BuildTarget, findDeployment, getOrCreateRemotePackage } from '../workspaces'
+import { gunzip, gzip, isNonNullable, keyedMemoize, linkBin, makeExecutable, memoize, throwIfNotFileNotFoundError, tryReadJson } from '../utils'
 import { Fs, ensureDir } from '../system'
 import { glob } from '../utils/glob'
-import { createTarball, extractTarball } from '../utils/tar'
 import { getLogger, runTask } from '..'
 import { homedir } from 'node:os'
 import { getBuildTargetOrThrow, getFs, getSelfPathOrThrow, isSelfSea } from '../execution'
 import { ImportMap, expandImportMap, hoistImportMap } from '../runtime/importMaps'
 import { createCommandRunner, patchPath, runCommand } from '../utils/process'
-import { PackageJson, ResolvedPackage, getImmediatePackageJsonOrThrow, getPackageJson } from './packageJson'
+import { PackageJson, ResolvedPackage, getCompiledPkgJson, getCurrentPkg, getImmediatePackageJsonOrThrow, getPackageJson } from './packageJson'
 import { readKey, setKey } from '../cli/config'
 import { getEntrypointsFile } from '../compiler/programBuilder'
-import { createPackageForRelease } from '../cli/buildInternal'
+import { createPackageForRelease, createSynapseTarball } from '../cli/buildInternal'
+import * as registry from '@cohesible/resources/registry'
+import { extractTarball } from '../utils/tar'
 
 const getDependentsFilePath = () => path.resolve(getUserSynapseDirectory(), 'packageDependents.json')
 
@@ -89,6 +90,57 @@ function getLinkedPkgPath(name: string, deploymentId?: string) {
     const packagesDir = getLinkedPackagesDirectory()
     
     return path.resolve(packagesDir, deploymentId ? `${name}-${deploymentId}` : name)
+}
+
+async function publishTarball(tarball: Buffer, pkgJson: PackageJson) {
+    if (!pkgJson.version) {
+        throw new Error('Package is missing a version')
+    }
+
+    const remotePkgId = await getOrCreateRemotePackage()
+    const client = registry.createClient()
+    const { hash } = await client.uploadPackage(tarball)
+    await client.publishPackage({
+        packageId: remotePkgId,
+        packageHash: hash,
+        packageJson: pkgJson,
+    })
+}
+
+async function publishTarballToRemote(tarballPath: string) {
+    const tarball = Buffer.from(await getFs().readFile(tarballPath))
+    const files = extractTarball(await gunzip(tarball))
+    const pkgJsonFile = files.find(f => f.path === 'package.json')
+    if (!pkgJsonFile) {
+        throw new Error(`Missing package.json inside tarball`)
+    }
+
+    const pkgJson = JSON.parse(pkgJsonFile.contents.toString('utf-8'))
+
+    await publishTarball(tarball, pkgJson)
+}
+
+export async function publishToRemote(tarballPath?: string) {
+    if (tarballPath) {
+        return publishTarballToRemote(tarballPath)
+    }
+
+    const bt = getBuildTargetOrThrow()
+    const packageDir = getWorkingDir()
+    const tmpDest = path.resolve(packageDir, `${path.dirname(packageDir)}-tmp`)
+
+    const pkgJson = await getCurrentPkg()
+    if (!pkgJson) {
+        throw new Error('Missing package.json')
+    }
+
+    try {
+        await createPackageForRelease(packageDir, tmpDest, { environmentName: bt.environmentName }, true, true)
+        const tarball = await createSynapseTarball(tmpDest)
+        await publishTarball(tarball, pkgJson.data)
+    } finally {
+        await getFs().deleteFile(tmpDest).catch(throwIfNotFileNotFoundError)
+    }
 }
 
 export async function linkPackage(opt?: PublishOptions & { globalInstall?: boolean; skipInstall?: boolean; useNewFormat?: boolean }) {

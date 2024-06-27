@@ -18,7 +18,7 @@ import { createTemplateService, getHash, parseModuleName } from './templates'
 import { createImportMap, createModuleResolver } from './runtime/resolver'
 import { createAuth, getAuth } from './auth'
 import { generateOpenApiV3, generateStripeWebhooks } from './codegen/schemas'
-import { addImplicitPackages, createMergedView, createNpmLikeCommandRunner, dumpPackage, emitPackageDist, getPkgExecutables, getProjectOverridesMapping, installToUserPath, linkPackage } from './pm/publish'
+import { addImplicitPackages, createMergedView, createNpmLikeCommandRunner, dumpPackage, emitPackageDist, getPkgExecutables, getProjectOverridesMapping, installToUserPath, linkPackage, publishToRemote } from './pm/publish'
 import { ResolvedProgramConfig, getResolvedTsConfig, resolveProgramConfig } from './compiler/config'
 import { createProgramBuilder, getDeployables, getEntrypointsFile, getExecutables } from './compiler/programBuilder'
 import { loadCpuProfile } from './perf/profiles'
@@ -62,6 +62,7 @@ import { createBlock, openBlock } from './build-fs/block'
 import { seaAssetPrefix } from './bundler'
 import { buildWindowsShim } from './zig/compile'
 import { openRemote } from './git'
+import { getTypesFile } from './compiler/resourceGraph'
 
 export { runTask, getLogger } from './logging'
 
@@ -111,7 +112,11 @@ export async function syncModule(deploymentId: string, bt = getBuildTargetOrThro
     }
 }
 
-export async function publish(target: string, opt?: CompilerOptions & DeployOptions & { newFormat?: boolean; archive?: string; dryRun?: boolean; local?: boolean; globalInstall?: boolean; skipInstall?: boolean }) {
+export async function publish(target: string, opt?: CompilerOptions & DeployOptions & { remote?: boolean; newFormat?: boolean; archive?: string; dryRun?: boolean; local?: boolean; skipInstall?: boolean }) {
+    if (opt?.remote) {
+        return publishToRemote(opt.archive)
+    }
+
     if (opt?.archive) {
         const packageDir = getWorkingDir()
         const dest = path.resolve(packageDir, opt.archive)
@@ -129,10 +134,11 @@ export async function publish(target: string, opt?: CompilerOptions & DeployOpti
     }
 
     if (opt?.local) {
-        await linkPackage({ dryRun: opt?.dryRun, globalInstall: opt?.globalInstall, skipInstall: opt?.skipInstall, useNewFormat: opt?.newFormat }) 
-    } else {
-        throw new Error(`Publishing non-local packages is not implemented`)
+        await linkPackage({ dryRun: opt?.dryRun, skipInstall: opt?.skipInstall, useNewFormat: opt?.newFormat })
+        return
     }
+
+    throw new Error(`Publishing non-local packages is not implemented`)
 }
 
 async function findOrphans() {
@@ -2391,11 +2397,19 @@ function normalizeToRelative(fileName: string, workingDir = getWorkingDir()) {
     return path.relative(workingDir, path.resolve(workingDir, fileName))
 }
 
-export async function replCommand(target: string, opt?: { entrypoint?: string; cwd?: string }) {
+export async function replCommand(target?: string, opt?: {}) {
+    target = target ? normalizeToRelative(target) : target
     await compileIfNeeded(target)
 
     const repl = await runTask('', 'repl', async () => {
+        if (!target) {      
+            const moduleLoader = await getModuleLoader(false)
+        
+            return enterRepl(undefined, moduleLoader, {})
+        }
+    
         const files = await getEntrypointsFile()
+        const typesFile = await getTypesFile()
         const deployables = files?.deployables ?? {}
         const status = await validateTargetsForExecution(target, deployables)
         const outfile = status.sources?.[target]?.outfile 
@@ -2411,7 +2425,9 @@ export async function replCommand(target: string, opt?: { entrypoint?: string; c
     
         const moduleLoader = await runTask('init', 'loader', () => getModuleLoader(false), 1) // 8ms on simple hello world no infra
     
-        return enterRepl(resolved, moduleLoader, {})
+        return enterRepl(resolved, moduleLoader, {
+            types: typesFile?.[target.replace(/\.tsx?$/, '.d.ts')],
+        })
     }, 1)
 
     return repl.promise
