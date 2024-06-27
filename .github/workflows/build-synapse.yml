@@ -23,8 +23,6 @@ jobs:
     steps: 
       - uses: actions/checkout@v3
       - run: curl -fsSL https://synap.sh/install | bash
-      - run: echo "SYNAPSE_INSTALL=$HOME/.synapse" >> "$GITHUB_ENV"
-      - run: echo "${SYNAPSE_INSTALL}/bin" >> "$GITHUB_PATH"
       - run: synapse --version
       - run: synapse compile && synapse build
       - run: ./dist/bin/synapse
