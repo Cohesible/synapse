@@ -10,7 +10,7 @@ import { isNonNullable } from '../utils'
 // Commands are treated like scripts in `package.json`
 const commandsDirective = '!commands'
 
-function parseCommands(text: string, synapseCmd = isSelfSea() ? undefined : 'syn') {
+function parseCommands(text: string) {
     const lines = text.split('\n')
     const directive = lines.findIndex(l => l.startsWith(`// ${commandsDirective}`))
     if (directive === -1) {
@@ -32,9 +32,9 @@ function parseCommands(text: string, synapseCmd = isSelfSea() ? undefined : 'syn
     }
 
     // Used to support partial dev builds
-    if (synapseCmd) {
-        return commands.map(cmd => cmd.replaceAll('synapse', synapseCmd))
-    }
+    // if (synapseCmd) {
+    //     return commands.map(cmd => cmd.replaceAll('synapse', synapseCmd))
+    // }
 
     return commands
 }
