@@ -17,7 +17,8 @@
         "node": "22.1.0"
     },
     "scripts": {
-        "compileSelf": "synapse compile --no-synth && synapse publish --local"
+        "compileSelf": "synapse compile --no-synth && synapse publish --local",
+        "testFixtures": "synapse run src/testing/internal.ts --skipValidation -- \"$@\""
     },
     "synapse": {
         "config": {
