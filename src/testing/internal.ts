@@ -89,7 +89,7 @@ async function findTests(testDir: string, patterns = ['**/*.ts']) {
 
 export async function main(...patterns: string[]) {
     const testDir = path.resolve(getWorkingDir(), 'test', 'fixtures')
-    const tests = await findTests(testDir, patterns)
+    const tests = await findTests(testDir, patterns.length === 0 ? undefined : patterns)
 
     const failures: [string, unknown][] = []
     for (const test of tests) {
