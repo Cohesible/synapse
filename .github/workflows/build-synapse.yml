@@ -6,6 +6,7 @@ on:
       - "!.github/**"
       - .github/workflows/build-synapse.yml
       - src/**
+      - test/**
   pull_request: 
     branches:
       - main
@@ -13,7 +14,8 @@ on:
       - "!.github/**"
       - .github/workflows/build-synapse.yml
       - src/**
-  
+      - test/**
+
 jobs: 
   run_test: 
     runs-on: 
