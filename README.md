@@ -11,16 +11,27 @@
 Synapse is a toolchain for building and deploying TypeScript applications, from CLI tools to full-stack apps. Your application's infrastructure is defined within the application itself.
 
 Features:
-* Multi-stage Programming - run code at build time
-* Cloud agnostic libraries - write once, deploy anywhere
-* Deploy locally or to the cloud (only AWS at this time)
+* Multi-stage programming - run code at build time
+* Cloud agnostic libraries - write once, deploy anywhere, including locally
 * Automatic permissions solver - least privilege permissions via symbol execution
-* Built-in TypeScript compiler and bundler
-* Incremental builds (distributed caching coming soon)
-* Extremely fast package manager
-* Node.js compatible JavaScript runtime
-* [A testing framework](docs/testing.md)
-* Write native modules using Zig (coming soon)
+* Native modules - write modules using Zig with automatic TypeScript bindings (coming soon)
+* Everything you need, built-in
+    * TypeScript compiler and bundler
+    * Incremental builds (distributed caching coming soon)
+    * Extremely fast package manager
+    * Node.js compatible JavaScript runtime
+    * [A testing framework](docs/testing.md)
+
+```main.ts
+import { Bucket } from 'synapse:srl/storage'
+
+const bucket = new Bucket()
+
+export async function main() {
+    await bucket.put('hello', 'world!')
+    console.log(await bucket.get('hello', 'utf-8'))
+}
+```
 
 ## How it works
 
