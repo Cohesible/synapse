@@ -141,20 +141,16 @@ export function createTarball(files: TarballFile[]): Buffer {
 export async function extractToDir(data: Buffer, dir: string, ext: '.xz' | '.zip', stripComponents = 1) {
     await ensureDir(dir)
 
-    const args: string[] = []
-    if (stripComponents !== 0) {
-        args.push(`--strip-components=${stripComponents}`)
-    }
-
     // Okay so apparently passing through stdin on windows doesn't write out top-level files ??
     const useStdin = process.platform !== 'win32'
+    const args: string[] = []
 
     switch (ext) {
         case '.xz':
-            args.unshift(useStdin ? '-xJf-' : '-xJf')
+            args.push(useStdin ? '-xJf-' : '-xJf')
             break
         case '.zip':
-            args.unshift(useStdin ? '-xzf-' : '-xzf')
+            args.push(useStdin ? '-xzf-' : '-xzf')
             break
         default:
             throw new Error(`Unknown extname: ${ext}`)
@@ -162,11 +158,18 @@ export async function extractToDir(data: Buffer, dir: string, ext: '.xz' | '.zip
 
 
     if (useStdin) {
+        if (stripComponents !== 0) {
+            args.push(`--strip-components=${stripComponents}`)
+        }
+    
         return runCommand('tar', args, { cwd: dir, input: data })
     }
 
     const tmpPath = path.resolve(dir, `archive${ext}`)
     args.push(tmpPath)
+    if (stripComponents !== 0) {
+        args.push(`--strip-components=${stripComponents}`)
+    }
 
     await getFs().writeFile(tmpPath, data)
 
