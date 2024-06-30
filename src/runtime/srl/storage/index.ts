@@ -112,16 +112,14 @@ export declare class TTLCache<K extends string = string, V = any> {
     delete(key: K): Promise<void>
 }
 
-// import * as assert from 'node:assert'
-// import { describe, it } from 'synapse:test'
 import { DataPointer } from 'synapse:core'
 
 export type Encoding = 'utf-8' | 'base64' | 'base64url' | 'hex'
 
 //# resource = true
 export declare class Bucket {
-    get(key: string): Promise<Uint8Array>
-    get(key: string, encoding: Encoding): Promise<string>
+    get(key: string): Promise<Blob | undefined>
+    get(key: string, encoding: Encoding): Promise<string | undefined>
     put(key: string, blob: string | Uint8Array): Promise<void>
     list(prefix?: string): Promise<string[]>
     /** @internal */
@@ -132,16 +130,6 @@ export declare class Bucket {
     /** @internal */
     addBlob(sourceLocation: string | DataPointer, key?: string, contentType?: string): string
 }
-
-// describe('Bucket', () => {
-//     const bucket = new Bucket()
-
-//     it('can have stuff', async () => {
-//         await bucket.put('foo', 'bar')
-//         const data = await bucket.get('foo', 'utf-8')
-//         assert.strictEqual(data, 'bar')
-//     })
-// })
 
 //# resource = true
 /** @internal */

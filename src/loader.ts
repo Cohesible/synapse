@@ -103,6 +103,9 @@ export function createrLoader(
         return getCredentials ??= createGetCredentials(getAuth())
     }
 
+    // XXX: certain packages use this to check for a node-compatible runtime
+    process.versions.node ??= process.versions.synapse ?? process.versions.node
+
     function createRuntime(
         sources: { name: string, source: string }[],
         getSource: (fileName: string, id: string, virtualLocation: string) => string,
@@ -528,12 +531,12 @@ export function createrLoader(
                 RegExp: _globalThis.RegExp,
                 // console: _globalThis.console,
                 console: wrapped.console,
+                global: _globalThis,
                 globalThis: _globalThis, // Probably shouldn't do this
                 get __getCredentials() {
                     return getCredentialsFn()
                 },
                 __getConsole: getConsole,
-               // __getBackendClient: getBackendClient,
                 __getContext: () => context,
                 __createAsset: createAsset,
                 __getBuildDirectory: () => outDir,
@@ -598,12 +601,6 @@ export function createrLoader(
                     }
                     return addSymbol(getNodeRequire()(spec))
                 }
-
-                // XXX
-                // if (spec === 'monaco-editor') {
-                //     cache[spec] ??= { exports: createFakeModule(spec, context) }
-                //     return cache[spec].exports
-                // }
 
                 const location = moduleResolver.resolveVirtual(spec, importer)
                 if (cache[location] !== undefined) {
@@ -1120,7 +1117,22 @@ function createGlobalProxy(value: any) {
 }
 
 export function isProxy(o: any, checkPrototype = false) {
-    return !!o && ((checkPrototype && unproxy in o) || !!Reflect.getOwnPropertyDescriptor(o, moveable2))
+    // TODO: see how much this `try/catch` block hurts perf
+    // Simple tests don't show a noticeable change
+    // 
+    // We only need it because some modules bind JS builtins which we end up trapping.
+    // Many of those builtin functions accept primitives as receivers.
+    // Not a fan of this "intrinsic" pattern. It only makes things more confusing...
+
+    try {
+        return !!o && ((checkPrototype && unproxy in o) || !!Reflect.getOwnPropertyDescriptor(o, moveable2))
+    } catch(e) {
+        if (typeof o !== 'object' && typeof o !== 'function') {
+            return false
+        }
+
+        throw e
+    }
 }
 
 export function unwrapProxy(o: any, checkPrototype = false): any {
@@ -1371,11 +1383,6 @@ function createSerializationProxy(
         apply: (target, thisArg, args) => {
             const result = Reflect.apply(target, unwrapProxy(thisArg, true), args)
             if (!_shouldTrap(result)) {
-                return result
-            }
-
-            // XXX: never trap the fn passed to `__scope__`
-            if (operations.length === 2 && operations[0].module === 'synapse:core' && operations[1].property === 'scope') {
                 return result
             }
 
@@ -1761,35 +1768,3 @@ function createContextStorage(
     }
 }
 
-
-// Apple Dev Id
-// W1337179404
-// 53JRUGDHXZ
-// https://medium.com/anchore-engineering/developers-need-to-handle-macos-binary-signing-how-we-automated-the-solution-part-1-4433b32ae311
-
-// {
-//     "main": "/path/to/bundled/script.js",
-//     "output": "/path/to/write/the/generated/blob.blob",
-//     "disableExperimentalSEAWarning": true, // Default: false
-//     "useSnapshot": false,  // Default: false
-//     "useCodeCache": true // Default: false
-//   } 
-
-// #include <dlfcn.h>
-// #include <mach-o/getsect.h>
-
-// static int rcs_addr_handle = 0;
-
-// std::pair<const void*, size_t> get_resource( const char* sec_name )
-// {
-//     // get image header from a global address
-//     Dl_info img_info = {};
-//     int img_index = dladdr( &rcs_addr_handle, &img_info );
-//     if ( img_index == 0 ) return { nullptr, 0 };
-//     auto* header = (struct mach_header_64*) img_info.dli_fbase;
-
-//     // get resource address
-//     unsigned long size = 0;
-//     auto* addr = getsectiondata( header, "my_rcs_segment", sec_name, &size );
-//     return { addr, size };
-// }

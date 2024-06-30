@@ -248,7 +248,7 @@ export async function buildWindowsShim() {
     const targetFile = path.resolve('src', 'zig', 'win32', 'shim.zig')
     const outfile = path.resolve('dist', 'shim.exe')
 
-    await runZig(targetFile, outfile, ['build-exe', targetFile, '-target', 'x86_64-windows', '-O', 'ReleaseFast'])
+    await runZig(targetFile, outfile, ['build-exe', targetFile, '-target', 'x86_64-windows', '-O', 'ReleaseSmall'])
 
     return outfile
 }
@@ -358,7 +358,7 @@ export async function compileZig(file: string, opt: ResolvedProgramConfig, targe
             // need to link against a `.lib` file for Windows
             const libPath = await downloadNodeLib()
             if (libPath) {
-                args.push(libPath)
+                args.push(libPath, '-lc')
             }
 
             // TODO: using the hook requires the `delayload` MSVC feature e.g. `/delayload node.exe`

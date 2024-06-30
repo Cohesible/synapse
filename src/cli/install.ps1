@@ -80,10 +80,10 @@ function Install-Synapse {
   $IsUrl = $false
 
   if ($Version -match "^\d+\.\d+\.\d+$") {
-    $Version = "synapse-v$Version"
+    $Version = "v$Version"
   }
   elseif ($Version -match "^v\d+\.\d+\.\d+$") {
-    $Version = "synapse-$Version"
+    # noop
   }
   elseif ($Version -match "^https:") {
     $IsUrl = $true
@@ -210,16 +210,12 @@ function Install-Synapse {
 
       # New-ItemProperty -Path $RegistryKey -Name "NoModify" -Value 1 -PropertyType DWord -Force | Out-Null
       # New-ItemProperty -Path $RegistryKey -Name "NoRepair" -Value 1 -PropertyType DWord -Force | Out-Null
-      try {
-        curl.exe "-sfLo" "$InstallDir\install.ps1" "https://synap.sh/install.ps1" 
-      } catch {
-        try {
-            Invoke-RestMethod -Uri "https://synap.sh/install.ps1" -OutFile "$InstallDir\install.ps1"
-        } catch {}
-      }
 
-      New-ItemProperty -Path $RegistryKey -Name "UninstallString" -Value "powershell -c `"& `'$InstallDir\install.ps1`' -Uninstall -PauseOnError`"" -PropertyType String -Force | Out-Null
-      New-ItemProperty -Path $RegistryKey -Name "QuietUninstallString" -Value "powershell -c `"& `'$InstallDir\install.ps1`' -Uninstall -PauseOnError`"" -PropertyType String -Force | Out-Null
+      if (Test-Path "${InstallDir}\app\dist\install.ps1") {
+        Copy-Item "${InstallDir}\app\dist\install.ps1" -Destination "$InstallDir" -Force
+        New-ItemProperty -Path $RegistryKey -Name "UninstallString" -Value "powershell -c `"& `'$InstallDir\install.ps1`' -Uninstall -PauseOnError`"" -PropertyType String -Force | Out-Null
+        New-ItemProperty -Path $RegistryKey -Name "QuietUninstallString" -Value "powershell -c `"& `'$InstallDir\install.ps1`' -Uninstall -PauseOnError`"" -PropertyType String -Force | Out-Null
+      }
     } catch {
       Write-Output "Failed to install to registry:"
       Write-Output $_

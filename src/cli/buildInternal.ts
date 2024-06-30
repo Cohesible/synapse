@@ -1,7 +1,7 @@
 import * as path from 'node:path'
 import * as zlib from 'node:zlib'
 import * as github from '../utils/github'
-import { getGlobalCacheDirectory, getUserSynapseDirectory, resolveProgramBuildTarget } from '../workspaces'
+import { getGlobalCacheDirectory, getUserSynapseDirectory, resolveProgramBuildTarget, toProgramRef } from '../workspaces'
 import { getBuildTargetOrThrow, getFs } from '../execution'
 import { createTarball, extractFileFromZip, extractTarball, hasBsdTar } from '../utils/tar'
 import { PackageJson, getPackageJson } from '../pm/packageJson'
@@ -466,7 +466,7 @@ export async function createPackageForRelease(pkgDir: string, dest: string, targ
     const programId = bt.programId 
     const deploymentId = bt.deploymentId
 
-    const programFs = getProgramFs(programId)
+    const programFs = getProgramFs(bt)
     const filesToKeep: string[] = []
 
     const moduleMappings = await getModuleMappings(programFs)

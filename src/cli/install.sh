@@ -105,12 +105,41 @@ install_from_archive() {
         shell=${SHELL:-sh}
         "$node" "$app_dir/dist/install.js" "$install_dir" "$app_dir" $(basename "$shell")
     else
-        echo 'Skipping profile install'
+        info 'Skipping profile install'
         "$node" "$app_dir/dist/install.js" "$install_dir" "$app_dir"
     fi
 
     installedVersion=$("$install_dir"/bin/synapse --version)
     success "Installed $installedVersion"
+}
+
+install_from_github() {
+    target=$(get_target)
+    if [[ "$target" =~ ^darwin ]]; then
+        tarball_basename=synapse-$target.zip
+    else
+        tarball_basename=synapse-$target.tgz
+    fi
+
+    GITHUB=${GITHUB-"https://github.com"}
+
+    github_repo="$GITHUB/Cohesible/synapse"
+
+    if [[ $# = 0 ]]; then
+        synapse_uri=$github_repo/releases/latest/download/$tarball_basename
+    else
+        info "Installing requested version $1"
+        synapse_uri=$github_repo/releases/download/$1/$tarball_basename
+    fi
+
+    tarball_path=$app_dir/$tarball_basename
+
+    curl --fail --location --progress-bar --output "$tarball_path" "$synapse_uri" ||
+        error "Failed to download synapse from \"$synapse_uri\""
+
+    install_from_archive "$tarball_path"
+
+    rm -r "$tarball_path"
 }
 
 if [[ $# -gt 0 ]]; then
@@ -139,6 +168,10 @@ if [[ $# -gt 0 ]]; then
 
         install_from_archive "$tarball_path"
         rm -r "$tarball_path"
+    elif [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+        install_from_github $1
+    elif [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+        install_from_github "v$1"
     else
         install_from_archive $1
     fi
@@ -146,30 +179,4 @@ if [[ $# -gt 0 ]]; then
     exit 0
 fi
 
-
-target=$(get_target)
-if [[ "$target" =~ ^darwin ]]; then
-    tarball_basename=synapse-$target.zip
-else
-    tarball_basename=synapse-$target.tgz
-fi
-
-GITHUB=${GITHUB-"https://github.com"}
-
-github_repo="$GITHUB/Cohesible/synapse"
-
-if [[ $# = 0 ]]; then
-    synapse_uri=$github_repo/releases/latest/download/$tarball_basename
-else
-    synapse_uri=$github_repo/releases/download/$1/$tarball_basename
-fi
-
-
-tarball_path=$app_dir/$tarball_basename
-
-curl --fail --location --progress-bar --output "$tarball_path" "$synapse_uri" ||
-    error "Failed to download synapse from \"$synapse_uri\""
-
-install_from_archive "$tarball_path"
-
-rm -r "$tarball_path"
+install_from_github

@@ -1,5 +1,5 @@
 import * as path from 'node:path'
-import { getLogger } from '..'
+import { getLogger, runTask } from '..'
 import { createMountedFs, getPublished, getDeploymentFs, getDataRepository, getDeploymentStore, readState, toFsFromIndex, createTempMountedFs, getFsFromHash, toFsFromHash, getProgramFs, getProgramHash, DataRepository } from '../artifacts'
 import { getAuth } from '../auth'
 import { getBackendClient } from '../backendClient'
@@ -14,7 +14,7 @@ import { createBasicDataRepo, createModuleResolverForBundling } from '../runtime
 import { createCodeCache } from '../runtime/utils'
 import { createTemplateService } from '../templates'
 import { wrapWithProxy, memoize, getHash, createRwMutex, throwIfNotFileNotFoundError } from '../utils'
-import { BuildTarget, getOrCreateDeployment, getDeploymentBuildDirectory, getV8CacheDirectory } from '../workspaces'
+import { BuildTarget, getOrCreateDeployment, getDeploymentBuildDirectory, getV8CacheDirectory, toProgramRef } from '../workspaces'
 import { DeployOptions, SessionContext, createStatePersister, createZip, getTerraformPath, mapResource, parsePlan, startTerraformSession } from './deployment'
 import { TfJson } from '../runtime/modules/terraform'
 import { TfState } from './state'
@@ -55,7 +55,7 @@ export async function loadBuildState(bt: BuildTarget, repo = getDataRepository()
             return
         }
 
-        const deployables = (await getEntrypointsFile(getProgramFs(bt.programId)))?.deployables
+        const deployables = (await getEntrypointsFile(getProgramFs(bt)))?.deployables
         const programDeployables = new Set<string>(Object.values(deployables ?? {}).map(f => path.relative(bt.workingDirectory, f)))
 
         const importMap: ImportMap<SourceInfo> = {}
@@ -165,10 +165,12 @@ async function maybeLoadEnvironmentVariables(fs: Pick<Fs, 'readFile'>) {
 
 export async function createSessionContext(programHash?: string): Promise<SessionContext> {
     const bt = getBuildTargetOrThrow()
-    const deploymentId = await getOrCreateDeployment()
+    const deploymentId = bt.deploymentId ?? await runTask('projects', 'deployment', getOrCreateDeployment, 10)
     const repo = getDataRepository()
 
-    const resolvedProgramHash = programHash ?? (await repo.getHead(bt.programId))!.storeHash
+    const resolvedProgramHash = programHash ?? (await repo.getHead(toProgramRef(bt)))!.storeHash
+    getLogger().debug(`Creating session context with program hash [deploymentId: ${deploymentId}]`, resolvedProgramHash)
+
     const tmpMountedFs = createTempMountedFs((await repo.getBuildFs(resolvedProgramHash)).index, bt.workingDirectory)
 
     const fs = tmpMountedFs
@@ -209,7 +211,6 @@ export async function createSessionContext(programHash?: string): Promise<Sessio
         return sourceMapParser
     })
 
-    // XXX: only used for `internal/apps/github` atm
     await maybeLoadEnvironmentVariables(fs)
 
     const env = {

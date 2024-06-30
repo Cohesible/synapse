@@ -5,7 +5,7 @@ import * as path from 'node:path'
 import * as stream from 'node:stream'
 import * as child_process from 'node:child_process'
 import type * as http from 'node:http'
-import { fetch, HttpError, HttpHandler, HttpRequest, HttpResponse, HttpRoute, PathArgs, RouteRegexp, buildRouteRegexp, compareRoutes, createPathBindings, matchRoutes } from 'synapse:http'
+import { fetch, HttpError, HttpHandler, HttpRequest, HttpResponse, HttpRoute, PathArgs, RouteRegexp, buildRouteRegexp, compareRoutes, createPathBindings, matchRoutes, RequestHandler, RequestHandlerWithBody, PathArgsWithBody } from 'synapse:http'
 import { upgradeToWebsocket, WebSocket } from 'synapse:ws'
 import * as compute from 'synapse:srl/compute'
 import { randomUUID } from 'node:crypto'
@@ -58,7 +58,8 @@ async function startServer(props: LocalHttpServiceProps) {
     const server = getHttp().createServer()
     const controlRouter = createRequestRouter()
 
-    controlRouter.addRoute('POST /__control__/routeTable', async (req, data) => {
+    controlRouter.addRoute('POST', '/__control__/routeTable', async (_, req) => {
+        const data = await receiveData(req)
         if (!data) {
             throw new Error(`Expected body`)
         }
@@ -318,7 +319,7 @@ export class Gateway implements compute.HttpService {
     readonly invokeUrl: string
 
     readonly defaultPath?: string | undefined
-    authHandler?: HttpHandler
+    authHandler?: RequestHandlerWithBody
 
     public async callOperation<T extends any[], R>(route: HttpRoute<T, R>, ...args: T): Promise<R> {
         return fetch(route, ...args)
@@ -328,17 +329,7 @@ export class Gateway implements compute.HttpService {
         throw new Error('Method not implemented.')
     }
 
-    public addRoute<P extends string = string, U = any, R = HttpResponse>(
-        route: P, 
-        handler: HttpHandler<P, U, R> | HttpHandler<P, string, R>,
-    ): HttpRoute<[...PathArgs<P>, U], R> {
-        const [method, path] = route.split(' ')
-        if (path === undefined) {
-            throw new Error(`Missing method in route: ${route}`)
-        }
-
-        this.requestRouter.addRoute(route, wrapHandler(handler, this.authHandler))
-
+    private toRoute(method: string, path: string) {
         const pathBindings = createPathBindings(path)
 
         return {
@@ -354,6 +345,16 @@ export class Gateway implements compute.HttpService {
                 response: [] 
             },
         }
+    }
+
+    public route<P extends string = string, U = unknown, R = unknown>(
+        method: string,
+        path: P,
+        handler: RequestHandler<`${string} ${P}`, R> | RequestHandlerWithBody<`${string} ${P}`, U, R>
+    ): HttpRoute<PathArgsWithBody<P, U>, R> {
+        this.requestRouter.addRoute(method, path, wrapRequestHandler(handler, this.authHandler))
+
+        return this.toRoute(method, path)
     }
 
     constructor(opt?: compute.HttpServiceOptions) {
@@ -383,12 +384,7 @@ async function runHandler<T>(response: http.ServerResponse, fn: () => Promise<T>
                 return await sendResponse(response, Buffer.from(await resp.arrayBuffer()), resp.headers, resp.status)
             }
 
-            // Streamed response
-            if (resp.body && contentType === 'text/html') {
-                return await sendResponse(response, resp.body, resp.headers, resp.status)
-            }
-
-            const body = resp.body
+            const body = resp.body === null ? undefined : resp.body
 
             return await sendResponse(response, body, resp.headers, resp.status)
         }
@@ -469,42 +465,55 @@ function isJsonRequest(headers: Headers) {
     return !!contentType.match(/application\/(?:([^+\s]+)\+)?json/)
 }
 
-function wrapHandler(
-    handler: HttpHandler, 
-    authHandler?: HttpHandler, 
+function wrapRequestHandler(
+    handler: RequestHandler | RequestHandlerWithBody, 
+    authHandler?: RequestHandler | RequestHandlerWithBody, 
 ) {
-    async function handleRequest(req: HttpRequest, data?: string) {
-        const body = (data && isJsonRequest(req.headers)) ? JSON.parse(data) : data
-        
+    async function handleRequest(url: URL, req: http.IncomingMessage, pathParameters: Record<string, string>) {
+        const method = req.method
+        const headers = new Headers(Object.entries(req.headers).filter(([_, v]) => v !== undefined) as any)
+        const body = isJsonRequest(headers) && handler.length >= 2 && method !== 'GET' && method !== 'HEAD'
+            ? JSON.parse(await receiveData(req)) 
+            : undefined
+
+        const reqBody = method === 'GET' || method === 'HEAD' ? undefined : (body ?? stream.Readable.toWeb(req))
+        const newReq = new Request(url, {
+            headers,
+            method,
+            body: reqBody,
+            duplex: 'half', // specific to node
+        } as RequestInit)
+
+        ;(newReq as any).pathParameters = pathParameters
+
         if (authHandler) {
-            const resp = await authHandler(req, body)
+            const resp = await authHandler(newReq as any, body)
             if (resp !== undefined) {
                 return resp
             }
         }
 
-        return handler(req, body)
+        return handler(newReq as any, body)
     }
 
     return handleRequest
 }
 
+type GatewayHandler = ReturnType<typeof wrapRequestHandler>
 
-type GatewayHandler = ReturnType<typeof wrapHandler>
+interface RouteEntry {
+    readonly route: string
+    readonly pattern: RouteRegexp<string>
+    readonly handler: GatewayHandler
+}
+
 function createRequestRouter() {
-    interface RouteEntry {
-        readonly route: string
-        readonly pattern: RouteRegexp<string>
-        readonly handler: GatewayHandler
-    }
-
     const routeTable: { [method: string]: RouteEntry[] } = {}
 
-    function addRoute(route: string, handler: GatewayHandler) {
-        const [method, path] = route.split(' ')
+    function addRoute(method: string, path: string, handler: GatewayHandler) {
         const routes = routeTable[method] ??= []
         const r = {
-            route,
+            route: `${method} ${path}`,
             handler,
             pattern: buildRouteRegexp(path),
         }
@@ -561,20 +570,13 @@ function createRequestRouter() {
         ]
         const url = new URL(req.url!, `http://${req.headers.host}`)
 
-        return runHandler(resp, async () => {
-            const data = await receiveData(req)
+        return runHandler(resp, () => {
             const selectedRoute = findRoute(url.pathname, routes)
-            console.log('Using route:', selectedRoute.value.route)
+            const pathParameters = selectedRoute.match.groups ?? {}
+            const entry = selectedRoute.value
+            console.log('Using route:', entry.route)
 
-            const mappedRequest = {
-                path: url.pathname,
-                queryString: url.search,
-                headers: new Headers(Object.entries(req.headers).filter(([_, v]) => v !== undefined) as any),
-                method: req.method!,
-                pathParameters: selectedRoute.match.groups ?? {},
-            }    
-    
-            return selectedRoute.value.handler(mappedRequest, data)
+            return entry.handler(url, req, pathParameters)
         })
     }
 

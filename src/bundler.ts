@@ -778,6 +778,8 @@ function generateLazyModule(spec: string, obfuscate = true, allowDynamicLink = f
 
             createVariableStatement('mod', loadModule()),
 
+            // FIXME: this doesn't work as intended because `esbuild` assigns `module.exports` to per-module locals
+            // Meaning we never remove the proxy. Which is fine, just means worse perf.
             ts.factory.createExpressionStatement(
                 ts.factory.createAssignment(
                     ts.factory.createPropertyAccessExpression(

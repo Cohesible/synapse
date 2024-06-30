@@ -115,6 +115,16 @@ export async function getCurrentBranch(dir = process.cwd()) {
     return branch ? branch.trim() : undefined
 }
 
+export async function getDefaultBranch(remote: string, dir = process.cwd()) {
+    const info = await runGit(dir, ['remote', 'show', remote])
+    const branch = info.match(/HEAD branch: ([^\s]+)/)?.[1]
+    if (!branch) {
+        throw new Error('Failed to parse default branch')
+    }
+
+    return branch.trim()
+}
+
 export async function getLatestCommit(remote: string, branch = 'main', dir = process.cwd()) {
     await runGit(dir, ['fetch', remote, branch])
     const hash = await runGit(dir, ['rev-parse', 'FETCH_HEAD'])

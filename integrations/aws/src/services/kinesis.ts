@@ -249,7 +249,7 @@ function createIngestionService(consumer: (data: string) => Promise<void> | void
     })
 
 
-    const route = service.addRoute('POST /ingest', async (req, body: FirehosePutRequest) => {
+    const route = service.route('POST', '/ingest', async (req, body: FirehosePutRequest) => {
         try {
             await Promise.all(body.records.map(r => consumer(r.data)))
 

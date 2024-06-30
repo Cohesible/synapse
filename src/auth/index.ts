@@ -32,19 +32,20 @@ export type Auth = ReturnType<typeof createAuth>
 
 export const getAuth = memoize(() => createAuth())
 
-function getClient(): ReturnType<typeof createIdentityClient> {
+function _getClient(): ReturnType<typeof createIdentityClient> {
     try {
         return createIdentityClient()
     } catch {
-        return getBackendClient() as any
+        return getBackendClient(true) as any
     }
 }
+
+const getClient = memoize(_getClient)
 
 export const getAuthClient = getClient
 
 export function createAuth() {
     const fs = getFs()
-    const client = getClient()
     const credsDir = path.resolve(getUserSynapseDirectory(), 'credentials')
     const statePath = path.resolve(credsDir, 'state.json')
 
@@ -87,7 +88,7 @@ export function createAuth() {
         }
 
         if (account.subtype === 'machine') {
-            await client.deleteMachineIdentity(account.id)
+            await getClient().deleteMachineIdentity(account.id)
             await fs.deleteFile(getMachineKeyPath(account.id)).catch(e => {
                 if ((e as any).code !== 'ENOENT') {
                     throw e
@@ -120,7 +121,7 @@ export function createAuth() {
     }
 
     async function refreshCredentials(identity: Pick<Identity, 'id'>, refreshToken: string) {
-        const creds = await client.refreshCredentials(refreshToken)
+        const creds = await getClient().refreshCredentials(refreshToken)
 
         return saveCredentials(identity, creds)
     }
@@ -162,7 +163,7 @@ export function createAuth() {
 
     async function getMachineCredentials(account: Account & { subtype: 'machine'}) {
         const privateKey = await getMachineKey(account)
-        const creds = await client.getMachineCredentials(account.id, privateKey, account.config?.sessionDuration)
+        const creds = await getClient().getMachineCredentials(account.id, privateKey, account.config?.sessionDuration)
 
         return saveCredentials(account, creds)
     }
@@ -180,7 +181,7 @@ export function createAuth() {
     }
 
     async function createMachineIdentity(makeCurrent?: boolean) {
-        const identity = await client.createMachineIdentity()
+        const identity = await getClient().createMachineIdentity()
         await fs.writeFile(getMachineKeyPath(identity.id), identity.privateKey)
         const acc = { ...identity, privateKey: undefined, subtype: 'machine' } as Account & { subtype: 'machine' }
         await putAccount(acc, makeCurrent)
@@ -231,7 +232,7 @@ export function createAuth() {
     }
 
     async function listIdentityProviders() {
-        return client.listProviders()
+        return getClient().listProviders()
     }
 
     async function getAccount(id: string): Promise<Account | undefined> {
@@ -267,22 +268,22 @@ export function createAuth() {
 
     async function startLogin() {
         const type = 'github'
-        const { providers } = await client.listProviders()
+        const { providers } = await getClient().listProviders()
         const filtered = providers.filter(p => !type || p.type === type)
         if (filtered.length === 0) {
             throw new Error(`No identity providers available`)
         }
     
         const providerId = filtered[0].id
-        const { pollToken, redirectUrl } = await client.startLogin(providerId)
+        const { pollToken, redirectUrl } = await getClient().startLogin(providerId)
         getLogger().log('Open URL to login:', redirectUrl)
     
         const startTime = Date.now()
         while (Date.now() - startTime < 60_000) {
             await new Promise<void>(r => setTimeout(r, 2500))
-            const token = await client.getToken(providerId, pollToken)
+            const token = await getClient().getToken(providerId, pollToken)
             if (token) {
-                const identity = await client.whoami(token.access_token)
+                const identity = await getClient().whoami(token.access_token)
                 await putAccount(identity, true)
                 await saveCredentials(identity, token)
 
@@ -382,7 +383,7 @@ export function createAuth() {
             throw new Error(`Missing credentials for identity: ${id}`)
         }
 
-        const resp = await client.whoami(creds.access_token)
+        const resp = await getClient().whoami(creds.access_token)
         if (resp.id !== id) {
             throw new Error(`Imported identity ID does not match the ID reported by the authentication service`)
         }

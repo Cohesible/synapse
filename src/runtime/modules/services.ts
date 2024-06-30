@@ -95,7 +95,7 @@ export abstract class Service<T = void> {
                 if (k.startsWith('_')) continue
                 if (k === 'constructor' || typeof v.value !== 'function') continue
 
-                const route = service.addRoute(`POST /__rpc/${k}`, async (req, body: { args: any[] }) => {
+                const route = service.route('POST', `/__rpc/${k}`, async (req, body: { args: any[] }) => {
                     const args = body.args
                     if (authorizer) {
                         const authorization = req.headers.get('authorization')

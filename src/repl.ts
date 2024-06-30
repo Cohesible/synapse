@@ -4,7 +4,7 @@ import * as path from 'node:path'
 import * as fs from 'node:fs/promises'
 import { CombinedOptions } from '.'
 import { getLogger } from './logging'
-import { getSocketsDirectory, getTargetDeploymentIdOrThrow, getUserSynapseDirectory } from './workspaces'
+import { getSocketsDirectory, getTargetDeploymentIdOrThrow, getUserSynapseDirectory, toProgramRef } from './workspaces'
 import { TfState } from './deploy/state'
 import { SessionContext } from './deploy/deployment'
 import { pointerPrefix } from './build-fs/pointers'
@@ -12,7 +12,7 @@ import { getDisplay } from './cli/ui'
 import { getArtifactFs } from './artifacts'
 import { getBuildTargetOrThrow } from './execution'
 import { TypeInfo } from './compiler/resourceGraph'
-import { ensureDir } from './utils'
+import { ensureDir, getHash } from './utils'
 
 export interface ReplOptions extends CombinedOptions {
     onInit?: (instance: ReplInstance) => void
@@ -109,7 +109,7 @@ function wrapCallable(target: any, prop: PropertyKey) {
 
 async function createRepl(
     target: string | undefined,
-    loader: ReturnType<SessionContext['createModuleLoader']>, 
+    loader: Pick<ReturnType<SessionContext['createModuleLoader']>, 'loadModule'>, 
     options: ReplOptions,
     socket?: net.Socket
 ) {
@@ -130,7 +130,7 @@ async function createRepl(
     const historyDir = path.resolve(getUserSynapseDirectory(), 'repl-history')
     await ensureDir(historyDir)
 
-    const historyFile = path.resolve(historyDir, getBuildTargetOrThrow().programId)
+    const historyFile = path.resolve(historyDir, getHash(toProgramRef(getBuildTargetOrThrow())))
     instance.setupHistory(historyFile, err => {
         if (err) {
             getLogger().error(`Failed to setup REPL history`, err)
@@ -190,7 +190,7 @@ async function createRepl(
 
 export async function enterRepl(
     target: string | undefined,
-    loader: ReturnType<SessionContext['createModuleLoader']>, 
+    loader: Pick<ReturnType<SessionContext['createModuleLoader']>, 'loadModule'>, 
     options: CombinedOptions & { types?: Record<string, TypeInfo> }
 ) {
     await getDisplay().releaseTty()

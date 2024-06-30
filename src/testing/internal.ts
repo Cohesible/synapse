@@ -9,6 +9,7 @@ import { isNonNullable } from '../utils'
 
 // Commands are treated like scripts in `package.json`
 const commandsDirective = '!commands'
+const finallyCommand = '@finally'
 
 function parseCommands(text: string) {
     const lines = text.split('\n')
@@ -31,17 +32,13 @@ function parseCommands(text: string) {
         }
     }
 
-    // Used to support partial dev builds
-    // if (synapseCmd) {
-    //     return commands.map(cmd => cmd.replaceAll('synapse', synapseCmd))
-    // }
-
     return commands
 }
 
 interface RunTestOptions {
     baseline?: boolean
     snapshot?: boolean
+    synapseCmd?: string
 }
 
 export async function runInternalTestFile(fileName: string, opt?: RunTestOptions) {
@@ -54,16 +51,42 @@ export async function runInternalTestFile(fileName: string, opt?: RunTestOptions
     return runTest(fileName, commands, opt)
 }
 
+function renderCommands(commands: string[], synapseCmd?: string) {
+    if (synapseCmd) {
+        commands = commands.map(cmd => cmd.replaceAll('synapse', synapseCmd))
+    }
+
+    const inner: string[] = []
+    const statements: string[] = []
+    for (const c of commands) {
+        if (c.startsWith(finallyCommand)) {
+            statements.push(c.slice(finallyCommand.length).trim())
+        } else {
+            inner.push(c)
+        }
+    }
+
+    if (statements.length > 0) {
+        statements.unshift('export _EXIT_CODE=$?')
+        statements.push('exit $_EXIT_CODE')
+    }
+
+    return [
+        inner.join(' && '),
+        ...statements,
+    ].join('; ')
+}
+
 async function runTest(fileName: string, commands: string[], opt?: RunTestOptions) {
     if (opt?.snapshot) {
         const runner = createNpmLikeCommandRunner(path.dirname(fileName), undefined, ['inherit', 'pipe', 'inherit'])
-        const cmd = commands.join(' && ')
+        const cmd = renderCommands(commands, opt?.synapseCmd)
         const result = await runner(cmd)
         return
     }
 
     const runner = createNpmLikeCommandRunner(path.dirname(fileName), undefined, 'inherit')
-    const cmd = commands.join(' && ')
+    const cmd = renderCommands(commands, opt?.synapseCmd)
 
     await runner(cmd)
 }

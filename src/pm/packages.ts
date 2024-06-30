@@ -149,7 +149,7 @@ export function resolveExport(target: string, exports: PackageExport, conditions
         throw new Error(`Found no subpaths matching "${target}": ${entries.map(x => x[0])}`)
     }
 
-    function resolveConditionalExports(cond: ConditionalExports, pathPattern?: string): [resolved: string, ...conditions: string[]] {
+    function resolveConditionalExports(cond: ConditionalExports, pathPattern?: string): string | [resolved: string, ...conditions: string[]] {
         // We iterate over the condition set instead of 
         // the conditions to ensure priority
         for (const k of condSet) {
@@ -158,10 +158,10 @@ export function resolveExport(target: string, exports: PackageExport, conditions
 
             try {
                 const resolved = inner(v, pathPattern)
-                if (typeof resolved === 'string') {
+                if (typeof resolved === 'string' && k !== 'default') {
                     return [resolved, k]
                 }
-                return [resolved[0], ...resolved[1], k]
+                return resolved
             } catch {}
         }
 
@@ -233,6 +233,7 @@ export function resolveBareSpecifier(spec: string, pkg: PackageJson, mode: 'cjs'
     if (pkg.exports) {
         const conditions = getConditions(mode)
         const resolved = resolveExport(target, pkg.exports, conditions, defaultEntrypoint)
+
         if (typeof resolved === 'string') {
             return {
                 fileName: resolved,
@@ -731,7 +732,7 @@ function createFilePackageRepo(fs: Fs, workingDirectory: string): PackageReposit
             }
 
 
-            const integrity = await getProgramHash(bt.programId, getDataRepository(undefined, bt.buildDir))
+            const integrity = await getProgramHash(bt, getDataRepository(undefined, bt.buildDir))
 
             return {
                 ...pkg.data,
@@ -2161,7 +2162,8 @@ export async function writeToNodeModules(
                 if (snapshot?.store) {
                     const selfPath = getSelfPath()
                     const selfDir = selfPath ? path.dirname(path.dirname(selfPath)) : undefined
-                    const updateDependents = selfDir ? !pkgLocation.startsWith(selfDir) : false
+                    // const updateDependents = selfDir ? !pkgLocation.startsWith(selfDir) : false
+                    const updateDependents = false
                     await installFromSnapshot(installDir, path.resolve(dir, 'node_modules', spec), pkgLocation, snapshot as Snapshot & { store: ReadonlyBuildFs }, updateDependents)
                 } else {
                     const link = () => fs.link(pkgLocation, dest, { symbolic: true, typeHint: 'dir' })
@@ -2229,7 +2231,7 @@ export async function writeToNodeModules(
                     }
 
                     // Copy `package.json` to help TypeScript
-                    const patterns = typesOnly ? ['**/*.d.ts', 'package.json'] : ['*']
+                    const patterns = typesOnly ? ['**/*.d.ts', 'package.json'] : ['**']
                     // A decent chunk of a time is just spent globbing
                     // We also aren't streaming the discovered files
                     const files = await glob(fs, pkgLocation, patterns) 

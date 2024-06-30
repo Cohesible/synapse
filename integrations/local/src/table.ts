@@ -2,7 +2,7 @@ import * as core from 'synapse:core'
 import * as storage from 'synapse:srl/storage'
 import * as compute from 'synapse:srl/compute'
 import { HttpError } from 'synapse:http'
-import { LocalKVStore, NoSuchKey, getStorePath } from './bucket'
+import { LocalKVStore, getStorePath } from './bucket'
 import { createHash } from 'node:crypto'
 
 function hashObj(o: any) {
@@ -13,17 +13,9 @@ export class Table<K, V> implements storage.Table<K, V> {
     private readonly resource = new LocalKVStore(getStorePath())
 
     public async get(key: K): Promise<V | undefined> {
-        try {
-            const d = await this.resource.get(hashObj(key))
+        const d = await this.resource.get(hashObj(key), 'utf-8')
 
-            return JSON.parse(d.toString('utf-8'))
-        } catch (e) {
-            if (e instanceof NoSuchKey) {
-                return
-            }
-
-            throw e
-        }
+        return d !== undefined ? JSON.parse(d) : undefined
     }
 
     getBatch(keys: K[]): Promise<{ key: K; value: V }[]> {

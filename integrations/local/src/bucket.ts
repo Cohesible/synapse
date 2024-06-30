@@ -6,10 +6,6 @@ import { getContentType } from 'synapse:http'
 import { createHash } from 'node:crypto'
 import { getLocalPath } from './provider'
 
-export class NoSuchKey extends Error {
-    public readonly name = 'NoSuchKey'
-}
-
 function isFileNotFoundError(e: unknown) {
     return (e as any).code === 'ENOENT'
 }
@@ -46,12 +42,19 @@ export class LocalKVStore extends core.defineResource({
         await fs.writeFile(p, value)
     }
 
-    async get(key: string) {        
-        return fs.readFile(path.resolve(this.filePath, key)).catch(e => {
+    async get(key: string): Promise<Blob | undefined>
+    async get(key: string, encoding: storage.Encoding): Promise<string | undefined>
+    async get(key: string, encoding?: storage.Encoding): Promise<string | Blob | undefined> {        
+        const data = await fs.readFile(path.resolve(this.filePath, key), encoding).catch(e => {
             throwIfNotFileNotFoundError(e)
-
-            throw new NoSuchKey(`Key not found: ${key}`)
+            return undefined
         })
+
+        if (encoding) {
+            return data
+        }
+
+        return data !== undefined ? new Blob([data]) : undefined
     }
 
     async stat(key: string) {        
@@ -119,12 +122,10 @@ export function getStorePath() {
 export class Bucket implements storage.Bucket {
     private readonly resource = new LocalKVStore(getStorePath())
 
-    public async get(key: string): Promise<Uint8Array>
-    public async get(key: string, encoding: storage.Encoding): Promise<string>
-    public async get(key: string, encoding?: storage.Encoding): Promise<Uint8Array | string> {
-        const data = await this.resource.get(key)
-
-        return encoding ? Buffer.from(data).toString(encoding) : data
+    public get(key: string): Promise<Blob | undefined>
+    public get(key: string, encoding: storage.Encoding): Promise<string | undefined>
+    public get(key: string, encoding?: storage.Encoding): Promise<Blob | string | undefined> {
+        return this.resource.get(key, encoding)
     }
 
     public async put(key: string, blob: string | Uint8Array): Promise<void> {

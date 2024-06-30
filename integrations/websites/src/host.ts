@@ -31,17 +31,7 @@ interface Component {
 type FunctionComponent<P = any, C = any, U = any> = (props: P, context?: C) => U
 type ComponentType<P = any, C = any> = FunctionComponent<P, C>
 
-interface MountedNode {
-    unmount?(): void
-}
-
-interface MountOptions {
-    rehydrate?: boolean
-}
-
-type MountFn = (container: Element | Document, children: JSXNode, opt: MountOptions) => MountedNode
 type RenderSyncFn = (node: JSXNode) => string
-type RenderStreamFn = (node: JSXNode, opt?: { bootstrapScripts?: string[]} ) => Promise<ReadableStream>
 
 export interface Layout {
     readonly parent?: Layout
@@ -67,13 +57,13 @@ export interface WebsiteHost {
     addPage<T extends string, U>(route: T, page: Page<CapturedPattern<T>, U>, context: U): RouteablePage<CapturedPattern<T>>
 
     // XXX: having the `string` overload makes things work correctly ???
-    addHandler<T extends string, R = unknown>(route: T, handler: HttpHandler<T, string, R>): HttpFetcher<T, string, R>
-    addHandler<T extends string, U, R = unknown>(route: T, handler: HttpHandler<T, U, R>): HttpFetcher<T, U, R>
+    // addHandler<T extends string, R = unknown>(route: T, handler: HttpHandler<T, string, R>): HttpFetcher<T, string, R>
+    // addHandler<T extends string, U, R = unknown>(route: T, handler: HttpHandler<T, U, R>): HttpFetcher<T, U, R>
 
     bind<T extends any[], U>(handler: (...args: T) => Promise<U> | U): (...args: T) => Promise<U>
 
-    addRoute<T extends string, R = unknown>(route: T, handler: HttpHandler<T, string, R>): HttpRoute<[string], R>
-    addRoute<T extends string, U, R = unknown>(route: T, handler: HttpHandler<T, U, R>): HttpRoute<[request: U], R>
+    // addRoute<T extends string, R = unknown>(route: T, handler: HttpHandler<T, string, R>): HttpRoute<[string], R>
+    // addRoute<T extends string, U, R = unknown>(route: T, handler: HttpHandler<T, U, R>): HttpRoute<[request: U], R>
 }
 
 interface WebsiteHostProps {
@@ -349,7 +339,7 @@ export function createWebsiteHost<T>(
 
         const defaultOrigin = props?.domain ? `https://${props.domain.name}` : cdn.url
 
-        website.addRoute(`OPTIONS /{proxy+}`, async req => {
+        website.route('OPTIONS', `/{proxy+}`, async req => {
             const origin = req.headers.get('origin')
 
             return {
@@ -381,14 +371,14 @@ export function createWebsiteHost<T>(
         })
     }
 
-    website.addRoute('GET /_assets/{path+}', async (req) => {
+    website.route('GET', '/_assets/{path+}', async (req) => {
         const pathname = req.pathParameters.path
 
         return await getAsset(pathname)
     })
 
     // This route automatically redirects paths with trailing slashes to the normalized path
-    website.addRoute('GET {path*}/', req => {
+    website.route('GET', '{path*}/', req => {
         return new Response(undefined, {
             status: 308,
             headers: new Headers({
@@ -420,7 +410,7 @@ export function createWebsiteHost<T>(
         // `defaultPath` implies API Gateway atm.
         if (runtime.renderStream && !website.defaultPath) {
             const getStream = createStreamedEntrypoint(runtime, finalizedPage, routeRegexp, addAsset, bind)
-            const r = website.addRoute(`GET ${fixedRoute}`, async (req) => {
+            const r = website.route('GET', fixedRoute, async (req) => {
                 const cache = new Map<any, any>()
                 const ctx: UseServerContext = { 
                     cache, 
@@ -549,7 +539,7 @@ export function createWebsiteHost<T>(
 
         const indexText = createEntrypoint(runtime, finalizedPage, routeRegexp, addAsset, bind)
 
-        const r = website.addRoute(`GET ${fixedRoute}`, (req) => {
+        const r = website.route('GET', fixedRoute, (req) => {
             return new Response(indexText, {
                 headers: {
                     'content-type': 'text/html; charset=utf-8',
@@ -565,7 +555,7 @@ export function createWebsiteHost<T>(
     const fnMap = new Map<string, Function>()
     // XXX: permissions solver doesn't work on `Map`
     const fnMap2: Record<string, Function> = {}
-    const apiRoute = website.addRoute('POST /_api/{id+}', async (req, body: { args: any[] }) => {
+    const apiRoute = website.route('POST', '/_api/{id+}', async (req, body: { args: any[] }) => {
         const { id } = req.pathParameters
         const handler = fnMap2[id]
         if (!handler) {
@@ -591,28 +581,10 @@ export function createWebsiteHost<T>(
         return fn as any
     }
 
-    function addHandler<T extends string, R = unknown>(route: T, handler: HttpHandler<T, string, R>): HttpFetcher<T, string, R>
-    function addHandler<T extends string, U, R = unknown>(route: T, handler: HttpHandler<T, U, R>): HttpFetcher<T, U, R>
-    function addHandler<T extends string, U, R = unknown>(route: T, handler: HttpHandler<T, U, R> | HttpHandler<T, string, R>) {
-        const r = website.addRoute(route, handler as any)
-        const fn = (...args: any[]) => fetch(r, ...args)
-        fnMap.set(getObjectId(fn), handler)
-
-        return fn
-    }
-
-    function addRoute<T extends string, R = unknown>(route: T, handler: HttpHandler<T, string, R>): HttpRoute<[string], R>
-    function addRoute<T extends string, U, R = unknown>(route: T, handler: HttpHandler<T, U, R>): HttpRoute<[request: U], R>
-    function addRoute<T extends string, U, R = unknown>(route: T, handler: HttpHandler<T, U, R> | HttpHandler<T, string, R>) {
-        return website.addRoute(route, handler as any)
-    }
-
     return {
         url: website.invokeUrl,
         addAsset,
         addPage,
-        addHandler,
-        addRoute,
         bind,
     }
 }

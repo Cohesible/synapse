@@ -11,6 +11,7 @@ import { handleCompletion } from './completions/completion'
 import { downloadNodeLib } from './buildInternal'
 import { runInternalTestFile } from '../testing/internal'
 import { getAuth } from '../auth'
+import { tryUpgrade } from './updater'
 
 
 interface TypeMap {
@@ -743,9 +744,10 @@ registerTypedCommand(
     {
         internal: true,
         args: [{ name: 'file', type: typescriptFileType }],
+        options: [{ name: 'synapseCmd', type: 'string' }]
     },
-    async (target) => {
-        await runInternalTestFile(path.resolve(getWorkingDir(), target))
+    async (target, opt) => {
+        await runInternalTestFile(path.resolve(getWorkingDir(), target), opt)
     }
 )
 
@@ -865,6 +867,18 @@ registerTypedCommand(
             return synapse.machineLogin()
         }
         await synapse.login()
+    }
+)
+
+registerTypedCommand(
+    'upgrade',  
+    {
+        options: [{ name: 'force', type: 'boolean' }],
+        requirements: { program: false }
+    },
+    async (...args) => {
+        const [_, opt] = unpackArgs(args)
+        await tryUpgrade(opt)
     }
 )
 
@@ -1449,7 +1463,7 @@ async function parseArgs(args: string[], desc: CommandDescriptor) {
 async function getBuildTarget(cmd: CommandDescriptor, params: string[]) {
     const cwd = process.cwd()
     const environmentIndex = params.indexOf('--environment')
-    const environmentName = (environmentIndex !== -1 ? params[environmentIndex+1] : undefined) ?? process.env['SYNAPSE_ENV']
+    const environmentName = (environmentIndex !== -1 ? params[environmentIndex+1] : undefined) ?? process.env.SYNAPSE_ENV
     const res = await resolveProgramBuildTarget(cwd, { environmentName })
     if (!res && cmd.inferBuildTarget) {
         const programFiles = params.filter(x => x.match(/\.tsx?$/))

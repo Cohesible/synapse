@@ -187,6 +187,10 @@ async function finishInstall(installDir: string, pkgDir: string, shell?: string)
         throw new Error(`Failed to run Synapse: ${out.stdout + '\n' + out.stderr}`)
     }
 
+    if (process.env.SYNAPSE_INSTALL_IS_UPGRADE) {
+        return
+    }
+
     await maybeInstallToGitHubRunner(installDir)
 
     if (process.platform === 'win32') {

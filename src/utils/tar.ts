@@ -146,18 +146,35 @@ export async function extractToDir(data: Buffer, dir: string, ext: '.xz' | '.zip
         args.push(`--strip-components=${stripComponents}`)
     }
 
+    // Okay so apparently passing through stdin on windows doesn't write out top-level files ??
+    const useStdin = process.platform !== 'win32'
+
     switch (ext) {
         case '.xz':
-            args.unshift('-xJf-')
+            args.unshift(useStdin ? '-xJf-' : '-xJf')
             break
         case '.zip':
-            args.unshift('-xzf-')
+            args.unshift(useStdin ? '-xzf-' : '-xzf')
             break
         default:
             throw new Error(`Unknown extname: ${ext}`)
     }
 
-    await runCommand('tar', args, { cwd: dir, input: data })
+
+    if (useStdin) {
+        return runCommand('tar', args, { cwd: dir, input: data })
+    }
+
+    const tmpPath = path.resolve(dir, `archive${ext}`)
+    args.push(tmpPath)
+
+    await getFs().writeFile(tmpPath, data)
+
+    try {
+        await runCommand('tar', args, { cwd: dir })
+    } finally {
+        await getFs().deleteFile(tmpPath)
+    }
 }
 
 export const hasBsdTar = memoize(async () => {

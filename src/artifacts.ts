@@ -5,7 +5,7 @@ import type { ExternalValue, PackageInfo } from './runtime/modules/serdes'
 import { getLogger, runTask } from './logging'
 import { Mutable, acquireFsLock, createRwMutex, createTrie, deepClone, getHash, isNonNullable, keyedMemoize, memoize, sortRecord, throwIfNotFileNotFoundError, tryReadJson } from './utils'
 import type { TerraformPackageManifest, TfJson } from './runtime/modules/terraform'
-import { BuildTarget, Deployment, Program, getBuildDir, getProgramIdFromDeployment, getRemoteProjectId, getRootDir, getRootDirectory, getTargetDeploymentIdOrThrow, getWorkingDir, resolveProgramBuildTarget } from './workspaces'
+import { BuildTarget, Deployment, Program, getBuildDir, getProgramInfoFromDeployment, getRemoteProjectId, getRootDir, getRootDirectory, getTargetDeploymentIdOrThrow, getWorkingDir, resolveProgramBuildTarget, toProgramRef } from './workspaces'
 import {  NpmPackageInfo } from './pm/packages'
 import { TargetsFile, readPointersFile } from './compiler/host'
 import { TarballFile } from './utils/tar'
@@ -3030,7 +3030,14 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
     const dataDir = getDataDir()
     const resolvedDir = getResolvedDir() // For files that need a "flat" name
 
-    const getHeadPath = (id: string) => path.resolve(headDir, id)
+    const _getHeadPath = (id: string) => {
+        if (id.match(/[@:\/]/)) {
+            return path.resolve(headDir, getHash(id))
+        }
+        return path.resolve(headDir, id)
+    }
+
+    const getHeadPath = keyedMemoize(_getHeadPath)
     const getDataPath = (hash: string) => path.resolve(dataDir, getPrefixedPath(hash))
     const getBlockPath = (hash: string) => path.resolve(getBlocksDir(), hash)
 
@@ -3775,15 +3782,17 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
     }
 
     // Store utils
-    function getProgramStore(programId: string, workingDirectory: string) {
+    function getProgramStore(bt: Pick<BuildTarget, 'programId' | 'projectId' | 'branchName' | 'workingDirectory'>) {
+        const ref = toProgramRef(bt)
+
         const openVfs = async (key: string) => {
-            const vfs = await getRootBuildFs(programId)
+            const vfs = await getRootBuildFs(ref)
 
             return vfs.open(key)
         }
 
         async function getFullStore() {
-            const head = await getHeadData(programId)
+            const head = await getHeadData(ref)
             if (!head?.storeHash) {
                 // throw new Error(`No program store found`)
                 return { hash: '', index: { files: {}, stores: {} } }
@@ -3793,13 +3802,7 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
         }
 
         async function getPackageStore() {
-            const head = await getHeadData(`${programId}`)
-            if (!head?.storeHash) {
-                // throw new Error(`No program store found`)
-                return { hash: '', index: { files: {}, stores: {} } }
-            }
-
-            return getBuildFs(head.storeHash)
+            return getFullStore()
         }
 
         // Compilation
@@ -3809,7 +3812,7 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
             const vfs = await openVfs('synth')
     
             async function commitTemplate(template: TfJson) {
-                await writeTemplate(template, getProgramFs(programId))
+                await writeTemplate(template, getProgramFs(bt))
             }
 
             function setDeps(deps: Record<string, ReadonlyBuildFs>) {
@@ -3822,11 +3825,11 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
         }
 
         async function clear(key: string) {
-            const r = await getRootBuildFs(`${programId}`)
+            const r = await getRootBuildFs(ref)
             r.clear(key)
         }
 
-        return { clear, getTargets: async () => getTargets(await getRootBuildFs(`${programId}`)), getInstallation, getTemplate: async () => getTemplate(await openVfs('synth')), getSynthStore, getFullStore, getVfs: openVfs, getRoot: () => getRootBuildFs(programId), getModuleMappings, getPackageStore }
+        return { clear, getTargets: async () => getTargets(await getRootBuildFs(ref)), getInstallation, getTemplate: async () => getTemplate(await openVfs('synth')), getSynthStore, getFullStore, getVfs: openVfs, getRoot: () => getRootBuildFs(ref), getModuleMappings, getPackageStore }
     }
 
     //
@@ -4129,12 +4132,12 @@ export function getDataRepository(fs: Fs & SyncFs = getFs(), buildDir = getBuild
     return getRepo(fs, buildDir).root
 }
 
-export function getProgramFsIndex(programId: string) {
-    return getRepo(getFs(), getBuildDir()).getBuildFsIndex(programId)
+export function getProgramFsIndex(bt: Pick<BuildTarget, 'programId' | 'projectId' | 'branchName'>) {
+    return getRepo(getFs(), getBuildDir()).getBuildFsIndex(toProgramRef(bt))
 }
 
-export function getDeploymentFsIndex(deploymentID: string) {
-    return getRepo(getFs(), getBuildDir()).getBuildFsIndex(deploymentID)
+export function getDeploymentFsIndex(deploymentId: string) {
+    return getRepo(getFs(), getBuildDir()).getBuildFsIndex(deploymentId)
 }
 
 export async function getInstallation(fs: Pick<Fs, 'readFile'>): Promise<InstallationAttributes | undefined> {
@@ -4579,8 +4582,9 @@ function getDefaultAliases(){
         return {}
     }
 
-    const { programId, deploymentId } = bt
-    const defaultAliases = deploymentId ? { program: programId, process: deploymentId } : { program: programId }
+    const { deploymentId } = bt
+    const program = toProgramRef(bt)
+    const defaultAliases = deploymentId ? { program, process: deploymentId } : { program }
 
     return defaultAliases as Record<string, string>
 }
@@ -4610,19 +4614,19 @@ export async function shutdownRepos() {
     }
 }
 
-export function getProgramFs(id?: string) {
-    if (!id) {
+export function getProgramFs(buildTarget?: Pick<BuildTarget, 'programId' | 'projectId' | 'branchName' | 'workingDirectory'>) {
+    if (!buildTarget) {
         const buildDir = getBuildDir()
-        const workingDirectory = getWorkingDir()
-        const { programId } = getBuildTargetOrThrow()
-    
-        return getRootFs(programId, buildDir, workingDirectory)
+        const bt = getBuildTargetOrThrow()
+        const programRef = toProgramRef(bt)
+
+        return getRootFs(programRef, buildDir, bt.workingDirectory)
     }
 
-    const buildDir = getBuildDir(id)
-    const workingDirectory = getWorkingDir(id)
+    const buildDir = getBuildDir()
+    const programRef = toProgramRef(buildTarget)
 
-    return getRootFs(id, buildDir, workingDirectory)
+    return getRootFs(programRef, buildDir, buildTarget.workingDirectory)
 }
 
 export function getDeploymentFs(id?: string, programId?: string, projectId?: string) {
@@ -4637,10 +4641,17 @@ export function getDeploymentFs(id?: string, programId?: string, projectId?: str
         return getRootFs(deploymentId, buildDir, workingDirectory)
     }
 
-    // FIXME: we need to use both IDs to resolve the build/working dir correctly?
-    programId ??= getProgramIdFromDeployment(id)
-    const rootDir = getBuildDir(programId)
-    const workingDirectory = getWorkingDir(programId, projectId)
+    let branchName: string | undefined
+    if (!programId) {
+        const res = getProgramInfoFromDeployment(id)
+        programId = res.programId
+        branchName = res.branchName
+    } else {
+        branchName = getBuildTargetOrThrow().branchName
+    }
+    
+    const rootDir = getBuildDir()
+    const workingDirectory = getWorkingDir(programId, projectId, branchName)
 
     return getRootFs(id, rootDir, workingDirectory)
 }
@@ -4655,18 +4666,19 @@ export async function getPreviousFs(id: string) {
     return toFsFromHash(hash)
 }
 
-export function getPreviousProgramFs(id = getBuildTargetOrThrow().programId) {
-    return getPreviousFs(id)
+export function getPreviousProgramFs(bt = getBuildTargetOrThrow()) {
+    return getPreviousFs(toProgramRef(bt))
 }
 
-export async function didFileMaybeChange(fileName: string, fsId = getBuildTargetOrThrow().programId) {
-    const commits = await listCommits(fsId, undefined, 1)
+export async function didFileMaybeChange(fileName: string, bt = getBuildTargetOrThrow()) {
+    const ref = toProgramRef(bt)
+    const commits = await listCommits(ref, undefined, 1)
     const hash = commits[0]?.storeHash
     if (!hash) {
         return true
     }
 
-    const root = await getDataRepository().getRootBuildFs(fsId)
+    const root = await getDataRepository().getRootBuildFs(ref)
     const currentFile = root.findFile(fileName)
     const previousIndex = await getDataRepository().getBuildFs(hash)
     const previousFile = previousIndex.index.files[fileName]
@@ -4716,10 +4728,10 @@ export async function loadSnapshot(location: string): Promise<Snapshot | undefin
     }
 
     const snapshotRepo = getRepository(fs, res.buildDir)
-    const programStore = snapshotRepo.getProgramStore(res.programId, res.workingDirectory)
+    const programStore = snapshotRepo.getProgramStore(res)
     const fullStore = await programStore.getPackageStore()
     const deployStore = res.deploymentId ? await snapshotRepo.getBuildFsIndex(res.deploymentId) : undefined
-    const programFs = getProgramFs(res.programId)
+    const programFs = getProgramFs(res)
     const deploymentFs = res.deploymentId ? getDeploymentFs(res.deploymentId) : undefined
     const [targets, moduleMappings, published, pointers, types] = await Promise.all([
         getTargets(programFs),
@@ -4752,7 +4764,10 @@ export async function tryLoadSnapshot(location: string) {
 }
 
 export async function createSnapshot(fsIndex: BuildFsIndex, programId: string, deploymentId?: string) {
-    const programFs = getProgramFs(programId)
+    const programFs = getProgramFs({
+        ...getBuildTargetOrThrow(),
+        programId,
+    })
     const deploymentFs = deploymentId ? getDeploymentFs(deploymentId) : undefined
     const published = deploymentFs ? await getPublished(deploymentFs) : undefined
     const moduleMappings = await getModuleMappings(programFs)
@@ -4826,7 +4841,7 @@ async function syncHeads(repo: DataRepository, remote: RemoteArtifactRepository,
 
 const shouldUseRemote = !!process.env['SYNAPSE_SHOULD_USE_REMOTE']
 
-export async function syncRemote(projectId: string, programId: string, deploymentId: string) {
+export async function syncRemote(projectId: string, deploymentId: string) {
     if (!shouldUseRemote) {
         return
     }
@@ -4867,10 +4882,9 @@ export async function createArtifactFs(
     fs: Fs & SyncFs,
     buildTarget: BuildTarget,
 ) {
-    const programId = buildTarget.programId
     const repo = getRepo(fs, buildTarget.buildDir)
 
-    const getCurrentProgramStore = memoize(() => repo.getProgramStore(programId, buildTarget.workingDirectory))
+    const getCurrentProgramStore = memoize(() => repo.getProgramStore(buildTarget))
     const getCurrentProcessStore = memoize(async () => {
         if (!buildTarget.deploymentId) {
             throw new Error(`No process exists for the current build target`)
@@ -4951,7 +4965,7 @@ export async function createArtifactFs(
     function getProgramFs2(programHash: string): Promise<BuildFsFragment>
     function getProgramFs2(programHash?: string) {
         if (!programHash) {
-            return getProgramFs(programId)
+            return getProgramFs(buildTarget)
         }
 
         return getBuildFs(programHash).then(r => r.root as BuildFsFragment)
@@ -4999,11 +5013,11 @@ export async function createArtifactFs(
 
 export const getArtifactFs = memoize(() => createArtifactFs(getFs(), getBuildTargetOrThrow()))
 
-export async function dumpFs(id = getBuildTargetOrThrow().programId, dest = path.resolve('.vfs-dump'), repo = getDataRepository()) {
+export async function dumpFs(id?: string, dest = path.resolve('.vfs-dump'), repo = getDataRepository()) {
     const opt: DumpFsOptions = { clean: true, prettyPrint: true, link: false, writeIndex: true }
 
     // It's _probably_ a hash
-    if (id.length === 64) {
+    if (id?.length === 64) {
         const vfs = await repo.getBuildFs(id)
         await dump(getDataRepository(), { id: vfs.hash, ...vfs.index }, dest, opt)
 
@@ -5013,11 +5027,11 @@ export async function dumpFs(id = getBuildTargetOrThrow().programId, dest = path
     function resolveId() {
         switch (id) {
             case 'program':
-                return getBuildTargetOrThrow().programId
+                return toProgramRef(getBuildTargetOrThrow())
             case 'deployment':
                 return getBuildTargetOrThrow().deploymentId!
             default:
-                return id
+                return id ?? toProgramRef(getBuildTargetOrThrow())
         }
     }
 
@@ -5037,8 +5051,8 @@ export async function getOverlayedFs(workingDirectory: string, index: BuildFsInd
     return toFs(workingDirectory, readOnlyFs, getFs())
 }
 
-export async function commitProgram(repo = getDataRepository(), programId = getBuildTargetOrThrow().programId) {
-    await runTask('commit', programId, () => repo.commitHead(programId), 1)
+export async function commitProgram(repo = getDataRepository(), bt = getBuildTargetOrThrow()) {
+    await runTask('commit', `program ${bt.programId}`, () => repo.commitHead(toProgramRef(bt)), 1)
 }
 
 export type ProcessStore = ReturnType<typeof getDeploymentStore>
@@ -5271,7 +5285,7 @@ export async function getPreviousDeploymentProgramHash() {
     const repo = getDataRepository(getFs())
     const deploymentId = getBuildTargetOrThrow().deploymentId
     if (!deploymentId) {
-        throw new Error(`No process id found`)
+        throw new Error(`No deployment id found`)
     }
 
     const h = await repo.getHead(deploymentId)
@@ -5304,8 +5318,8 @@ export async function getMoved(programHash?: string): Promise<{ from: string; to
     return template?.moved
 }
 
-export async function getProgramHash(programId = getBuildTargetOrThrow().programId, repo = getDataRepository()) {
-    const head = await repo.getHead(programId)
+export async function getProgramHash(bt = getBuildTargetOrThrow(), repo = getDataRepository()) {
+    const head = await repo.getHead(toProgramRef(bt))
 
     return head?.storeHash
 }

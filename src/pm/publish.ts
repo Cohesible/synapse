@@ -146,8 +146,16 @@ export async function publishToRemote(tarballPath?: string) {
 export async function linkPackage(opt?: PublishOptions & { globalInstall?: boolean; skipInstall?: boolean; useNewFormat?: boolean }) {
     const bt = getBuildTargetOrThrow()
 
+    function getPkg() {
+        if (opt?.packageDir) {
+            return getPackageJson(getProgramFs(), packageDir, false)
+        }
+
+        return getCurrentPkg()
+    }
+
     const packageDir = opt?.packageDir ?? getWorkingDir()
-    const pkg = await getPackageJson(getProgramFs(), packageDir, false)
+    const pkg = await getPkg()
     if (!pkg) {
         throw new Error(`No "package.json" found: ${packageDir}`)
     }
@@ -204,8 +212,12 @@ export async function linkPackage(opt?: PublishOptions & { globalInstall?: boole
     }
 
     switch (pkgName) {
+        case 'synapse-aws':
+            await replaceIntegration('aws')
+            break
         case 'synapse-local':
             await replaceIntegration('local')
+            break
     }
 
 
@@ -297,7 +309,7 @@ async function getOverridesFromProject() {
     const projectId = bt.projectId
     const packages = await listPackages(projectId)
     for (const [k, v] of Object.entries(packages)) {
-        const procId = await findDeployment(v, projectId, bt.environmentName)
+        const procId = await findDeployment(v, projectId, bt.environmentName, bt.branchName)
         res[k] = getLinkedPkgPath(k, procId)
     }
 
@@ -491,7 +503,7 @@ async function writeImportMap(packageDir: string, published?: Record<string, str
 
 export async function createMergedView(programId: string, deploymentId?: string, pruneInfra = true, preferProgram = false) {
     const builds = await Promise.all([
-        getProgramFsIndex(programId),
+        getProgramFsIndex({ ...getBuildTargetOrThrow(), programId }),
         deploymentId ? getDeploymentFsIndex(deploymentId) : undefined
     ])
 

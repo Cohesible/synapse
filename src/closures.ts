@@ -8,7 +8,7 @@ import { BuildFsFragment, toFs } from './artifacts'
 import { DeploymentContext } from './deploy/server'
 import {  coerceToPointer, extractPointers, isDataPointer, pointerPrefix } from './build-fs/pointers'
 import { getBuildTargetOrThrow, getFs } from './execution'
-import { BuildTarget } from './workspaces'
+import { BuildTarget, toProgramRef } from './workspaces'
 import { loadBuildState } from './deploy/session'
 import { Mutable, getHash, makeExecutable, memoize } from './utils'
 import { optimizeSerializedData } from './optimizer'
@@ -311,7 +311,7 @@ export async function bundleExecutable(
     ].join('\n')
 
     // XXX: pretty hacky
-    const emitFs = await repo.getRootBuildFs(`${bt.programId}-emit`)
+    const emitFs = await repo.getRootBuildFs(`${toProgramRef(bt)}-emit`)
     const optimizer = opt?.useOptimizer ? createOptimizer({
         readDataSync: repo.readDataSync,
         writeDataSync: (data) => emitFs.root.writeDataSync(data),
@@ -348,7 +348,7 @@ export async function bundlePkg(
     const transpiler = createTranspiler(mountedFs, resolver, {})
 
     // XXX: pretty hacky
-    const emitFs = await repo.getRootBuildFs(`${bt.programId}-emit`)
+    const emitFs = await repo.getRootBuildFs(`${toProgramRef(bt)}-emit`)
     const serializerHost = createSerializerHost(emitFs.root)
     const sourceFileName = path.resolve(workingDirectory, target)
     const res = await transpiler.transpile(

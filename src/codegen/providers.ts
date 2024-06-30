@@ -714,8 +714,6 @@ export function getProviderSource(name: string, providerRegistryHostname?: strin
             return 'registry.terraform.io/integrations/github'
         case 'fly':
             return 'registry.terraform.io/fly-apps/fly'
-        case 'kubernetes':
-            return 'registry.terraform.io/hashicorp/kubernetes'
 
         // Built-ins
         case 'synapse':

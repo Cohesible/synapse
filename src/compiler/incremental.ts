@@ -1,6 +1,6 @@
 import ts from 'typescript'
 import * as path from 'node:path'
-import { createFileHasher, keyedMemoize, memoize, throwIfNotFileNotFoundError } from '../utils'
+import { createFileHasher, isWindows, keyedMemoize, memoize, throwIfNotFileNotFoundError } from '../utils'
 import { Fs } from '../system'
 import { getGlobalCacheDirectory } from '../workspaces'
 import { getFs } from '../execution'
@@ -255,6 +255,10 @@ export function createIncrementalHost(opt: ts.CompilerOptions) {
             saveCache({ ...cache, ...updatedCache }),
             fileChecker.flush(),
         ])
+
+        if (isWindows()) {
+            return new Set([...changed].map(f => f.replaceAll('\\', '/')))
+        }
 
         return changed
     }

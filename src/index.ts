@@ -5,7 +5,7 @@ import { FailedTestEvent, TestEvent, runTask } from './logging'
 import { BoundTerraformSession, DeployOptions, SessionContext, SessionError, createStatePersister, createZipFromDir, getChangeType, getDiff, getTerraformPath, isTriggeredReplaced, parsePlan, startStatelessTerraformSession, startTerraformSession } from './deploy/deployment'
 import { LocalWorkspace, getV8CacheDirectory, initProject, getLinkedPackagesDirectory, Program, getRootDirectory, getDeploymentBuildDirectory, getTargetDeploymentIdOrThrow, getOrCreateDeployment, getWorkingDir } from './workspaces'
 import { createLocalFs } from './system'
-import { AmbientDeclarationFileResult, Mutable, acquireFsLock, createHasher, createRwMutex, getCiType, isNonNullable, isWindows, keyedMemoize, makeExecutable, memoize, printNodes, replaceWithTilde, showArtifact, throwIfNotFileNotFoundError, toAmbientDeclarationFile, wrapWithProxy } from './utils'
+import { AmbientDeclarationFileResult, Mutable, acquireFsLock, createHasher, createRwMutex, getCiType, isNonNullable, isWindows, keyedMemoize, makeExecutable, memoize, printNodes, replaceWithTilde, resolveRelative, showArtifact, throwIfNotFileNotFoundError, toAmbientDeclarationFile, wrapWithProxy } from './utils'
 import { SymbolGraph, SymbolNode, createMergedGraph, createSymbolGraph, createSymbolGraphFromTemplate, detectRefactors, normalizeConfigs, renderSymbol, renderSymbolLocation } from './refactoring'
 import { SourceMapHost } from './static-solver/utils'
 import { getLogger } from './logging'
@@ -108,7 +108,7 @@ export async function syncModule(deploymentId: string, bt = getBuildTargetOrThro
     const projectId = await workspaces.getRemoteProjectId(bt.projectId)
     if (projectId) {
         getLogger().log('Using remote project id', projectId)
-        await syncRemote(projectId, bt.programId, deploymentId)
+        await syncRemote(projectId, deploymentId)
     }
 }
 
@@ -312,10 +312,12 @@ export async function deploy(targets: string[], opt?: DeployOpt2) {
             // TODO: also we should limit the staleness check to the subgraph(s) specified by `targets`
             const { stale } = await getStaleDeployableSources(targets.length > 0 ? targets : undefined) ?? {}
             if (!stale || stale.size > 0) {
+                getLogger().log('Found stale sources, recompiling')
                 await doCompile()
             } else if (opt?.deployTarget) {
                 const prev = await getPreviousPkg()
                 if (prev?.synapse?.config?.target !== opt.deployTarget) {
+                    getLogger().log(`Target has changed, recompiling: ${prev?.synapse?.config?.target} [previous] !== ${opt.deployTarget} [current]`)
                     await doCompile()
                 }
             }
@@ -1709,7 +1711,7 @@ export async function emitBlocks(dest: string) {
     const destDir = path.resolve(getWorkingDir(), dest)
     const deploymentId = bt.deploymentId
     const ids = {
-        program: await emitBlock(bt.programId, destDir),
+        program: await emitBlock(workspaces.toProgramRef(bt), destDir),
         process: deploymentId ? await emitBlock(deploymentId, destDir) : undefined,
     }
 
@@ -2143,7 +2145,7 @@ export async function clearCache(targetKey?: string, opt?: CombinedOptions) {
 export async function listCommitsCmd(mod: string, opt?: CombinedOptions & { useProgram?: boolean }) {
     const timestampWidth = new Date().toISOString().length
     const hashWidth = 12
-    const commits = await listCommits(opt?.useProgram ? getBuildTargetOrThrow().programId : undefined)
+    const commits = await listCommits(opt?.useProgram ? workspaces.toProgramRef(getBuildTargetOrThrow()) : undefined)
     if (commits.length === 0) {
         printLine(colorize('brightRed', 'No commits found'))
         return
@@ -2398,16 +2400,14 @@ function normalizeToRelative(fileName: string, workingDir = getWorkingDir()) {
 }
 
 export async function replCommand(target?: string, opt?: {}) {
-    target = target ? normalizeToRelative(target) : target
-    await compileIfNeeded(target)
-
     const repl = await runTask('', 'repl', async () => {
-        if (!target) {      
-            const moduleLoader = await getModuleLoader(false)
-        
-            return enterRepl(undefined, moduleLoader, {})
+        if (!target) {              
+            return enterRepl(undefined, { loadModule: (id) => import(id) }, {})
         }
     
+        target = normalizeToRelative(target)
+        await compileIfNeeded(target)
+
         const files = await getEntrypointsFile()
         const typesFile = await getTypesFile()
         const deployables = files?.deployables ?? {}
@@ -2471,7 +2471,7 @@ async function getStaleSources(include?: Set<string>) {
     const workingDir = getWorkingDir()
 
     async function checkSource(k: string, v: { hash: string }) {
-        const source = path.resolve(workingDir, k)
+        const source = resolveRelative(workingDir, k)
         if (include && !include.has(source)) return
 
         const hash = await hasher.getHash(source).catch(e => {
@@ -2509,6 +2509,7 @@ async function getStaleDeployableSources(targets?: string[]) {
 }
 
 export async function showStatus(opt?: { verbose?: boolean }) {
+    // Current env, target?
     // Packages (installation)
     // Compile (pending moves)
     // Deploy 
@@ -2547,7 +2548,7 @@ export async function showStatus(opt?: { verbose?: boolean }) {
         } else {
             printLine(colorize('green', 'Compiled'))
         }
-    }
+    } 
 
     const info = await getPreviousDeployInfo()
     if (!info?.deploySources || !info.state || info.state.resources.length === 0) {
@@ -2628,7 +2629,7 @@ export async function diffFileCmd(fileName: string, opt?: { commitsBack?: number
 
 // This is safe because deployments always reference fs hashes not head IDs
 export async function clean(opt?: any) {
-    await getDataRepository().deleteHead(getBuildTargetOrThrow().programId)
+    await getDataRepository().deleteHead(workspaces.toProgramRef(getBuildTargetOrThrow()))
 }
 
 export async function lockedInstall() {
@@ -2681,6 +2682,8 @@ interface BuildExecutableOpt {
 }
 
 export async function buildExecutables(targets: string[], opt: BuildExecutableOpt) {
+    await compileIfNeeded(targets[0])
+
     const bt = getBuildTargetOrThrow()
     const pkg = await getCurrentPkg()
     if (!pkg) {
@@ -2742,7 +2745,7 @@ export async function buildExecutables(targets: string[], opt: BuildExecutableOp
         const outfile = !config?.outDir ? path.resolve(bt.workingDirectory, 'out', v) : undefined
 
         const res = await bundleExecutable(bt, resolved, outfile, undefined, bundleOpt)
-        const dest = path.resolve(bt.workingDirectory, outDir, 'bin', k)
+        const dest = path.resolve(bt.workingDirectory, outDir, 'bin', isWindows() ? `${k}.exe` : k)
 
         if (opt.sea) {
             try {
@@ -2891,6 +2894,14 @@ export async function internalBundle(target?: string, opt: any = {}) {
             'dist/src/cli/install.js',
             path.resolve(outdir, 'dist', 'install.js')
         )
+
+        // Used for uninstalling
+        if (resolved.os === 'windows') {
+            await getFs().writeFile(
+                path.resolve(outdir, 'dist', 'install.ps1'),
+                await getFs().readFile(path.resolve(getWorkingDir(), 'src', 'cli', 'install.ps1'))
+            )
+        }
     }
 
     await bundleInstallScript()

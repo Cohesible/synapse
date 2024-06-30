@@ -4,6 +4,7 @@
 import * as http from 'node:https'
 import * as zlib from 'node:zlib'
 import * as crypto from 'node:crypto'
+import * as stream from 'node:stream'
 import { addBrowserImplementation } from 'synapse:core'
 
 type TypedArray =
@@ -31,6 +32,11 @@ export type PathArgs<T extends string> = T extends `${infer P}{${infer U}}${infe
     ? [...PathArgs<P>, string, ...PathArgs<S>] 
     : []
 
+export type PathArgsWithBody<T extends string, U> = [
+    ...PathArgs<T>, 
+    ...(U extends undefined ? [body?: U] : unknown extends U ? [body?: any] : [body: U])
+]
+
 export interface HttpRequest<T extends string = string> {
     readonly path: string
     readonly method: SplitRoute<T>[0]
@@ -41,6 +47,18 @@ export interface HttpRequest<T extends string = string> {
     readonly pathParameters: CapturedPattern<SplitRoute<T>[1]>
 }
 
+export interface TypedRequest<T extends string = string> extends Request {
+    readonly method: SplitRoute<T>[0]
+    readonly pathParameters: CapturedPattern<SplitRoute<T>[1]>
+    readonly body: (Request['body'] & AsyncIterable<Uint8Array>) | null
+    readonly context?: any
+}
+
+export type RequestHandler<T extends string = string, R = unknown> = 
+    (request: TypedRequest<T>) => Promise<HandlerResponse<R>> | HandlerResponse<R>
+
+export type RequestHandlerWithBody<T extends string = string, U = any, R = unknown> = 
+    (request: TypedRequest<T>, body: U) => Promise<HandlerResponse<R>> | HandlerResponse<R>
 
 // type FormDataValue = string | Blob | File
 // type TypedFormData<T extends Record<string, FormDataValue | FormDataValue[]>> = FormData & {
@@ -306,6 +324,13 @@ function resolveBody(body: any) {
             return {
                 body,
                 contentEncoding,
+            }
+        }
+
+        if (body instanceof ReadableStream) {
+            return {
+                contentType: 'application/octet-stream',
+                body,
             }
         }
 
@@ -607,12 +632,31 @@ async function doRequestBrowser(request: http.RequestOptions | URL, body?: any) 
 
 addBrowserImplementation(doRequest, doRequestBrowser)
 
+const agents = new Map<typeof import('node:https'), http.Agent>()
+function getAgent(http: typeof import('node:https')) {
+    const existing = agents.get(http)
+    if (existing) {
+        return existing
+    }
+
+    const agent = new http.Agent({ 
+        keepAlive: true,
+    })
+    agents.set(http, agent)
+
+    return agent
+}
+
 function doRequest(request: http.RequestOptions | URL, body?: any) {
     // We create an error here to preserve the trace
     const err = new Error()
 
     return new Promise<any>((resolve, reject) => {
         const http: typeof import('node:https') = request.protocol === 'http:' ? require('node:http') : require('node:https')
+
+        if (!(request instanceof URL) && !request.agent) {
+            request.agent = getAgent(http)
+        }
 
         const req = http.request(request, res => {
             const contentType = res.headers['content-type'] ? parseContentType(res.headers['content-type']) : undefined
@@ -624,18 +668,11 @@ function doRequest(request: http.RequestOptions | URL, body?: any) {
                 if (val instanceof Error) {
                     reject(val)
                 } else {
-                    if (code === 204 && val === undefined) {
+                    if (code === 204 && !val) {
                         resolve(undefined)
+                    } else {
+                        resolve(val)
                     }
-
-                    const r = val || {}
-                    if (typeof r === 'object') {
-                        Object.defineProperty(r, '$headers', {
-                            value: res.headers,
-                            enumerable: false
-                        })
-                    }
-                    resolve(r)
                 }
 
                 res.destroy()
@@ -677,8 +714,14 @@ function doRequest(request: http.RequestOptions | URL, body?: any) {
                 }
             })
         })
+
         req.on('error', reject)
-        req.end(body)
+
+        if (body instanceof ReadableStream) {
+            stream.Readable.fromWeb(body as any).pipe(req)
+        } else {
+            req.end(body)
+        }
     })
 }
 

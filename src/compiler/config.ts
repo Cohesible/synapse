@@ -31,6 +31,8 @@ interface ParsedConfig {
 // "verbatimModuleSyntax": true,
 // "noEmit": true,
 
+// TODO: code 18003 is when no input files were found
+
 function getDefaultTsConfig(targetFiles: string[]) {
     return {
         include: targetFiles,

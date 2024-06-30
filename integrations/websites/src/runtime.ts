@@ -13,6 +13,13 @@ type JSXElementConstructor<P> = (props?: P) => JSXNode<P>
 
 interface Component {
     render(): JSXElement
+
+    // setState<K extends keyof S>(
+    //     state: ((prevState: Readonly<S>, props: Readonly<P>) => Pick<S, K> | S | null) | (Pick<S, K> | S | null),
+    //     callback?: () => void,
+    // ): void;
+    // state: Readonly<S>;
+    // readonly props: Readonly<P>;
 }
 
 type FunctionComponent<P = any> = (props: P) => JSXNode<P>
@@ -49,7 +56,7 @@ interface MountOptions {
 
 // TODO: combine 'render' functions into one
 // we should decide what to do based off the return value
-type MountFn<T = JSXNode> = (container: Element | Document, children: T, opt: MountOptions) => MountedNode
+type MountFn<T = JSXNode> = (container: Element | Document, children: T, opt: MountOptions) => MountedNode | void
 type RenderSyncFn<T = JSXNode> = (node: T) => string
 type RenderStreamFn<T = JSXNode> = (node: T, opt?: { bootstrapScripts?: string[]} ) => Promise<ReadableStream>
 

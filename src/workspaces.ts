@@ -3,15 +3,17 @@ import * as path from 'node:path'
 import * as fs from 'node:fs/promises'
 import { Fs, SyncFs } from './system'
 import { DeployOptions } from './deploy/deployment'
-import { Remote, findRepositoryDir, getCurrentBranch, getCurrentBranchSync, listRemotes } from './git'
+import { Remote, findRepositoryDir, getCurrentBranch, getCurrentBranchSync, getDefaultBranch, listRemotes } from './git'
 import { getLogger } from './logging'
-import { getHash, keyedMemoize, memoize, throwIfNotFileNotFoundError, tryReadJson, tryReadJsonSync } from './utils'
+import { getCiType, getHash, keyedMemoize, makeRelative, memoize, throwIfNotFileNotFoundError, tryReadJson, tryReadJsonSync } from './utils'
 import { glob } from './utils/glob'
 import { getBuildTarget, getBuildTargetOrThrow, getFs, isInContext } from './execution'
 import * as projects from '@cohesible/resources/projects'
 import * as registry from '@cohesible/resources/registry'
 import { getPackageJson } from './pm/packageJson'
 import { randomUUID } from 'node:crypto'
+
+// TODO: investigate using a relational db here like sqlite 
 
 // Workspaces are state + source code!!!
 // A workspace is directly tied to a source control repo
@@ -213,45 +215,101 @@ async function findProject(cwd: string) {
     }
 }
 
-// TODO: we should hash all program IDs to make them safe to use as filenames and store metadata somewhere else
 function getProgramIdNoPkg(workingDirectory: string, rootDir: string) {
-    const base = path.relative(rootDir, workingDirectory)
+    const base = makeRelative(rootDir, workingDirectory)
     if (!base) {
-        return 'dir___root'
+        return '__dir__root__'
     }
 
-    return `dir__${base.replaceAll(path.sep, '_')}`
+    return `__dir__${base}`
 }
 
-async function findProgram(cwd: string, rootDir: string, projectId: string) {
-    const relPath = path.relative(rootDir, cwd)
+interface FindProgramResult {
+    programName: string,
+    workingDirectory: string
+    branchName?: string
+    existing?: projects.ProgramInfo
+}
+
+async function findProgram(cwd: string, rootDir: string, projectId: string): Promise<FindProgramResult> {
+    const relPath = makeRelative(rootDir, cwd)
     if (relPath.startsWith('..')) {
         throw new Error(`Current directory "${cwd}" is not inside project directory: ${rootDir}`)
     }
 
     const pkg = await getPackageJson(getFs(), cwd, false)
     const workingDirectory = pkg?.directory ?? cwd
-    const name = pkg?.data.name ?? getProgramIdNoPkg(workingDirectory, rootDir)
-    const branch = await getCurrentBranchCached(rootDir)
-    const programId = branch ? `${branch}_${name}` : name
+    const programName = pkg?.data.name ?? getProgramIdNoPkg(workingDirectory, rootDir)
+    const branchName = await getCurrentBranchCached(rootDir)
     const relativeWorkingDir = cwd === rootDir ? undefined : relPath
 
     const state = await getProjectState(projectId)
-    if (state) {
-        const existing = state.programs[programId]
-        if (!existing) {
-            getLogger().debug(`Initialized program "${programId}"`)
-            state.programs[programId] = { workingDirectory: relativeWorkingDir }
-            await setProjectState(state)
-        } else if (existing.workingDirectory !== relativeWorkingDir) {
-            throw new Error(`Conflicting programs "${programId}": existing workingDir ${existing.workingDirectory ?? '<root>'} !== ${relativeWorkingDir ?? '<root>'}`)
+    const base = {
+        programName,
+        workingDirectory,
+        branchName,
+    }
+
+    if (!state) {
+        return base
+    }
+
+    const defaultBranch = await getDefaultBranchCached(projectId)
+    if (branchName !== defaultBranch) {
+        (state.branches as any) ??= {}
+    }
+
+    const programs = branchName && branchName !== defaultBranch 
+        ? state.branches![branchName]?.programs
+        : state.programs
+
+    const existing = programs?.[programName]
+    
+    // XXX: temporary backwards compat
+    if (existing && process.platform === 'win32' && existing.workingDirectory) {
+        existing.workingDirectory = existing.workingDirectory.replaceAll('\\', '/')
+    }
+
+    if (existing && existing.workingDirectory !== relativeWorkingDir) {
+        throw new Error(`Conflicting programs "${programName}": existing workingDir ${existing.workingDirectory ?? '<root>'} !== ${relativeWorkingDir ?? '<root>'}`)
+    }
+
+    if (!existing) {
+        if (branchName && branchName !== defaultBranch) {
+            getLogger().debug(`Initialized program "${programName}@${branchName}"`)
+            const branch = state.branches![branchName] ??= { apps: {}, programs: {} }
+            branch.programs[programName] = { workingDirectory: relativeWorkingDir }
+        } else {
+            getLogger().debug(`Initialized program "${programName}"`)
+            state.programs[programName] = { workingDirectory: relativeWorkingDir }
         }
+
+        await setProjectState(state)
     }
 
     return {
-        programId,
+        programName,
         workingDirectory,
+        branchName,
+        existing,
     }
+}
+
+// [<projectId>+:+]<programId>[@<branchName>]
+function parseProgramRef(ref: string): { id: string; branchName?: string; projectId?: string } {
+    const [projectId, rem] = ref.match(/^([^:\s]+)\+:\+([^\s]+)$/) ?? []
+    const [id, branchName] = (rem ?? ref).match(/^([^@\s]+)(?:@([^@\s]+))$/) ?? []
+    if (!id) {
+        throw new Error(`Failed to parse program ref: ${ref}`)
+    }
+
+    return { id, branchName, projectId }
+}
+
+export function toProgramRef(bt: Pick<BuildTarget, 'programId' | 'projectId' | 'branchName'>) {
+    const base = bt.branchName ? `${bt.programId}@${bt.branchName}` : bt.programId
+
+    return bt.projectId ? `${bt.projectId}+:+${base}` : base
 }
 
 // TODO: this should only match if the target source file is included by the config
@@ -272,16 +330,10 @@ async function tryFindTsConfig(dir: string, recurse = false) {
 }
 
 async function initProjectlessProgram(id: string, workingDirectory: string) {
-    const state = (await getProjectState('global')) ?? {
-        id: 'global',
-        apps: {},
-        programs: {},
-        packages: {},
-    }
-
+    const state = await getOrCreateProjectState('global')
     if (state && !state.programs[id]) {
         getLogger().debug(`Initialized program "${id}"`)
-        state.programs[id] = { workingDirectory,}
+        state.programs[id] = { workingDirectory }
         await setProjectState(state)
     }
 
@@ -336,18 +388,19 @@ async function findProjectlessProgram(cwd: string, target?: string) {
     return initProjectlessProgram(programId, pkg.directory)
 }
 
-export async function findDeployment(programId: string, projectId: string, environmentName?: string): Promise<string | undefined> {
-    const state = await getProjectState(projectId)
-    if (!state) {
+export async function findDeployment(programId: string, projectId: string, environmentName?: string, branchName?: string): Promise<string | undefined> {
+    const totalState = await getBranchAwareState(projectId, branchName)
+    if (!totalState) {
         throw new Error(`No project state found: ${projectId}`)
     }
 
-    const program = state.programs[programId]
+    const branchState = totalState.branch ?? totalState.state
+    const program = branchState.programs[programId]
     if (!program?.appId) {
         return !environmentName ? program?.processId : undefined
     }
 
-    const app = state.apps[program.appId]
+    const app = branchState.apps[program.appId]
     if (!app) {
         throw new Error(`Missing application: ${program.appId}`)
     }
@@ -359,6 +412,38 @@ export async function findDeployment(programId: string, projectId: string, envir
     }
 
     return (environment as any).process ?? environment.deploymentId
+}
+
+function findAppByDeployment(branch: Branch, deploymentId: string) {
+    for (const [k, v] of Object.entries(branch.apps)) {
+        for (const env of Object.values(v.environments)) {
+            if (env.deploymentId === deploymentId || (env as any).process === deploymentId) {
+                return k
+            }
+        }
+    }
+}
+
+async function repairPrograms(projId: string) {
+    const ents = await getEntities()
+    const state = await getProjectState(projId)
+    if (!state) {
+        return
+    }
+
+    const defaultBranch = await getDefaultBranchCached(projId)
+    for (const [k, v] of Object.entries(ents.deployments)) {
+        if (v.projectId !== projId) continue
+
+        if (!v.branchName || v.branchName === defaultBranch) {
+            const prog = state.programs[v.programId]
+            if (prog && !prog.appId) {
+                prog.appId = findAppByDeployment(state, k)
+            }
+        }
+    }
+
+    await setProjectState(state)
 }
 
 // TODO: add flag to disable auto-init
@@ -373,12 +458,13 @@ export async function resolveProgramBuildTarget(cwd: string, opt?: BuildTargetOp
 
         return {
             projectId,
-            programId: prog.programId,
+            programId: prog.programName,
             deploymentId: opt.deployment,
             rootDirectory,
             workingDirectory: prog.workingDirectory,
             buildDir: path.resolve(rootDirectory, synDirName, 'build'),
             environmentName: opt?.environmentName,
+            branchName: prog.branchName,
         }
     }
 
@@ -406,16 +492,17 @@ export async function resolveProgramBuildTarget(cwd: string, opt?: BuildTargetOp
     }
 
     const prog = await findProgram(targetDir, proj.rootDir, proj.id)
-    const deployment = await findDeployment(prog.programId, proj.id, opt?.environmentName)
+    const deployment = await findDeployment(prog.programName, proj.id, opt?.environmentName, prog.branchName)
 
     return {
         projectId: proj.id,
-        programId: prog.programId,
+        programId: prog.programName,
         deploymentId: deployment,
         rootDirectory: proj.rootDir,
         workingDirectory: prog.workingDirectory,
         buildDir: path.resolve(getUserSynapseDirectory(), 'build'),
         environmentName: opt?.environmentName,
+        branchName: prog.branchName,
     }
 }
 
@@ -427,6 +514,7 @@ export interface BuildTarget {
     readonly projectId: string | 'global'
     readonly programId: string // This is unique per-branch
     readonly deploymentId?: string
+    readonly branchName?: string
     readonly environmentName?: string
     readonly rootDirectory: string // `rootDirectory` === `workingDirectory` when using a global project
     readonly workingDirectory: string
@@ -454,8 +542,8 @@ async function _createProject(name: string, params: { url: string }): ReturnType
     return getProjectsClient().createProject(name, params)
 }
 
-async function getOrCreateApp(state: ProjectState, bt: BuildTarget) {
-    const program = state.programs[bt.programId] ?? {}
+async function getOrCreateApp(state: Branch, bt: BuildTarget) {
+    const program = state.programs[bt.programId] ??= {}
     if (program.appId) {
         const app = state.apps[program.appId]
         if (!app) {
@@ -472,21 +560,152 @@ async function getOrCreateApp(state: ProjectState, bt: BuildTarget) {
     return app
 }
 
-const getProjectsClient = memoize(() => projects.createClient())
+const getProjectsClient = memoize(() => {
+    if (!shouldCreateRemoteProject) {
+        return projects.createClient({ authorization: () => 'none' })
+    }
+    return projects.createClient()
+})
 
-async function updateProjectState(state: ProjectState) {
+const defaultBranchName = 'main'
+
+async function getDefaultBranchCached(projectId: string) {
+    if (projectId === 'global') {
+        return defaultBranchName
+    }
+
+    const ents = await getEntities()
+    const proj = ents.projects[projectId]
+    if (!proj) {
+        throw new Error(`Missing project: ${projectId}`)
+    }
+
+    if (proj.defaultBranch) {
+        return proj.defaultBranch
+    }
+
+    if (!proj.url) {
+        const gitRepo = await findRepositoryDir(proj.directory)
+        if (gitRepo) {
+            const remotes = await listRemotes(gitRepo)
+            proj.url = remotes[0]?.fetchUrl
+        }
+    }
+
+    if (!proj.url) {
+        return defaultBranchName
+    }
+
+    const defaultBranch = await getDefaultBranch(proj.url)
+    proj.defaultBranch = defaultBranch
+    await setEntities(ents)
+
+    return defaultBranch
+}
+
+async function migratePrograms(state: ProjectState) {
+    if (state.branches) {
+        return state
+    }
+
+    const branches = new Map<string, Branch>()
+    function addProgram(name: string, info: projects.ProgramInfo, branchName: string, isLegacy?: boolean) {
+        const branch = branches.get(branchName) ?? {
+            apps: {},
+            programs: {},
+        }
+        branches.set(branchName, branch)
+        if (info.appId) {
+            branch.apps[info.appId] = state.apps[info.appId]
+        }
+        branch.programs[name] = isLegacy ? { ...info, isLegacy } as any : info
+    }
+
+    function getOldProgramIdNoPkg(workingDirectory: string, rootDir: string) {
+        const base = path.relative(rootDir, workingDirectory)
+        if (!base) {
+            return 'dir___root'
+        }
+    
+        return `dir__${base}`
+    }
+
+    const rootDir = state.id !== 'global' ? await getProjectDirectory(state.id) : '/'
+    const defaultBranch = await getDefaultBranchCached(state.id)
+    for (const [k, v] of Object.entries(state.programs)) {
+        const workingDir = v.workingDirectory ? path.resolve(rootDir, v.workingDirectory) : rootDir
+
+        if (!(await getFs().fileExists(workingDir))) {
+            getLogger().log(`Program "${k}" no longer exists`, workingDir)
+            continue
+        }
+
+        const pkg = await getPackageJson(getFs(), workingDir, false)
+
+        const newId = pkg?.data.name || getProgramIdNoPkg(workingDir, rootDir)
+        if (k === newId) {
+            addProgram(k, v, defaultBranch)
+            continue
+        }
+
+        const oldId = pkg?.data.name || getOldProgramIdNoPkg(workingDir, rootDir)
+        const cleaned = k.replace(oldId, '')
+        if (!cleaned.endsWith('_')) {
+            addProgram(k, v, defaultBranch, true)
+            addProgram(newId, v, defaultBranch)
+            continue
+        }
+
+        const branchName = cleaned.slice(0, -1)
+        addProgram(k, v, branchName, true)
+        addProgram(newId, v, branchName)
+    }
+
+    const defaultData = branches.get(defaultBranch)
+    if (defaultData) {
+        Object.assign(state, defaultData)
+        branches.delete(defaultBranch)
+    }
+
+    if (!state.branches) {
+        Object.assign(state, { branches: {} })
+    }
+
+    for (const [k, v] of branches) {
+        state.branches![k] = v
+    }
+
+    await updateProjectState(state, [...branches.keys()])
+
+    return state
+}
+
+async function updateProjectState(state: ProjectState, updatedBranches: string[] = []) {
     await setProjectState(state)
 
-    if (shouldUseRemote) {
-        const ents = await getEntities()
-        const remote = ents.projects[state.id]?.remote
-        if (remote) {
-            await getProjectsClient().updateProject(remote, {
-                apps: state.apps,
-                packages: state.packages,
-                programs: state.programs,
-                importedPackages: state.importedPackages,
-            })
+    if (!shouldUseRemote) {
+        return
+    }
+
+    const ents = await getEntities()
+    const remote = ents.projects[state.id]?.remote
+    if (remote) {
+        await getProjectsClient().updateProject(remote, {
+            apps: state.apps,
+            packages: state.packages,
+            programs: state.programs,
+            importedPackages: state.importedPackages,
+        })
+
+        for (const b of updatedBranches) {
+            const branch = state.branches?.[b]
+            if (branch) {
+                await getProjectsClient().putBranch({
+                    name: b,
+                    projectId: remote,
+                    ...branch,
+                })
+            }
         }
     }
 }
@@ -496,22 +715,23 @@ export async function getOrCreateDeployment(bt: BuildTarget = getBuildTargetOrTh
         return bt.deploymentId
     }
 
-    const state = await getProjectState(bt.projectId)
-    if (!state) {
-        throw new Error(`Missing project state: ${bt.projectId} [${bt.rootDirectory}]`)
+    const totalState = await getBranchAwareState(bt.projectId, bt.branchName)
+    if (!totalState) {
+        throw new Error(`Missing project state: ${bt.projectId} [${bt.rootDirectory}${bt.branchName ? `@${bt.branchName}` : ''}]`)
     }
 
-    const program = state.programs[bt.programId] ?? {}
-    if (program?.processId && !bt.environmentName) {
+    const branchState = totalState.branch ?? totalState.state
+    const program = branchState.programs[bt.programId] ??= {}
+    if (program.processId && !bt.environmentName) {
         return program.processId
     }
 
-    const app = await getOrCreateApp(state, bt)
+    const app = await getOrCreateApp(branchState, bt)
 
     const environmentName = bt.environmentName ?? app.defaultEnvironment ?? 'local'
     const environment = app.environments[environmentName]
     if (environment) {
-        return (environment as any).process ?? environment.deploymentId
+        return (environment as any).process as string ?? environment.deploymentId
     }
 
     const deployment = await createDeployment()
@@ -520,12 +740,13 @@ export async function getOrCreateDeployment(bt: BuildTarget = getBuildTargetOrTh
         deploymentId: deployment.id,
     }
 
-    await updateProjectState(state)
+    await updateProjectState(totalState.state, bt.branchName ? [bt.branchName] : undefined)
 
     const ents = await getEntities()
     ents.deployments[deployment.id] = {
         programId: bt.programId,
         projectId: bt.projectId,
+        branchName: bt.branchName,
         local: deployment.local,
     }
 
@@ -534,11 +755,19 @@ export async function getOrCreateDeployment(bt: BuildTarget = getBuildTargetOrTh
     return deployment.id
 }
 
+interface LocalProject {
+    readonly directory: string
+    remote?: string
+    url?: string
+    defaultBranch?: string
+}
+
 interface EntitiesFile {
-    readonly projects: Record<string, { readonly directory: string; remote?: string }>
+    readonly projects: Record<string, LocalProject>
     readonly deployments: Record<string, {
-        programId: string
+        programId: string // program name
         projectId: string
+        branchName?: string
         local?: boolean
     }>
 }
@@ -593,8 +822,25 @@ function migrateState(state: ProjectState): ProjectState {
     return state
 }
 
+async function migrateState2(state: ProjectState): Promise<ProjectState> {
+    state = migrateState(state)
+    await migratePrograms(state)
+
+    return state
+}
+
 async function getProjectState(projectId: string, fs = getFs()): Promise<ProjectState | undefined> {
-    return tryReadJson<ProjectState>(fs, getStateFilePath(projectId)).then(s => s ? migrateState(s) : undefined)
+    return tryReadJson<ProjectState>(fs, getStateFilePath(projectId)).then(s => s ? migrateState2(s) : undefined)
+}
+
+async function getOrCreateProjectState(projectId: string): Promise<ProjectState> {
+    return await getProjectState(projectId) ?? {
+        id: projectId,
+        apps: {},
+        programs: {},
+        packages: {},
+        branches: {},
+    }
 }
 
 async function setProjectState(newState: ProjectState, fs = getFs()) {
@@ -610,18 +856,27 @@ function getProjectStateSync(projectId: string, fs: SyncFs = getFs()) {
     return migrateState(state)
 }
 
-function findProgramByProcess(state: ProjectState, processId: string) {
-    for (const [k, v] of Object.entries(state.programs)) {
-        if (v.processId === processId) {
-            return k
-        }
+function findProgramByDeployment(state: ProjectState, deploymentId: string, branchName?: string) {
+    const branchState = branchName ? state.branches?.[branchName] : undefined
+    if (branchState) {
+        return worker(branchState) ?? worker(state)
+    }
 
-        if (v.appId) {
-            const app = state.apps[v.appId]
-            if (!app) continue
+    return worker(state)
 
-            if (Object.values(app.environments).some(x => ((x as any).process ?? x.deploymentId) === processId)) {
+    function worker(branch: Branch) {
+        for (const [k, v] of Object.entries(branch.programs)) {
+            if (v.processId === deploymentId) {
                 return k
+            }
+    
+            if (v.appId) {
+                const app = branch.apps[v.appId]
+                if (!app) continue
+    
+                if (Object.values(app.environments).some(x => ((x as any).process ?? x.deploymentId) === deploymentId)) {
+                    return k
+                }
             }
         }
     }
@@ -635,7 +890,7 @@ function findDeploymentById(deploymentId: string) {
     }
 
     const state = getProjectStateSync(deployment.projectId)
-    const programId = findProgramByProcess(state, deploymentId)
+    const programId = findProgramByDeployment(state, deploymentId, deployment.branchName)
     if (!programId) {
         return
     }
@@ -643,16 +898,21 @@ function findDeploymentById(deploymentId: string) {
     return { 
         directory: ents.projects[deployment.projectId]?.directory,
         programId,
+        projectId: deployment.projectId,
+        branchName: deployment.branchName,
     }
 }
 
-export function getProgramIdFromDeployment(deploymentId: string) {
+export function getProgramInfoFromDeployment(deploymentId: string) {
     const res = findDeploymentById(deploymentId)
     if (!res) {
         throw new Error(`No deployment found: ${deploymentId}`)
     }
 
-    return res.programId
+    return {
+        programId: res.programId,
+        branchName: res.branchName,
+    }
 }
 
 export function getRootDir(programId?: string) {
@@ -663,14 +923,15 @@ export function getRootDir(programId?: string) {
     return getRootDirectory()
 }
 
-export function getWorkingDir(programId?: string, projectId?: string) {
+export function getWorkingDir(programId?: string, projectId?: string, branchName?: string) {
     if (!programId) {
         return getBuildTarget()?.workingDirectory ?? process.cwd()
     }
 
     projectId ??= getBuildTargetOrThrow().projectId
     const state = getProjectStateSync(projectId)
-    const prog = state.programs[programId]
+    const branch = branchName ? state.branches?.[branchName] : undefined
+    const prog = branch?.programs[programId] ?? state.programs[programId]
     if (!prog) {
         // This can happen if the program attached to a process got moved
         // TODO: automatically fix things for the user
@@ -703,7 +964,7 @@ export function getSynapseDir() {
     return path.resolve(bt.rootDirectory, synDirName)
 }
 
-export function getBuildDir(programId?: string) {
+export function getBuildDir() {
     const bt = getBuildTarget()
     if (!bt) {
         return path.resolve(getUserSynapseDirectory(), 'build')   
@@ -721,12 +982,18 @@ export function getTargetDeploymentIdOrThrow(): string {
     return bt.deploymentId
 }   
 
+interface Branch {
+    readonly apps: Record<projects.AppInfo['id'], projects.AppInfo>
+    readonly programs: Record<Program['id'], projects.ProgramInfo>
+}
+
 interface ProjectState {
     readonly id: string
     readonly apps: Record<projects.AppInfo['id'], projects.AppInfo>
     readonly programs: Record<Program['id'], projects.ProgramInfo>
     readonly packages: Record<string, string> // package name -> program id
     readonly importedPackages?: Record<string, string>
+    readonly branches?: Record<string, Branch>
 }
 
 async function findProjectFromDir(dir: string) {
@@ -796,12 +1063,41 @@ export async function getRemoteProjectId(projectId: string) {
     return proj?.remote
 }
 
+async function getRemoteProject(projectId: string) {
+    const ents = await getEntities()
+    const proj = ents.projects[projectId]
+    if (!proj.url) {
+        return
+    }
+
+    return getProjectByUrl(proj.url)
+}
+
 function normalizeUrl(url: string) {
     return url.replace(/\.git$/, '')
 }
 
+async function getProjectByUrl(url: string) {
+    try {
+        return await getProjectsClient().getProjectByUrl(normalizeUrl(url))
+    } catch (e) {
+        if ((e as any).statusCode !== 404) {
+            throw e
+        }
+    }
+}
+
 async function getOrCreateRemoteProject(dir: string, remotes?: Omit<Remote, 'headBranch'>[]) {
     const remoteUrl = remotes?.[0].fetchUrl
+    if (!remoteUrl) {
+        return
+    }
+
+    const existing = await getProjectByUrl(remoteUrl)
+    if (existing !== undefined) {
+        return existing
+    }
+
     const existingProjects = await listRemoteProjects()
     getLogger().debug('Existing projects', existingProjects)
 
@@ -811,7 +1107,12 @@ async function getOrCreateRemoteProject(dir: string, remotes?: Omit<Remote, 'hea
 
     if (match) {
         getLogger().log(`Restoring existing project bound to remote: ${remoteUrl}`)
-    } else if (remoteUrl) {
+    } else {
+        // We don't want to init projects in CI (usually)
+        if (getCiType() === 'github') {
+            return
+        }
+
         getLogger().log(`Initializing new project with remote: ${remoteUrl}`)
     }
 
@@ -819,7 +1120,10 @@ async function getOrCreateRemoteProject(dir: string, remotes?: Omit<Remote, 'hea
 }
 
 export async function initProject(dir: string, remotes?: Omit<Remote, 'headBranch'>[]) {
-    const remote = !isRemoteDisabled() ? await getOrCreateRemoteProject(dir, remotes) : undefined
+    const remote = !isRemoteDisabled() 
+        ? await getOrCreateRemoteProject(dir, remotes) 
+        : undefined
+
     const proj = { id: randomUUID(), kind: 'project', apps: remote?.apps, programs: remote?.programs, packages: remote?.packages, owner: '' }
 
     const ents = await getEntities()
@@ -827,10 +1131,12 @@ export async function initProject(dir: string, remotes?: Omit<Remote, 'headBranc
     if (remote?.apps) {
         const appMap = new Map<string, string>()
         for (const [k, v] of Object.entries(remote.programs)) {
+            if (k.startsWith('main_')) continue // XXX: temporary hack to fix CI
             if (v.appId) {
                 appMap.set(v.appId, k)
             }
         }
+
         for (const app of Object.values(remote.apps)) {
             for (const env of Object.values(app.environments)) {
                 const deploymentId = (env as any).process ?? env.deploymentId
@@ -842,16 +1148,23 @@ export async function initProject(dir: string, remotes?: Omit<Remote, 'headBranc
         }
     }
 
+    const remoteUrl = remotes?.[0].fetchUrl
     await addProject(ents, proj.id, { 
         directory: dir, 
         remote: remote?.id,
+        url: remoteUrl ? normalizeUrl(remoteUrl) : undefined,
     })
 
-    const state = await getProjectState(proj.id) ?? {
-        id: proj.id,
-        apps: proj.apps ?? {},
-        packages: proj.packages ?? {},
-        programs: proj.programs ?? {},
+    const state = await getOrCreateProjectState(proj.id)
+
+    if (remote?.apps) {
+        for (const [k, v] of Object.entries(remote.programs)) {
+            if (k.startsWith('main_')) continue // XXX: temporary hack to fix CI
+            state.programs[k] = v
+            if (v.appId && remote.apps[v.appId]) {
+                state.apps[v.appId] = remote.apps[v.appId]
+            }
+        }
     }
 
     await setProjectState(state)
@@ -872,13 +1185,7 @@ async function getCurrentProjectId() {
 
 export async function setPackage(pkgName: string, programId: string) {
     const projectId = await getCurrentProjectId()
-    const state = await getProjectState(projectId) ?? {
-        id: projectId,
-        apps: {},
-        programs: {},
-        packages: {},
-    }
-
+    const state = await getOrCreateProjectState(projectId)
     state.packages[pkgName] = programId
 
     await setProjectState(state)
@@ -898,11 +1205,13 @@ export async function listRemotePackages(projectId?: string) {
         return
     }
 
+    const importedPkgs = state.importedPackages ?? (await getRemoteProject(projectId))?.importedPackages
+
     const packages = state?.packages ?? {}
     const result: Record<string, string> = {}
 
     for (const [k, v] of Object.entries(packages)) {
-        const imported = state.importedPackages?.[k]
+        const imported = importedPkgs?.[k]
         if (imported) {
             result[k] = imported
         }
@@ -917,19 +1226,59 @@ export async function listRemotePackages(projectId?: string) {
     return result
 }
 
-export async function listDeployments(id?: string) {
-    const projectId = id ?? await getCurrentProjectId()
+async function tryGetBranch(projId: string, branchName: string) {
+    if (!shouldUseRemote) {
+        return
+    }
 
-    const state = await getProjectState(projectId)
-    if (!state) {
+    return getProjectsClient().getBranch(projId, branchName)
+}
+
+async function getBranchAwareState(projId: string, branchName?: string) {
+    const state = await getProjectState(projId)
+    if (!branchName || !state || projId === 'global') {
+        return state ? { state } : undefined
+    }
+
+    const defaultBranch = await getDefaultBranchCached(projId)
+    if (defaultBranch === branchName) {
+        return { state }
+    }
+
+    if (!state.branches) {
+        Object.assign(state, { branches: {} })
+    }
+
+    if (!state.branches![branchName]) {
+        const branch = await tryGetBranch(projId, branchName)
+        if (branch) {
+            state.branches![branchName] = branch
+            await setProjectState(state)
+        }
+    }
+    
+    const branch = state.branches![branchName] ??= { apps: {}, programs: {} }
+
+    return { state, branch }
+}
+
+export async function listDeployments(id?: string, branchName?: string) {
+    const projectId = id ?? await getCurrentProjectId()
+    branchName ??= getBuildTargetOrThrow().branchName
+
+    const totalState = await getBranchAwareState(projectId, branchName)
+    if (!totalState) {
         return {}
     }
 
+    const branchState = totalState.branch ?? totalState.state
     const res: [string, string][] = []
-    for (const [k, v] of Object.entries(state.programs)) {
+
+    const rootDir = getProjectDirectorySync(projectId)
+    for (const [k, v] of Object.entries(branchState.programs)) {
         if (!v.processId) continue
         
-        res.push([v.processId, getWorkingDir(k)])
+        res.push([v.processId, path.resolve(rootDir, v.workingDirectory ?? '')])
     }
 
     return Object.fromEntries(res)
@@ -937,7 +1286,7 @@ export async function listDeployments(id?: string) {
 
 export async function listAllDeployments() {
     const entities = await getEntities()
-    const res: Record<string, { workingDirectory: string, programId: string; projectId: string }> = {}
+    const res: Record<string, { workingDirectory: string, programId: string; projectId: string; branchName?: string }> = {}
     for (const [k, v] of Object.entries(entities.deployments)) {
         const projDir = v.projectId !== 'global' 
             ? entities.projects[v.projectId]?.directory
@@ -958,7 +1307,12 @@ export async function listAllDeployments() {
         }
 
         const workingDirectory = path.resolve(projDir, prog.workingDirectory ?? '') 
-        res[k] = { workingDirectory, programId: v.programId, projectId: proj.id }
+        res[k] = { 
+            workingDirectory, 
+            programId: v.programId, 
+            projectId: proj.id, 
+            branchName: v.branchName,
+        }
     }
 
     return res
@@ -995,15 +1349,15 @@ export async function isPublished(programId: string) {
     return false
 }
 
-function getRemotePackageId(state: ProjectState, programId: string) {
+function getRemotePackageId(branch: Branch, programId: string) {
     const bt = getBuildTargetOrThrow()
-    const appId = state.programs[programId]?.appId
+    const appId = branch.programs[programId]?.appId
     if (!appId) {
         return
         // throw new Error(`No app id found for program: ${programId}`)
     }
 
-    const app = state.apps[appId]
+    const app = branch.apps[appId]
     if (!app) {
         throw new Error(`Missing app: ${appId}`)
     }
@@ -1019,17 +1373,18 @@ function getRemotePackageId(state: ProjectState, programId: string) {
 
 export async function getOrCreateRemotePackage() {
     const bt = getBuildTargetOrThrow()
-    const state = await getProjectState(bt.projectId)
-    if (!state) {
+    const totalState = await getBranchAwareState(bt.projectId, bt.branchName)
+    if (!totalState) {
         throw new Error(`No project state found: ${bt.projectId}`)
     }
 
-    const appId = state.programs[bt.programId]?.appId
+    const branchState = totalState.branch ?? totalState.state
+    const appId = branchState.programs[bt.programId]?.appId
     if (!appId) {
         throw new Error(`No app id found for program: ${bt.programId}`)
     }
 
-    const app = state.apps[appId]
+    const app = branchState.apps[appId]
     if (!app) {
         throw new Error(`Missing app: ${appId}`)
     }
@@ -1055,7 +1410,7 @@ export async function getOrCreateRemotePackage() {
         packageId: pkg.id,
     }
 
-    await updateProjectState(state)
+    await updateProjectState(totalState.state, totalState.branch ? [bt.branchName!] : undefined)
 
     return pkg.id
 }

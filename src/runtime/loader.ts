@@ -1732,6 +1732,12 @@ function wrapProcess(proc: typeof process, workingDirectory: string, env?: Recor
                 return platform
             } else if (prop === 'env') {
                 return mergedEnv
+            } else if (prop === 'versions') {
+                // TODO: the same thing should be done in the synth loader too
+                return {
+                    ...proc.versions,
+                    node: proc.versions.node ?? proc.versions.synapse,
+                }
             }
 
             return Reflect.get(target, prop, recv)

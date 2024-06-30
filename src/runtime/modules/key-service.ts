@@ -7,6 +7,15 @@ import * as crypto from 'node:crypto'
 import * as storage from 'synapse:srl/storage'
 import { HttpError } from 'synapse:http'
 
+async function getKeyData(bucket: storage.Bucket, key: string) {
+    const blob = await bucket.get(key)
+    if (!blob) {
+        throw new Error(`Failed to get key data: ${key}`)
+    }
+    
+    return Buffer.from(await blob.arrayBuffer())
+}
+
 export function createKeyService() {
     const keyBucket = new storage.Bucket()
 
@@ -32,8 +41,7 @@ export function createKeyService() {
     }) {
         async sign(data: string | Buffer) {
             const location = `${this.id}.private`
-            const keyData = Buffer.from(await keyBucket.get(location))
-            const privateKey = await importPrivateEdwardsKey(keyData)
+            const privateKey = await importPrivateEdwardsKey(await getKeyData(keyBucket, location))
             const buffer = typeof data === 'string' ? Buffer.from(data) : data
     
             return crypto.subtle.sign('Ed448', privateKey, buffer)
@@ -49,9 +57,8 @@ export function createKeyService() {
     
         async getPublicKey() {
             const location = `${this.id}.public`
-            const keyData = Buffer.from(await keyBucket.get(location))
-    
-            return keyData
+
+            return await getKeyData(keyBucket, location)
         }
     
         async getPublicWebKey() {
@@ -90,7 +97,8 @@ export function createKeyService() {
     }) {
         async sign(data: string | Buffer) {
             const location = `${this.id}.private`
-            const privateKey = crypto.createPrivateKey(Buffer.from(await keyBucket.get(location)))
+            const keyData = Buffer.from(await getKeyData(keyBucket, location))
+            const privateKey = crypto.createPrivateKey(keyData)
             const signer = crypto.createSign('RSA-SHA256')
     
             return signer.update(data).sign(privateKey)
@@ -98,7 +106,7 @@ export function createKeyService() {
     
         async verify(data: string | Buffer, signature: Buffer) {
             const location = `${this.id}.public`
-            const publicKey = crypto.createPublicKey(Buffer.from(await keyBucket.get(location)))
+            const publicKey = crypto.createPublicKey(await getKeyData(keyBucket, location))
             const verifier = crypto.createVerify('RSA-SHA256')
     
             return verifier.update(data).verify(publicKey, signature)
@@ -106,9 +114,8 @@ export function createKeyService() {
     
         async getPublicKey() {
             const location = `${this.id}.public`
-            const keyData = Buffer.from(await keyBucket.get(location))
     
-            return keyData
+            return await getKeyData(keyBucket, location)
         }
     
         async getPublicWebKey() {

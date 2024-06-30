@@ -3,6 +3,7 @@ import { colorize, printLine, print } from '../cli/ui'
 import { getBuildTargetOrThrow, getFs, throwIfCancelled } from '../execution'
 import { BaseOutputMessage, getLogger, getTypedEventEmitter } from '../logging'
 import { arrayEditDistance, getHash, keyedMemoize, levenshteinDistance, throwIfNotFileNotFoundError } from '../utils'
+import { toProgramRef } from '../workspaces'
 import { DataPointer, maybeConvertToPointer, isDataPointer, toDataPointer, isNullHash, pointerPrefix, getNullHash } from './pointers'
 import { findArtifactByPrefix, getArtifactByPrefix } from './utils'
 
@@ -1030,7 +1031,7 @@ export async function diffFileInCommit(repo: DataRepository, fileName: string, c
 
 export async function diffFileInLatestCommit(fileName: string, opt?: { commitsBack?: number }) {
     const repo = getDataRepository()
-    const commits = await listCommits(getBuildTargetOrThrow().programId)
+    const commits = await listCommits(toProgramRef(getBuildTargetOrThrow()))
     const latestCommit = commits[0]
     if (!latestCommit) {
         printLine(colorize('brightRed', 'No commit found'))

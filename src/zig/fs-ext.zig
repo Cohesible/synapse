@@ -302,7 +302,7 @@ fn _removeDir(parent: [:0]const u8, path: [:0]const u8) !void {
     defer parentDir.close();
 
     if (!comptime builtin.target.isDarwin()) {
-        return parentDir.deleteDirZ(path.ptr);
+        return parentDir.deleteTree(path.ptr[0..path.len]);
     }
 
     const res = removefileat(parentDir.fd, path, null, REMOVEFILE_RECURSIVE);

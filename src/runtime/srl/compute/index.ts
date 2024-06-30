@@ -1,6 +1,6 @@
 //# moduleId = synapse:srl/compute
 
-import { HttpHandler, HttpRequest, HttpResponse, HttpRoute, PathArgs } from 'synapse:http'
+import { HttpRequest, HttpResponse, HttpRoute, PathArgs, RequestHandler, RequestHandlerWithBody, PathArgsWithBody } from 'synapse:http'
 // import { WebSocket } from 'synapse:ws'
 import { HostedZone, Network } from 'synapse:srl/net'
 
@@ -56,7 +56,7 @@ export interface HttpServiceOptions {
      * * `native` - authorizes using the target cloud provider (the default)
      * * A custom function that intercepts the request. Returning nothing passes the request on to the router.
      */
-    auth?: 'none' | 'native' | HttpHandler<any, undefined, HttpResponse | undefined>
+    auth?: 'none' | 'native' | RequestHandlerWithBody<any, any, Response | HttpResponse | undefined>
 
     /**
      * Uses a custom domain name instead of the one provided by the cloud provider.
@@ -69,6 +69,9 @@ export interface HttpServiceOptions {
     /** @internal */
     mergeHandlers?: boolean
 }
+
+// Nonexhaustive
+type HttpBodyMethod = 'POST' | 'PUT' | 'DELETE' | 'OPTIONS' | 'PATCH'
 
 //# resource = true
 export declare class HttpService {
@@ -86,17 +89,32 @@ export declare class HttpService {
     forward(req: HttpRequest, body: any): Promise<HttpResponse> 
 
     //# resource = true
-    addRoute<U extends string = string, R = unknown>(
-        route: U,
-        handler: HttpHandler<U, undefined, R>,
-        opt: never // XXX: extra arg to force TypeScript into the correct signature
-    ): HttpRoute<PathArgs<U>, R>
+    route<P extends string = string, R = unknown>(
+        method: 'GET',
+        path: P,
+        handler: RequestHandler<`GET ${P}`, R>
+    ): HttpRoute<PathArgs<P>, R>
 
     //# resource = true
-    addRoute<P extends string = string, U = undefined, R = unknown>(
-        route: P,
-        handler: HttpHandler<P, U, R>
-    ): HttpRoute<[...PathArgs<P>, ...(U extends undefined ? [] : [body: U])], R>
+    route<P extends string = string, U = unknown, R = unknown>(
+        method: 'ANY',
+        path: P,
+        handler: RequestHandlerWithBody<`${string} ${P}`, U, R>
+    ): HttpRoute<PathArgsWithBody<P, U>, R>
+
+    //# resource = true
+    route<P extends string = string, U = unknown, R = unknown, M extends HttpBodyMethod = HttpBodyMethod>(
+        method: HttpBodyMethod,
+        path: P,
+        handler: RequestHandlerWithBody<`${HttpBodyMethod} ${P}`, U, R>
+    ): HttpRoute<PathArgsWithBody<P, U>, R>
+
+    //# resource = true
+    route<P extends string = string, U = unknown, R = unknown>(
+        method: string,
+        path: P,
+        handler: RequestHandlerWithBody<`${string} ${P}`, U, R>
+    ): HttpRoute<PathArgsWithBody<P, U>, R>
 
     /** TODO */
     // addMiddleware(

@@ -31,13 +31,21 @@ export class Bucket implements storage.Bucket {
     }
 
     // IMPORTANT: S3 returns a 403 instead of a 404 when the user doesn't have permission to list the bucket contents.
-    public async get(key: string): Promise<Uint8Array>
-    public async get(key: string, encoding: storage.Encoding): Promise<string>
-    public async get(key: string, encoding?: storage.Encoding): Promise<Uint8Array | string> {
-        const resp = await this.client.getObject({ Bucket: this.name, Key: key })
-        const bytes = await resp.Body!.transformToByteArray()
+    public async get(key: string): Promise<Blob | undefined>
+    public async get(key: string, encoding: storage.Encoding): Promise<string | undefined>
+    public async get(key: string, encoding?: storage.Encoding): Promise<Blob | string | undefined> {
+        try {
+            const resp = await this.client.getObject({ Bucket: this.name, Key: key })
+            const bytes = await resp.Body!.transformToByteArray()
 
-        return !encoding ? bytes : Buffer.from(bytes).toString(encoding)
+            // TODO: need way to convert web stream to blob
+            return !encoding ? new Blob([bytes]) : Buffer.from(bytes).toString(encoding)
+        } catch (e) {
+            if (!(e instanceof Error) || e.name !== 'NoSuchKey') {
+                throw e
+            }
+            return undefined
+        }
     }
 
     public async put(key: string, blob: string | Uint8Array): Promise<void> {

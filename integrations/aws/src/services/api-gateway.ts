@@ -6,7 +6,7 @@ import { LambdaFunction } from './lambda'
 import { signRequest } from '../sigv4'
 import { NodeHttpHandler } from '@smithy/node-http-handler'
 import { HostedZone } from './route53'
-import { HttpHandler, Middleware, RouteRegexp, buildRouteRegexp, matchRoutes, HttpResponse, HttpError, HttpRoute, PathArgs, createPathBindings, applyRoute, compareRoutes, HttpRequest } from 'synapse:http'
+import { HttpHandler, Middleware, RouteRegexp, buildRouteRegexp, matchRoutes, HttpResponse, HttpError, HttpRoute, PathArgs, createPathBindings, applyRoute, compareRoutes, HttpRequest, RequestHandler, RequestHandlerWithBody, PathArgsWithBody } from 'synapse:http'
 import { createSerializedPolicy } from './iam'
 import { generateIdentifier } from 'synapse:lib'
 import * as net from 'synapse:srl/net'
@@ -66,17 +66,11 @@ export class Gateway {
         this.region = region.name
     }
 
-    public addRoute<P extends string = string, U = any, R = HttpResponse>(
-        route: P, 
-        handler: HttpHandler<P, U, R> | HttpHandler<P, string, R>,
-    ): HttpRoute<[...PathArgs<P>, U], R> {
-        const [method, path] = route.split(' ')
-        if (path === undefined) {
-            throw new Error(`Missing method in route: ${route}`)
-        }
-
+    private _addRoute(method: string, path: string, handler: RequestHandler | RequestHandlerWithBody) {
         const authHandler = typeof this.props?.auth === 'function' ? this.props.auth : undefined
-        const wrapped = wrapHandler(handler as any, authHandler as any, this.middleware, this.props?.allowedOrigins)
+        const wrapped = wrapRequestHandler(handler, authHandler)
+
+        const route = `${method} ${path}`
         const mergeHandlers = this.props?.mergeHandlers ?? true
         if (mergeHandlers) {
             if (!this.requestRouter) {
@@ -89,7 +83,7 @@ export class Gateway {
 
             this.requestRouter.addRoute(route, wrapped)
 
-            core.getPermissionsLater(wrapped, statements => {
+            core.getPermissionsLater(handler, statements => {
                 this.requestRouter!.fn.principal.addPolicy({
                     // [\w+=,.@-]+{1,128}
                     name: `Route-${route.replace(/[\s\/]+/g, '_').replace(/[{}]/g, '')}`,
@@ -116,7 +110,15 @@ export class Gateway {
         }
     }
 
-    private addRouteInfra(route: string, handler: ReturnType<typeof wrapHandler>) {
+    public route<P extends string = string, U = unknown, R = unknown>(
+        method: string,
+        path: P,
+        handler: RequestHandler<`${string} ${P}`, R> | RequestHandlerWithBody<`${string} ${P}`, U, R>
+    ): HttpRoute<PathArgsWithBody<P, U>, R> {
+        return this._addRoute(method, path, handler)
+    }
+
+    private addRouteInfra(route: string, handler: ApiGatewayHandler) {
         const fn = new LambdaFunction(handler)
 
         const integration = new aws.Apigatewayv2Integration({
@@ -366,11 +368,9 @@ function isJsonRequest(headers: Record<string, string>) {
     return !!contentType.match(/application\/(?:([^+\s]+)\+)?json/)
 }
 
-function wrapHandler(
-    handler: HttpHandler, 
-    authHandler?: HttpHandler, 
-    middleware: Middleware[] = [],
-    allowedOrigins?: string[]
+function wrapRequestHandler(
+    handler: RequestHandler | RequestHandlerWithBody, 
+    authHandler?: RequestHandler | RequestHandlerWithBody, 
 ) {
     async function handleRequest(request: ApiGatewayRequestPayloadV2) {
         const decoded = (request.body !== undefined && request.isBase64Encoded) 
@@ -379,35 +379,37 @@ function wrapHandler(
         const body = (decoded && isJsonRequest(request.headers)) ? JSON.parse(decoded) : decoded
         const stage = request.requestContext.stage
         const trimmedPath = request.rawPath.replace(`/${stage}`, '')
+        const queryString = request.rawQueryString
+        const url = new URL(`${trimmedPath}${queryString ? `?${queryString}` : ''}`, `https://${request.headers['host']}`)
+        const headers = new Headers(request.headers)
+        const method = request.requestContext.http.method
+        const reqBody = method === 'GET' || method === 'HEAD' ? undefined : body
 
-        const mappedRequest = {
-            path: trimmedPath,
-            queryString: request.rawQueryString,
-            headers: new Headers(request.headers),
-            context: request.requestContext,
-            method: request.requestContext.http.method,
-            pathParameters: request.pathParameters,
+        const newReq = new Request(url, {
+            headers,
+            method,
+            body: reqBody,
+            duplex: 'half', // specific to node
+        } as RequestInit)
 
-            // Why is `cookies` an array?
-            cookies: request.cookies,
-        }
-        
-        return runHandler(async () => {
-            if (authHandler) {
-                const resp = await authHandler(mappedRequest, body)
-                if (resp !== undefined) {
-                    return resp
-                }
+        ;(newReq as any).cookeis = request.cookies
+        ;(newReq as any).context = request.requestContext
+        ;(newReq as any).pathParameters = request.pathParameters
+
+        if (authHandler) {
+            const resp = await authHandler(newReq as any, body)
+            if (resp !== undefined) {
+                return resp
             }
-    
-            return handler(mappedRequest, body)
-        })
+        }
+
+        return handler(newReq as any, body)
     }
 
     return handleRequest
 }
 
-type ApiGatewayHandler = ReturnType<typeof wrapHandler>
+type ApiGatewayHandler = ReturnType<typeof wrapRequestHandler>
 function createRequestRouter() {
     interface RouteEntry {
         readonly route: string

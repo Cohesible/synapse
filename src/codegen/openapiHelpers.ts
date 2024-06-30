@@ -1,5 +1,3 @@
-import { fetch } from 'synapse:http'
-
 type ParameterLocation = {
     readonly in?: "path";
     readonly style?: "matrix" | "label" | "simple";
@@ -75,10 +73,11 @@ async function sendRequest(
         headers['authorization'] = auth
     }
 
-    return fetch(built.path, {
+    const url = new URL(built.path, baseUrl)
+
+    return fetch(url, {
         headers,
         method,
         body: built.body,
-        baseUrl,
     })
 }

@@ -9,13 +9,9 @@ export class Counter implements storage.Counter {
     }
 
     async get(): Promise<number> {
-        try {
-            const d = JSON.parse(await this.bucket.get('counter', 'utf-8'))
+        const data = await this.bucket.get('counter', 'utf-8')
 
-            return d
-        } catch {
-            return this.init
-        }
+        return data !== undefined ? JSON.parse(data) : this.init
     }
 
     async set(amount: number): Promise<number> {

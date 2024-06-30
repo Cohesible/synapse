@@ -580,12 +580,14 @@ type SerializeableKeys<T> = { [P in keyof T]: T[P] extends (...args: any[]) => a
 type Serializeable<T extends object> = Pick<T, SerializeableKeys<T>>
 type Serialized<T> = Readonly<Pick<T, SerializeableKeys<T>>>
 
+export function using<T extends any[], U>(ctx: T, fn: () => U): U
+export function using<T, U>(ctx: T, fn: (ctx: T) => U): U
 export function using<T, U>(ctx: T, fn: (ctx: T) => U): U {
     if (typeof __getContext === 'undefined') {
         return fn(ctx)
     }
 
-    return __getContext().run({ contexts: [ctx] }, fn)
+    return __getContext().run({ contexts: Array.isArray(ctx) ? ctx : [ctx] }, fn)
 }
 
 /**

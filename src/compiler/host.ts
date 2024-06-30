@@ -525,34 +525,10 @@ export class CompilerHost {
         sourceFile = serializerTransformer.visit(sourceFile) as ts.SourceFile
         sourceFile = this.program.resourceTransformer.visitSourceFile(sourceFile) // Possibly do this pass in `serializerTransformer`
 
-        const importDecl = ts.factory.createImportDeclaration(
-            undefined,
-            ts.factory.createImportClause(
-                false, 
-                undefined, 
-                ts.factory.createNamedImports([
-                    ts.factory.createImportSpecifier(
-                        false, 
-                        ts.factory.createIdentifier('__scope__'), 
-                        ts.factory.createIdentifier('scope')
-                    )
-                ])
-            ),
-            ts.factory.createStringLiteral('synapse:core')
-        )
-
         const emit = async () => {
             const bt = getBuildTargetOrThrow()
             const relSourcefile = makeRelative(bt.workingDirectory, sourceFile.fileName)
             const artifacts = await this.emitArtifacts(sourceFile.fileName, moduleId)
-
-            sourceFile = ts.factory.updateSourceFile(
-                sourceFile,
-                [
-                    importDecl,
-                    ...sourceFile.statements,
-                ]
-            )
 
             if (getModuleType(this.compilerOptions?.module) === 'esm') {
                 sourceFile = transformImports(sourceFile)
@@ -643,7 +619,7 @@ export async function synth(entrypoints: string[], deployables: string[], opt: S
     const bt = getBuildTargetOrThrow()
     ;(bt as Mutable<typeof bt>).deploymentId = deploymentId
     process.env.SYNAPSE_ENV = bt.environmentName // XXX: not clean
-    process.env.SYNAPSE_TARGET = opt.deployTarget ?? 'local'
+    process.env.SYNAPSE_TARGET = opt.deployTarget ?? opt.compilerOptions?.deployTarget ?? 'local'
 
     const store = await afs.getCurrentProgramStore().getSynthStore()
     const vfs = toFs(bt.workingDirectory, store.afs, getFs())

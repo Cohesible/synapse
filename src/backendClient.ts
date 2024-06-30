@@ -91,10 +91,14 @@ function _createBackendClient() {
 }
 
 const clients: Record<string, ReturnType<typeof _createBackendClient>> = {}
-export function getBackendClient() {
+export function getBackendClient(bootstrap = false) {
     const k = getExecutionId()
     if (clients[k]) {
         return clients[k]
+    }
+
+    if (bootstrap) {
+        return clients[k] = getBootstrapClient()
     }
 
     try {

@@ -7,7 +7,7 @@ export class CDN implements storage.CDN {
 
     constructor(props: { bucket: storage.Bucket }) {
         const service = new compute.HttpService({ auth: 'none' })
-        service.addRoute('GET /{key+}', async req => {
+        service.route('GET', '/{key+}', async req => {
             const key = req.pathParameters.key
             const [data, metadata] = await Promise.all([
                 props.bucket.get(key),
