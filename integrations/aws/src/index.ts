@@ -44,17 +44,17 @@ export class Provider extends aws.AwsProvider {
         })
     }
 
-    public static fromAccount(account: Account) {
-        return this.fromRoleArn(getManagementRoleArn(account))
+    public static fromAccount(account: Account, partition = 'aws') {
+        return this.fromRoleArn(getManagementRoleArn(account, partition))
     }
 
     public static fromRoleArn(roleArn: string) {
         return new this({ assumeRole: [{ roleArn }] })
     }
 
-    public static withId(account: Account, id: string) {
+    public static withId(account: Account, id: string, partition = 'aws') {
         const roleName = 'OrganizationAccountAccessRole'
-        const roleArn = `arn:aws:iam::${account.id}:role/${roleName}`
+        const roleArn = `arn:${partition}:iam::${account.id}:role/${roleName}`
 
         return new this(...([{ assumeRole: [{ roleArn }] }, id] as any[]))
     }
@@ -65,11 +65,9 @@ Object.assign(Provider, { [core.contextType]: 'aws' })
 
 core.addTarget(srl.Provider, Provider, 'aws')
 
-export function getManagementRoleArn(account: Account) {
-    // TODO: partitions
-    return `arn:aws:iam::${account.id}:role/${account.managementRoleName}`
+export function getManagementRoleArn(account: Account, partition = 'aws') {
+    return `arn:${partition}:iam::${account.id}:role/${account.managementRoleName}`
 }
-
 
 export function createCrossAccountRole(target: Account, principal?: Role) {
     const awsPrincipal = principal ? principal.resource.arn : core.getContext(Provider).accountId

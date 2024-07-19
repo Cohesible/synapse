@@ -16,6 +16,10 @@ interface LocalHttpServiceProps {
     port?: number
 }
 
+function log(...args: any[]) {
+    console.log(new Date().toISOString(), 'SYSTEM', ...args)
+}
+
 function createLocalHttpService(props: LocalHttpServiceProps) {
     const b = new lib.Bundle(async () => {
         // Used for restarts
@@ -37,7 +41,7 @@ function createLocalHttpService(props: LocalHttpServiceProps) {
             server.shutdown()
         })
 
-        console.log('started server:', server.hostname, process.pid)
+        log('started server.', 'hostname:', server.hostname, 'pid:', process.pid)
 
         process.send?.({
             pid: process.pid,
@@ -86,7 +90,7 @@ async function startServer(props: LocalHttpServiceProps) {
     }
 
     async function shutdown() {
-        console.log('Stopping server...')
+        log('stopping server...')
 
         await new Promise<void>(async (resolve, reject) => {
             setTimeout(() => reject(new Error('Failed to shutdown')), 5000).unref()
@@ -535,7 +539,7 @@ function createRequestRouter() {
             matchRoutes(path, routes.map(e => [e.pattern, e]))
         )
 
-        console.log('All matched routes:', matched.map(r => r.value.route))
+        log('all matched routes:', matched.map(r => r.value.route))
 
         const sorted = matched.sort((a, b) => compareRoutes(b.value.route, a.value.route))
         const first = sorted[0]
@@ -574,7 +578,7 @@ function createRequestRouter() {
             const selectedRoute = findRoute(url.pathname, routes)
             const pathParameters = selectedRoute.match.groups ?? {}
             const entry = selectedRoute.value
-            console.log('Using route:', entry.route)
+            log('using route:', entry.route)
 
             return entry.handler(url, req, pathParameters)
         })
@@ -584,3 +588,40 @@ function createRequestRouter() {
 }
 
 core.addTarget(compute.HttpService, Gateway, 'local')
+
+core.registerLogProvider(
+    LocalHttpService,
+    async (r, q) => {
+        const data = await fs.readFile(r.logsPath, 'utf-8').catch(e => {
+            if ((e as any).code !== 'ENOENT') {
+                throw e
+            }
+        })
+
+        if (!data) {
+            return []
+        }
+
+        let lastTimestamp = 0
+        const events = data.split('\n').map(l => {
+            if (l.match(/^[\d]{4}-/) && l.includes(' SYSTEM')) {
+                const parts = l.split(' ')
+                const rem = parts.slice(2).join(' ')
+                lastTimestamp = new Date(parts[0]).getTime()
+
+                return {
+                    timestamp: parts[0],
+                    sourceType: 'system',
+                    data: rem,
+                }
+            }
+
+            return {
+                timestamp: lastTimestamp+1, // XXX: need to instrument user logs
+                data: l,
+            }
+        })
+
+        return events
+    }
+)

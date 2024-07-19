@@ -9,7 +9,3 @@ You can think of Synapse as a build system that is also apart of your applicatio
 
 And many more things that haven't been released yet!
 
-## Where's the code?
-Currently in a private repository. Synapse is built with Synapse, meaning there's _a lot_ of code that uses experimental/unpolished/undocumented features.
-
-We want a relatively smooth contributor experience, not a free-for-all. So open sourcing will happen gradually, starting with the "cloud integration" packages. This will allow people to contribute implementations for different cloud providers.

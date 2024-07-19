@@ -1176,6 +1176,10 @@ function tryOptimization(ops: ReflectionOperation[]) {
 
     if (ops[0].module.startsWith('synapse:')) {
         if (ops.length === 2) {
+            if (ops[1].type === 'get' && ops[1].property === 'move') {
+                return noop
+            }
+
             if (ops[1].type === 'get' && ops[1].property === 'getContext') {
                 return fn(createObjectLiteral({}, ts.factory))
             }
@@ -1394,6 +1398,14 @@ function renderSerializedData(
         return ident
     }
 
+    function renderStubFn(id: number | string) {
+        const exp = ts.factory.createArrowFunction(undefined, undefined, [], undefined, undefined, ts.factory.createBlock([]))
+        const ident = createIdent(id)
+        statements.set(id, createVariableStatement(ident, exp))
+
+        return ident
+    }
+
     function renderFunction(id: number | string, module: string, args: any[]) {
         const spec = isDataPointer(module) 
             ? toAbsolute(module) 
@@ -1543,6 +1555,13 @@ function renderSerializedData(
     function renderEntry(entry: ExternalValue) {
         frame = []
         dependencies.set(entry.id!, frame)
+
+        // This could also be implemented when serializing bundled data
+        const stubbed = getSymbol(entry, 'synapse.stubWhenBundled')
+        if (stubbed) {
+            return renderStubFn(entry.id!)
+        }
+
         const exp = render({ 
             ...entry,
             // Strip out permissions and alt. implementations

@@ -9,6 +9,7 @@ import { getWorkingDir } from '../../workspaces'
 import { resourceIdSymbol } from '../../deploy/server'
 import { CancelError } from '../../execution'
 import { TfState } from '../../deploy/state'
+import type { Symbol } from '../../runtime/modules/terraform'
 
 interface ResourceInfo {
     internal?: boolean
@@ -28,7 +29,7 @@ interface SymbolState {
 }
 
 
-function getBetterName(sym: SymbolNode['value']) {
+function getBetterName(sym: Symbol) {
     const parts = sym.name.split(' = ')
     if (parts.length === 1) {
         return { name: parts[0] }
@@ -41,28 +42,6 @@ function getBetterName(sym: SymbolNode['value']) {
     }
 
     return { name: ident }
-}
-
-export function renderBetterSymbolName(
-    sym: SymbolNode['value'], 
-    workingDir: string, 
-    headerLength: number,
-    icon = '*',
-    status = ''
-) {
-
-    const parts = getBetterName(sym)
-    const pSym = {
-        ...sym,
-        name: `${parts.name}${parts.type ? ` <${parts.type}>` : ''}`,
-        fileName: path.relative(workingDir, sym.fileName),
-    }
-
-    const loc = renderSymbolLocation(pSym, true)
-    const s = `${icon} ${renderSymbol(pSym, false)}${status}`
-    const padded = s.padEnd(headerLength - loc.length, ' ')
-
-    return `${padded}${loc}`
 }
 
 function getStatusIcon(status: SymbolState['status'], spinner: Spinner, duration: number) {
@@ -116,6 +95,32 @@ export function printSymbolTable(symbols: Iterable<[sym: SymbolNode, state: Symb
         //const padding = headerSize - leftWidth
         printLine(`${left}${' '.repeat(padding - leftWidth)}${colorize('gray', right)}`)
     }
+}
+
+function renderSym(sym: Symbol, showType = true, showLocation = true) {
+    const parts = getBetterName(sym)
+    const symType = parts.type && showType ? ` <${parts.type}> ` : ''
+
+    const loc = showLocation ? renderSymbolLocation(sym, true) : ''
+    const details = colorize('gray', `${symType}${loc}`)
+
+    return `${parts.name}${details}`
+}
+
+export function renderMove(
+    from: Symbol,
+    to: Symbol,
+    workingDir = getWorkingDir(), 
+) {
+
+    const fromParts = getBetterName(from)
+    const toParts = getBetterName(to)
+    const isSameFile = from.fileName === to.fileName
+    const isSameType = fromParts.type === toParts.type
+    const fromRendered = renderSym({ ...from, fileName: path.relative(workingDir, from.fileName) }, !isSameType, !isSameFile)
+    const toRendered = renderSym({ ...to, fileName: path.relative(workingDir, to.fileName) })
+
+    return `${fromRendered} --> ${toRendered}`
 }
 
 export function renderSymbolWithState(
@@ -418,13 +423,9 @@ export async function createDeployView(graph: MergedGraph, isDestroy?: boolean) 
     return { dispose, formatError }
 }
 
-function summarizePlan(graph: MergedGraph, plan: ParsedPlan): DeployEvent['action'] | 'no-op' {
+function summarizePlan(plan: ParsedPlan): DeployEvent['action'] | 'no-op' {
     let action: DeployEvent['action'] | 'no-op' = 'no-op'
     for (const [k, v] of Object.entries(plan)) {
-        // if (graph.isInternalResource(k) || k.startsWith('data.')) {
-        //     continue
-        // }
-
         if (k.startsWith('data.')) {
             continue
         }
@@ -459,6 +460,22 @@ export function groupSymbolInfoByFile(info: Map<SymbolNode, SymbolState>): Recor
     return groups
 }
 
+export function getPlannedChanges(plan: ParsedPlan) {
+    const resources: Record<string, { change: ReturnType<typeof getChangeType>, plan: ParsedPlan[string] }> = {}
+    for (const [k, v] of Object.entries(plan)) {
+        if (k.startsWith('data.')) continue
+    
+        const change = getChangeType(v.change)
+        if (change === 'no-op') continue
+
+        resources[k] = {
+            change,
+            plan: v,
+        }
+    }
+    return resources
+}
+
 export function extractSymbolInfoFromPlan(graph: MergedGraph, plan: ParsedPlan) {
     const symbolStates = new Map<SymbolNode, SymbolState>()
     const plans = new Map<SymbolNode, ParsedPlan>()
@@ -477,7 +494,7 @@ export function extractSymbolInfoFromPlan(graph: MergedGraph, plan: ParsedPlan) 
     }
 
     for (const [k, v] of plans) {
-        const summary = summarizePlan(graph, v)
+        const summary = summarizePlan(v)
         if (summary === 'no-op') {
             continue
         }

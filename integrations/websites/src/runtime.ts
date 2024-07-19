@@ -13,13 +13,6 @@ type JSXElementConstructor<P> = (props?: P) => JSXNode<P>
 
 interface Component {
     render(): JSXElement
-
-    // setState<K extends keyof S>(
-    //     state: ((prevState: Readonly<S>, props: Readonly<P>) => Pick<S, K> | S | null) | (Pick<S, K> | S | null),
-    //     callback?: () => void,
-    // ): void;
-    // state: Readonly<S>;
-    // readonly props: Readonly<P>;
 }
 
 type FunctionComponent<P = any> = (props: P) => JSXNode<P>
@@ -57,10 +50,9 @@ interface MountOptions {
 // TODO: combine 'render' functions into one
 // we should decide what to do based off the return value
 type MountFn<T = JSXNode> = (container: Element | Document, children: T, opt: MountOptions) => MountedNode | void
-type RenderSyncFn<T = JSXNode> = (node: T) => string
+type RenderFn<T = JSXNode> = (node: T) => Promise<string> | string
 type RenderStreamFn<T = JSXNode> = (node: T, opt?: { bootstrapScripts?: string[]} ) => Promise<ReadableStream>
-
-type Factory = (type: string | JSXElementConstructor<any>, props: any, key?: string | number) => JSXElement
+type CreateElement = (type: string | JSXElementConstructor<any>, props?: any, ...children: JSXElement[]) => JSXElement
 
 export interface JSXContext<T = any, U = JSXNode> {
     readonly Provider: ComponentType<{ value: T; children: U }>
@@ -68,9 +60,9 @@ export interface JSXContext<T = any, U = JSXNode> {
 }
 
 export interface JSXRuntime<T = JSXNode, U = JSXContext<any, T>> {
-    // readonly factory: Factory
+    readonly createElement: CreateElement
     readonly mount: MountFn<T>
-    readonly render: RenderSyncFn<T>
+    readonly render: RenderFn<T>
     // readonly createContext: (value: any) => U 
     readonly renderStream?: RenderStreamFn<T>
 }

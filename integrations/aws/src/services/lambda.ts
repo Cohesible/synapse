@@ -10,6 +10,8 @@ import { Role, createSerializedPolicy, spPolicy } from './iam'
 import { DockerfileDeployment, GeneratedDockerfile } from './ecr'
 import { Provider } from '..'
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { addResourceStatement, getPermissionsLater } from '../permissions'
+import { getLogEvents, listLogStreams } from './cloudwatch-logs'
 
 interface LambdaOptions {
     /** @unused */
@@ -54,7 +56,7 @@ export class LambdaFunction<T extends any[] = any[], U = unknown> implements com
             managedPolicyArns: [policyArn],
         })
 
-        core.getPermissionsLater(target, statements => {
+        getPermissionsLater(target, statements => {
             role.addPolicy({
                 name: 'InlinePolicy',
                 policy: createSerializedPolicy(statements),
@@ -191,23 +193,16 @@ export interface LambdaFunction<T extends any[] = any[], U = unknown> {
 
 core.addTarget(compute.Function, LambdaFunction, 'aws')
 core.bindModel(Lambda.Lambda, {
-    'invoke': {
-        Effect: 'Allow',
-        Action: 'lambda:InvokeFunction',
-        Resource: 'arn:{context.Partition}:lambda:{context.Region}:{context.Account}:function:{0.FunctionName}' 
-    },
+    'invoke': function (req) {
+        addResourceStatement({
+            service: 'lambda',
+            action: 'InvokeFunction',
+            resource: `function:${req.FunctionName}`,
+        }, this)
+
+        return core.createUnknown()
+    }
 })
-
-// core.bindModel(LambdaFunction, {
-//     invoke: function () {
-//         this.$context.addStatement({
-//             Action: 'lambda:InvokeFunction',
-//             Resource: `${this.resource.arn}`
-//         })
-
-//         return this.$context.createUnknown() as any
-//     }
-// })
 
 // https://github.com/DefinitelyTyped/DefinitelyTyped/blob/master/types/aws-lambda/handler.d.ts
 export interface CognitoIdentity {
@@ -405,12 +400,47 @@ function createImage(handler: string, entrypoint: lib.Bundle, extraCommands?: st
     return { repo, deployment }
 }
 
-// apigw-requestid: <base64 token>
-// Default log group: '/aws/lambda/${fn-name}'
-
-export async function getLogs(fn: LambdaFunction) {
-    const logGroup = fn.resource.loggingConfig?.logGroup ?? `/aws/lambda/${fn.resource.functionName}`
-    // const streams = await listStreams(logGroup)
-    // ...
-    
+async function getLogs(fn: aws.LambdaFunction) {
+    const region = fn.qualifiedArn.split(':')[3]
+    const logGroup = fn.loggingConfig?.logGroup ?? `/aws/lambda/${fn.functionName}`
+    const streams = await listLogStreams(logGroup, 5, region)
+    const events: Awaited<ReturnType<typeof getLogEvents>> = []
+    for (const s of streams) {
+        const r = await getLogEvents(logGroup, s.logStreamName!, region)
+        events.push(...r)
+    }
+    return events
 }
+
+core.registerLogProvider(
+    aws.LambdaFunction,
+    async (r, q) => {
+        const events = await getLogs(r)
+
+        return events.map(ev => {
+            const msg = ev.message!
+            // TODO: parse out JSON from the message
+            const sourceType = !!msg.match(/^[A-Z]/) || msg.includes('ERROR\tInvoke Error') ? 'system' : 'user'
+            if (sourceType === 'user') {
+                const columns = msg.split('\t')
+                const rem = columns.slice(3).join('\t')
+
+                return {
+                    timestamp: ev.timestamp!,
+                    sourceType,
+                    data: {
+                        requestId: columns[1],
+                        level: columns[2],
+                        message: rem.endsWith('\n') ? rem.slice(0, -1) : rem,
+                    },
+                }
+            }
+
+            return {
+                timestamp: ev.timestamp!,
+                sourceType,
+                data: msg.endsWith('\n') ? msg.slice(0, -1) : msg,
+            }
+        })
+    }
+)

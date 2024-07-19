@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import * as cs from '..'
+import * as synapse from '..'
 import * as path from 'node:path'
 import { getLogger } from '../logging'
 import { LogLevel, logToFile, logToStderr, purgeOldLogs, validateLogLevel } from './logger'
@@ -21,7 +21,7 @@ async function _main(argv: string[]) {
 
     await runWithAnalytics(cmd, async () => {
         await executeCommand(cmd, params)
-    }).finally(() => cs.shutdown())
+    }).finally(() => synapse.shutdown())
 }
 
 function isProbablyRelativePath(arg: string) {
@@ -145,7 +145,7 @@ export function main(...args: string[]) {
     if (isSea && arg0 && arg0.startsWith('sea-asset:')) {
         process.argv.splice(isSea ? 1 : 2, 1)
 
-        return runWithContext({ selfPath, selfBuildType }, () => cs.runUserScript(arg0))
+        return runWithContext({ selfPath, selfBuildType }, () => synapse.runUserScript(arg0))
     }
 
     // `pointer:<sha256 hash hex>` has a length of 72
@@ -154,7 +154,7 @@ export function main(...args: string[]) {
         process.argv.splice(isSea ? 1 : 2, 1)
 
         return resolveProgramBuildTarget(process.cwd()).then(buildTarget => {
-            return runWithContext({ selfPath, selfBuildType, buildTarget }, () => cs.runUserScript(arg0))
+            return runWithContext({ selfPath, selfBuildType, buildTarget }, () => synapse.runUserScript(arg0))
         })
     }
 
@@ -166,7 +166,7 @@ export function main(...args: string[]) {
         const resolved = fs.realpathSync(path.resolve(arg0))
         setContext({ selfPath, selfBuildType })
 
-        return cs.runUserScript(resolved)
+        return synapse.runUserScript(resolved)
     }
 
     Error.stackTraceLimit = 100

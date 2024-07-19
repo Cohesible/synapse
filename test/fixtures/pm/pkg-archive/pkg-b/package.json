@@ -1,0 +1,9 @@
+{
+    "name": "pkg-b",
+    "exports": "./main.ts",
+    "tsconfig": {
+      "compilerOptions": {
+        "declaration": true
+      }
+    }
+}

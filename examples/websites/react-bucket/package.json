@@ -1,0 +1,5 @@
+{
+    "dependencies": {
+        "@cohesible/synapse-react": "spr:#synapse-react"
+    }
+}

@@ -31,8 +31,6 @@ interface ParsedConfig {
 // "verbatimModuleSyntax": true,
 // "noEmit": true,
 
-// TODO: code 18003 is when no input files were found
-
 function getDefaultTsConfig(targetFiles: string[]) {
     return {
         include: targetFiles,
@@ -51,16 +49,34 @@ function getDefaultTsConfig(targetFiles: string[]) {
     }
 }
 
+function checkTsDiags(diags: ts.Diagnostic[]) {
+    if (diags.length === 0) {
+        return
+    }
+
+    if (diags.length === 1 && diags[0].code === 18003) {
+        throw new Error('Nothing to compile!')
+    }
+
+    const formatted = ts.formatDiagnostics(diags, {
+        getNewLine: () => '\n\t',
+        getCurrentDirectory: () => getWorkingDir(),
+        getCanonicalFileName: x => x.toLowerCase(),
+    })
+
+    throw new Error(`Failed to parse "tsconfig.json":\n\t${formatted}`)
+}
+
 function getTsConfigFromText(configText: string | void, fileName: string, targetFiles?: string[]) {
     if (!configText) {
         getLogger().debug(`No tsconfig.json, using default`)
 
         return getDefaultTsConfig(targetFiles ?? ['*'])
     }
+
     const parseResult = ts.parseConfigFileTextToJson(fileName, configText)
     if (parseResult.error) {
-        // TODO: output the error better, does `typescript` have a way to do this? (yes it does)
-        throw Object.assign(new Error('Failed to parse "tsconfig.json"'), parseResult.error)
+        checkTsDiags([parseResult.error])
     }
 
     return parseResult.config
@@ -102,11 +118,7 @@ async function getTsConfig(
     function parse() {
         const config = getTsConfigFromText(text, fileName, targetFiles)
         const cmd = ts.parseJsonConfigFileContent(config, sys, workingDirectory, undefined, fileName)
-        if (cmd.errors.length > 0) {
-            // TODO: output the error better, does `typescript` have a way to do this? (yes it does)
-            //     ts.formatDiagnostic(d, {})
-            throw Object.assign(new Error('Failed to parse "tsconfig.json"'), cmd.errors)
-        }
+        checkTsDiags(cmd.errors)
     
         cmd.options.composite ??= true
         cmd.options.alwaysStrict ??= true
@@ -422,6 +434,7 @@ export async function resolveProgramConfig(opt?: CompilerOptions, targetFiles?: 
         includeJs: true,
         generateExports: true,
         excludeProviderTypes: true,
+        environmentName: bt.environmentName,
         ...mergeConfigs(pkgConfig, opt), 
     }
 

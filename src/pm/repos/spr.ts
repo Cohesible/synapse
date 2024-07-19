@@ -7,7 +7,7 @@ import { parseVersionConstraint } from '../versions'
 import { PackageInfo } from '../../runtime/modules/serdes'
 import { getFs } from '../../execution'
 import { extractTarball, extractToDir, hasBsdTar } from '../../utils/tar'
-import { listRemotePackages } from '../../workspaces'
+import { findRemotePackage, listRemotePackages } from '../../workspaces'
 
 export const sprPrefix = 'spr:'
 
@@ -31,23 +31,33 @@ export function createSynapsePackageRepo(): PackageRepository {
     async function listVersions(pkgId: string) {
         const manfiest = await getManifest(pkgId)
 
-        return Object.keys(manfiest)
+        return Object.keys(manfiest.versions)
     }
 
     async function resolvePattern(spec: string, pattern: string): Promise<ResolvePatternResult> {
         if (!pattern.startsWith('#')) {
-            throw new Error('Public packages not implemented')
+            throw new Error(`Public packages not implemented: ${pattern}`)
         }
 
+        const [name, version = '*'] = pattern.slice(1).split('@')
+
         const pkgs = await getPrivatePackages()
-        const pkgId = pkgs?.[pattern.slice(1)]
+        const pkgId = pkgs?.[name]
         if (!pkgId) {
-            throw new Error(`Package not found: ${pattern}`)
+            const found = await findRemotePackage(name)
+            if (found) {
+                return {
+                    name: found,
+                    version: parseVersionConstraint(version),
+                } 
+            }
+
+            throw new Error(`Package "${spec}" not found: ${pattern}`)
         }
 
         return {
             name: pkgId,
-            version: parseVersionConstraint('*'),
+            version: parseVersionConstraint(version),
         }
     }
 
@@ -73,6 +83,9 @@ export async function downloadSynapsePackage(info: PackageInfo, dest: string) {
 
     const publishedHash = integrity.slice('sha256:'.length)
     const data = await getClient().downloadPackage(publishedHash, info.name)
+    if (!data) {
+        throw new Error(`Failed to fetch data for package: ${info.name} [destination: ${dest}]`)
+    }
 
     const tarball = await gunzip(data)
     const files = extractTarball(tarball)

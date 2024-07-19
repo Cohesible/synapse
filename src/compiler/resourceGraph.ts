@@ -758,7 +758,7 @@ export function createResourceGraph(
             }
         }
 
-
+        // TODO: don't wait on this
         await setTypes(data)
     }
 

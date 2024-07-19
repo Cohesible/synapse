@@ -57,13 +57,13 @@ Synapse contains built-in interfaces for common cloud resources. These are split
 
 Everything involving running/executing code:
 * `Function` - simplest unit of compute; a "serverless" function
-* `HttpService` - creates an HTTP(S) endpoint. Routes can be added via the method `addRoute`. Routes follow the format `[method] [path-pattern]` e.g. `GET /hello/{name}` will match a GET request to `/hello/world`. Path parameters can be accessed using the first parameter of the route callback `req.pathParameters`:
+* `HttpService` - creates an HTTP(S) endpoint. Routes can be added via the method `route`. The first argument is the HTTP method/verb and second is the path-pattern e.g. `GET` and `/hello/{name}` will match a GET request to `/hello/world`. Path parameters can be accessed using the first parameter of the route callback `req.pathParameters`:
 
 ```ts
 import { HttpService } from 'synapse:srl/compute'
 
 const service = new HttpService() 
-service.addRoute('GET /hello/{name}', req => {
+service.route('GET', '/hello/{name}', req => {
     return new Response(`hello, ${req.pathParameters.name}`)
 })
 

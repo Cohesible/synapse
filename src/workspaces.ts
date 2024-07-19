@@ -585,14 +585,17 @@ async function getDefaultBranchCached(projectId: string) {
     }
 
     if (!proj.url) {
+        getLogger().debug(`Searching for git repo in ${proj.directory}`)
         const gitRepo = await findRepositoryDir(proj.directory)
         if (gitRepo) {
+            getLogger().debug(`Searching for remotes in ${gitRepo}`)
             const remotes = await listRemotes(gitRepo)
             proj.url = remotes[0]?.fetchUrl
         }
     }
 
     if (!proj.url) {
+        getLogger().debug(`No remote URL found for project ${proj.directory}`)
         return defaultBranchName
     }
 
@@ -690,12 +693,14 @@ async function updateProjectState(state: ProjectState, updatedBranches: string[]
     const ents = await getEntities()
     const remote = ents.projects[state.id]?.remote
     if (remote) {
-        await getProjectsClient().updateProject(remote, {
-            apps: state.apps,
-            packages: state.packages,
-            programs: state.programs,
-            importedPackages: state.importedPackages,
-        })
+        if (updatedBranches.length === 0) {
+            await getProjectsClient().updateProject(remote, {
+                apps: state.apps,
+                packages: state.packages,
+                programs: state.programs,
+                importedPackages: state.importedPackages,
+            })
+        }
 
         for (const b of updatedBranches) {
             const branch = state.branches?.[b]
@@ -1066,7 +1071,7 @@ export async function getRemoteProjectId(projectId: string) {
 async function getRemoteProject(projectId: string) {
     const ents = await getEntities()
     const proj = ents.projects[projectId]
-    if (!proj.url) {
+    if (!proj?.url) {
         return
     }
 
@@ -1224,6 +1229,34 @@ export async function listRemotePackages(projectId?: string) {
     }
 
     return result
+}
+
+
+export async function findRemotePackage(spec: string): Promise<string | undefined> {
+    const bt = getBuildTargetOrThrow()
+    const s = await getBranchAwareState(bt.projectId, bt.branchName)
+    const state = s?.branch ?? s?.state
+    if (!state) {
+        return
+    }
+
+    for (const [k, v] of Object.entries(state.programs)) {
+        if (!v.appId) continue
+
+        const app = state.apps[v.appId]
+        if (!app) continue
+
+        const env = app.environments[bt.environmentName ?? app.defaultEnvironment ?? 'local']
+        if (!env.packageId) continue
+
+        const dir = v.workingDirectory ? path.resolve(bt.rootDirectory, v.workingDirectory) : bt.rootDirectory
+        const pkgJson = await getPackageJson(getFs(), dir, false)
+        if (!pkgJson) continue
+
+        if (pkgJson.data.name === spec) {
+            return env.packageId
+        }
+    }
 }
 
 async function tryGetBranch(projId: string, branchName: string) {

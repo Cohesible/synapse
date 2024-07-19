@@ -1,7 +1,7 @@
 import ts from 'typescript'
 import * as path from 'node:path'
 import { getProviderCacheDir, getProviderTypesDirectory, getGlobalCacheDirectory, getWorkingDir } from '../workspaces'
-import { capitalize, memoize, toAmbientDeclarationFile, toSnakeCase } from '../utils'
+import { capitalize, createVariableStatement, memoize, toAmbientDeclarationFile, toSnakeCase } from '../utils'
 import { providerPrefix } from '../runtime/loader'
 import { Fs, SyncFs } from '../system'
 import { runCommand } from '../utils/process'
@@ -480,6 +480,11 @@ async function generateProvider(fs: Fs, provider: ProviderInfo, outdir: string, 
     const map = new Map<string, Element>()
     const outfile: ts.Statement[] = []
 
+    outfile.push(createVariableStatement(
+        'version', 
+        ts.factory.createStringLiteral(provider.version), 
+        [ts.SyntaxKind.ExportKeyword]
+    ))
 
     const providerName = `${capitalize(provider.name)}Provider`
     outfile.push(...generateConstruct(providerName, provider.schema.provider, mapper.createSubmapper(providerName), 'provider'))
@@ -512,17 +517,18 @@ async function generateProvider(fs: Fs, provider: ProviderInfo, outdir: string, 
     indexfile.push('"use strict";')
     indexfile.push('const terraform = require("synapse:terraform");')
 
-    if (generateLazyBindings) {
-        indexfile.push('function bindClass(name, fn) {')
-        indexfile.push('    let v;')
-        indexfile.push('    const get = () => v ??= terraform.createTerraformClass(...fn());')
-        indexfile.push('    Object.defineProperty(exports, name, { get });')
-        indexfile.push('}')
-    } else {
-        indexfile.push('function bindClass(name, type, kind, mappings, version, source) {')
-        indexfile.push('    exports[name] = terraform.createTerraformClass(type, kind, mappings, version, source);')
-        indexfile.push('}')
-    }
+    // `package.json` also has the version but this is more convenient
+    indexfile.push(`exports.version = '${provider.version}'`)
+
+    indexfile.push('function bindClass(name, fn) {')
+    indexfile.push('    let v;')
+    indexfile.push('    const get = () => v ??= terraform.createTerraformClass(...fn());')
+    indexfile.push('    Object.defineProperty(exports, name, { get });')
+    indexfile.push('}')
+
+    indexfile.push('function eagerBindClass(name, type, kind, mappings, version, source) {')
+    indexfile.push('    exports[name] = terraform.createTerraformClass(type, kind, mappings, version, source);')
+    indexfile.push('}')
 
     for (const [k, v] of map.entries()) {
         const mappings = mapper.mappings[k]
@@ -537,10 +543,10 @@ async function generateProvider(fs: Fs, provider: ProviderInfo, outdir: string, 
             args.push(v.version, v.source)
         }
 
-        if (generateLazyBindings) {
+        if (generateLazyBindings && v.kind !== 'provider') {
             indexfile.push(`bindClass('${args[0]}', () => JSON.parse('${JSON.stringify(args.slice(1))}'));`)
         } else {
-            indexfile.push(`bindClass(...JSON.parse('${JSON.stringify(args)}'));`)
+            indexfile.push(`eagerBindClass(...JSON.parse('${JSON.stringify(args)}'));`)
         }
     }
 
@@ -706,29 +712,53 @@ interface ProviderInfo extends ResolvedProviderConfig {
     readonly schema: ProviderSchema
 }
 
-export function getProviderSource(name: string, providerRegistryHostname?: string) {
-    switch (name) {
-        // case 'aws':
-        //     return `${providerRegistryHostname}/cohesible/aws`
-        case 'github':
-            return 'registry.terraform.io/integrations/github'
-        case 'fly':
-            return 'registry.terraform.io/fly-apps/fly'
+const defaultTfRegistry = 'registry.terraform.io'
 
+export function getProviderSource(name: string) {
+    if (name.includes('.')) {
+        return name
+    }
+
+    if (name.includes('/')) {
+        return `${defaultTfRegistry}/${name}`
+    }
+
+    switch (name) {
         // Built-ins
         case 'synapse':
         case 'terraform':
             return `terraform.io/builtin/${name}`
 
+        case 'fly':
+            return `${defaultTfRegistry}/fly-apps/fly`    
+        case 'github':
+            return `${defaultTfRegistry}/integrations/github`
+
         default:
-            return `registry.terraform.io/hashicorp/${name}`
+            return `${defaultTfRegistry}/hashicorp/${name}`
     }
 }
 
-export async function listProviderVersions(name: string, providerRegistryHostname?: string, terraformPath = 'terraform') {
-    const source = name.includes('/') ? name : getProviderSource(name, providerRegistryHostname)
+// TODO: search for providers. 
+// We should automatically pick a provider if there's only one with a given name.
+// `package.json` could be updated with the resolved name to reduce fragility
+// https://registry.terraform.io/v2/providers?filter[tier]=partner&page[number]=7&page[size]=50&sort=-featured,tier,name
 
-    return listVersions(terraformPath, source)
+interface ProviderRegistryResponse {
+    readonly data: {
+        type: 'providers'
+        attributes: {
+            name: string
+            namespace: string
+            'full-name': string
+            unlisted?: boolean
+            warning?: string
+        }
+    }[]
+}
+
+export async function listProviderVersions(name: string, providerRegistryHostname?: string, terraformPath = 'terraform') {
+    return listVersions(terraformPath, getProviderSource(name))
 }
 
 export function createProviderGenerator(fs: Fs & SyncFs, providerRegistryHostname: string, terraformPath = 'terraform') {
@@ -737,7 +767,7 @@ export function createProviderGenerator(fs: Fs & SyncFs, providerRegistryHostnam
     const packagesDir = path.resolve(providersDir, 'packages')
 
     async function resolveProvider(provider: ProviderConfig): Promise<ResolvedProviderConfig> {
-        const source = provider.source ?? getProviderSource(provider.name, providerRegistryHostname)
+        const source = provider.source ?? getProviderSource(provider.name)
         const version = provider.version ?? (await listVersions(terraformPath, source))[0]
         
         return {
@@ -767,30 +797,11 @@ export function createProviderGenerator(fs: Fs & SyncFs, providerRegistryHostnam
         }
     }
 
-    const getInstalledProviders = memoize(async function (): Promise<Record<string, string>> {
-        const pkgManifest = path.resolve(providersDir, 'manifest.json')
-
-        try {
-            return JSON.parse(await fs.readFile(pkgManifest, 'utf-8'))
-        } catch (e) {
-            if ((e as any).code !== 'ENOENT') {
-                throw e
-            }
-            return {}
-        }
-    })
-
     async function generate(provider: ProviderConfig, dest?: string) {
         const resolved = await resolveProvider(provider)
         const info = { ...resolved, schema: await getSchema(resolved) }
         const outdir = dest ?? path.resolve(packagesDir, resolved.source, resolved.version)
-
-        const pkgManifest = path.resolve(providersDir, 'manifest.json')
-        const manifest = await getInstalledProviders()
-
         const pkgDest = await generateProvider(fs, info, outdir)
-        manifest[provider.name] = path.relative(providersDir, pkgDest)
-        await fs.writeFile(pkgManifest, JSON.stringify(manifest, undefined, 4))
 
         return {
             ...resolved,

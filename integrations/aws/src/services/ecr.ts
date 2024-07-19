@@ -7,6 +7,7 @@ import * as child_process from 'node:child_process'
 import * as ECR from '@aws-sdk/client-ecr'
 import * as ECRPublic from '@aws-sdk/client-ecr-public'
 import { getFileHash } from '../utils'
+import { addResourceStatement } from '../permissions'
 
 interface DockerfileProps {
     baseImage?: string
@@ -155,28 +156,31 @@ export async function deployToEcr(props: EcrDockerfileDeployment) {
 }
 
 // ONLY RELEVANT FOR PRIVATE ECR
-core.bindFunctionModel(deployToEcr, [
-    {
-        "Action": [
-            "ecr:BatchCheckLayerAvailability",
-            "ecr:BatchGetImage",
-            "ecr:CompleteLayerUpload",
-            "ecr:GetDownloadUrlForLayer",
-            "ecr:InitiateLayerUpload",
-            "ecr:PutImage",
-            "ecr:UploadLayerPart"
+core.bindFunctionModel(deployToEcr, function (req) {
+    addResourceStatement({
+        service: 'ecr',
+        action: [
+            "BatchCheckLayerAvailability",
+            "BatchGetImage",
+            "CompleteLayerUpload",
+            "GetDownloadUrlForLayer",
+            "InitiateLayerUpload",
+            "PutImage",
+            "UploadLayerPart"
         ],
-        "Effect": "Allow",
-        "Resource":"arn:{context.Partition}:ecr:{0.region}:{context.Account}:repository/{0.tagName}" // <-- THIS IS BASED OFF THE REPO NAME
-    },
-    {
-        "Action": [
-            "ecr:GetAuthorizationToken"
-        ],
-        "Effect": "Allow",
-        "Resource": "arn:{context.Partition}:ecr:{0.region}:{context.Account}:*"
-    }
-])
+        resource: `repository/*`,
+        region: req.region,
+    }, this)
+
+    addResourceStatement({
+        service: 'ecr',
+        action: 'GetAuthorizationToken',
+        resource: `*`,
+        region: req.region,
+    }, this)
+
+    return core.createUnknown()
+})
 
 interface DockerImageSummary {
     ID: string // Build ID

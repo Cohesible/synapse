@@ -1,6 +1,7 @@
 import * as core from 'synapse:core'
 import * as aws from 'synapse-provider:aws'
 import { HostedZone } from './route53'
+import { addResourceStatement } from '../permissions'
 
 export class Certificate {
     public readonly resource: aws.AcmCertificate
@@ -49,29 +50,17 @@ export class Certificate {
 
 // https://docs.aws.amazon.com/acm/latest/userguide/authen-apipermissions.html
 core.bindConstructorModel(aws.AcmCertificate, function () {
-    const resourceId = (id?: string) => `arn:aws:acm:${this.$context.regionId}:${this.$context.regionId}:certificate/${id ?? '*'}`
+    const addCertStatement = (action: string | string[], lifecycle: 'create' | 'update' | 'delete' | 'read', resource = '*') => {
+        addResourceStatement({
+            service: 'acm',
+            action,
+            lifecycle: [lifecycle],
+            resource: `certificate/${resource}`
+        }, this)
+    }
 
-    this.$context.addStatement({
-        Action: 'acm:RequestCertificate',
-        Resource: resourceId(),
-        Lifecycle: ['create'],
-    })
-
-    this.$context.addStatement({
-        Action: 'acm:UpdateCertificateOptions',
-        Resource: resourceId(this.id),
-        Lifecycle: ['update'],
-    })
-
-    this.$context.addStatement({
-        Action: 'acm:DeleteCertificate',
-        Resource: resourceId(this.id),
-        Lifecycle: ['delete'],
-    })
-
-    this.$context.addStatement({
-        Action: ['acm:GetCertificate', 'acm:DescribeCertificate'],
-        Resource: resourceId(this.id),
-        Lifecycle: ['read'],
-    })
+    addCertStatement('RequestCertificate', 'create')
+    addCertStatement('UpdateCertificateOptions', 'update', this.id)
+    addCertStatement('DeleteCertificate', 'delete', this.id)
+    addCertStatement(['GetCertificate', 'DescribeCertificate'], 'read', this.id)
 })

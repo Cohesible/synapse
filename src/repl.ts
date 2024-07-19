@@ -130,6 +130,7 @@ async function createRepl(
     const historyDir = path.resolve(getUserSynapseDirectory(), 'repl-history')
     await ensureDir(historyDir)
 
+    // TODO: use the target file if provided
     const historyFile = path.resolve(historyDir, getHash(toProgramRef(getBuildTargetOrThrow())))
     instance.setupHistory(historyFile, err => {
         if (err) {

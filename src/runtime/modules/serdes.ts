@@ -533,7 +533,7 @@ function normalize(str: string) {
     return [first, ...rest.map(capitalize)].join('')
 }
 
-function normalizeTerraform(obj: any): any {
+export function normalizeTerraform(obj: any): any {
     if (typeof obj !== 'object' || !obj) {
         return obj
     }

@@ -43,6 +43,7 @@ export interface DeployOptions {
 
     syncAfter?: boolean // For CI
     noSave?: boolean
+    loadRegistry?: boolean
 
     // XXX
     /** @deprecated */

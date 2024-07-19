@@ -4,6 +4,7 @@ import { RegionInputConfig } from '@smithy/config-resolver'
 import { AwsAuthInputConfig } from '@aws-sdk/middleware-signing'
 import { assumeRole } from './iam'
 import { Account } from './organizations'
+import { addStatement } from '../permissions'
 
 function createCredentialsProvider(roleArn: string) {
     return async function getCredentials() {
@@ -36,10 +37,8 @@ export function createCrossAccountClient<T>(account: Account, Client: new (confi
     core.bindModel(
         Client, 
         Object.fromEntries(
-            Object.keys(Client.prototype).map(k => [k, {
-                Effect: 'Allow',
-                Action: 'sts:AssumeRole',
-                Resource: roleArn,
+            Object.keys(Client.prototype).map(k => [k, function () {
+                addStatement({ Effect: 'Allow', Action: 'sts:AssumeRole', Resource: roleArn })
             }] as const)
         ) as any
     )

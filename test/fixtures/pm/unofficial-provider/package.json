@@ -1,0 +1,7 @@
+{
+    "synapse": {
+        "providers": {
+            "aliyun/alicloud": "*"
+        }
+    }
+}

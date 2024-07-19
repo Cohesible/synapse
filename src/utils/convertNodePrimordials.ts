@@ -61,6 +61,7 @@ function createPromiseMapper(name: string): Matcher {
     }
 }
 
+
 function createIterTransform(): Matcher {
     return {
         matchType: [ts.SyntaxKind.NewExpression],
@@ -89,13 +90,6 @@ function createIterTransform(): Matcher {
                 node.statement,
             )
         },
-    }
-}
-
-function Identity(): Matcher {
-    return {
-        matchType: ts.SyntaxKind.Identifier,
-        fn: n => n,
     }
 }
 

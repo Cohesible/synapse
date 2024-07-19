@@ -2,6 +2,7 @@ import type { TerraformSourceMap, Symbol, TfJson } from './runtime/modules/terra
 import { createMinHeap, createTrie, isNonNullable, keyedMemoize, levenshteinDistance } from './utils'
 import { getLogger } from '.'
 import { parseModuleName } from './templates'
+import { TfState } from './deploy/state'
 
 interface Node<T = unknown> {
     readonly value: T
@@ -445,6 +446,27 @@ function createSimilarityHost() {
     return { ld, getSize, getDist }
 }
 
+export interface ResolvedScope {
+    isNewExpression?: boolean
+    callSite: Symbol
+    assignment?: Symbol
+    namespace?: Symbol[]
+}
+
+export function getRenderedStatementFromScope(scope: ResolvedScope): string {
+    const nameParts = [scope.callSite.name]
+    if (scope.namespace) {
+        nameParts.unshift(...scope.namespace.map(n => n.name))
+    }
+
+    const exp = `${scope.isNewExpression ? 'new ' : ''}${nameParts.join('.')}`
+    const name = scope.assignment !== undefined 
+        ? `${scope.assignment.name} = ${exp}` 
+        : exp
+
+    return name
+}
+
 export type SymbolGraph = ReturnType<typeof createSymbolGraph>
 export function createSymbolGraph(sourceMap: TerraformSourceMap, resources: Record<string, any>) {
     let idCounter = 0
@@ -456,18 +478,17 @@ export function createSymbolGraph(sourceMap: TerraformSourceMap, resources: Reco
 
     type Scope = { isNewExpression?: boolean; callSite: number; assignment?: number; namespace?: number[] }
 
+    function resolveScope(scope: Scope): ResolvedScope {
+        return {
+            callSite: sourceMap.symbols[scope.callSite],
+            namespace: scope.namespace?.map(id => sourceMap.symbols[id]),
+            assignment: scope.assignment ? sourceMap.symbols[scope.assignment] : undefined,
+            isNewExpression: scope.isNewExpression,
+        }
+    }
+
     function createSymbolNode(scope: Scope) {
         const id = scope.callSite
-        const base = sourceMap.symbols[id].name
-        const nameParts = [base]
-        if (scope.namespace) {
-            nameParts.unshift(...scope.namespace.map(n => sourceMap.symbols[n].name))
-        }
-
-        const exp = `${scope.isNewExpression ? 'new ' : ''}${nameParts.join('.')}`
-        const name = scope.assignment !== undefined 
-            ? `${sourceMap.symbols[scope.assignment].name} = ${exp}` 
-            : exp
 
         return createTypedNode('symbol', {
             ...sourceMap.symbols[id],
@@ -475,7 +496,7 @@ export function createSymbolGraph(sourceMap: TerraformSourceMap, resources: Reco
             resources: [],
             // FIXME: don't clobber the original name
             // Might need to add a separate field
-            name,
+            name: getRenderedStatementFromScope(resolveScope(scope)),
         })
     }
 
@@ -526,7 +547,7 @@ export function createSymbolGraph(sourceMap: TerraformSourceMap, resources: Reco
             subtype: rType === 'synapse_resource' ? config.type : undefined,
             name: rName,
             config: { ...config, type: undefined },
-            scope: [],
+            scopes: v.scopes.map(resolveScope),
             fileName: '',
         }
 
@@ -748,7 +769,7 @@ interface Resource {
     readonly name: string
     readonly config: any
     readonly subtype?: string
-    readonly scope: number[]
+    readonly scopes: ResolvedScope[]
     readonly fileName: string
 }
 
@@ -1743,6 +1764,188 @@ export function renderSymbol(sym: Symbol, includeFileName = true, includePositio
     const suffix = includeFileName ? ` ${renderSymbolLocation(sym, includePosition)}` : ''
 
     return `${sym.name}${suffix}`
+}
+
+export function evaluateMoveCommands(template: TfJson, state: TfState) {
+    const commands = template['//']?.moveCommands
+    if (!commands || commands.length === 0) {
+        return
+    }
+
+    const resources: Record<string, Record<string, any>> = {}
+    for (const [k, v] of Object.entries(template.resource)) {
+        for (const [k2, v2] of Object.entries(v)) {
+            const byType = resources[k2] ??= {}
+            byType[k] = v2
+        }
+    }
+
+    function findResources(params: { prefix: string; suffix: string; types: string[]; middle?: string }) {
+        const matched: TfState['resources'] = []
+        for (const r of state.resources) {
+            if (!r.name.startsWith(params.prefix) || !r.name.endsWith(params.suffix)) {
+                continue
+            }
+
+            if (params.middle) {
+                const sliced = r.name.slice(params.prefix.length, -params.suffix.length)
+                if (!sliced.includes(params.middle)) {
+                    continue
+                }
+            }
+
+            if (params.types.includes(r.type)) {
+                matched.push(r)
+            }
+        }
+
+        return matched
+    }
+
+    const conflictedTo = new Set<string>()
+    const conflictedFrom = new Set<string>()
+
+    const moved: { from: string; to: string }[] = []
+    for (const cmd of commands) {
+        const matchedTemplates: Record<string, Record<string, any>> = {}
+        for (const [k, v] of Object.entries(resources)) {
+            if (k.startsWith(cmd.scope) && !conflictedTo.has(k)) {
+                matchedTemplates[k] = v
+            }
+        }
+
+        function getPrefixAndSuffix(key: string) {
+            if (cmd.name.startsWith('this.')) {
+                const [module, ...rem] = cmd.scope.split('_') 
+                const scope = rem.join('_')
+
+                const parts = scope.split('--')
+                const middle = [parts.at(-2), cmd.name.slice('this.'.length)].join('--')
+                if (parts.length === 2) {
+                    return {
+                        prefix: module + '_',
+                        middle,
+                        suffix: key.slice(cmd.scope.length),
+                    }
+                }
+
+                return {
+                    prefix: module + '_' + parts.slice(0, -2).join('--'),
+                    middle,
+                    suffix: key.slice(cmd.scope.length),
+                }
+            }
+
+            const prevScope = [...cmd.scope.split('--').slice(0, -1), cmd.name].join('--')
+
+            return {
+                prefix: prevScope,
+                suffix: key.slice(cmd.scope.length),
+            }
+        }
+
+        for (const [k, v] of Object.entries(matchedTemplates)) {
+            const matchedResources = findResources({
+                ...getPrefixAndSuffix(k),
+                types: Object.keys(v),
+            })
+
+            for (const r of matchedResources) {
+                if (conflictedFrom.has(`${r.type}.${r.name}`)) continue
+
+                const from = `${r.type}.${r.name}`
+                const to = `${r.type}.${k}`
+                if (from !== to) {
+                    const conflicts: number[] = []
+                    for (let i = 0; i < moved.length; i++) {
+                        if ((moved[i].from === from || moved[i].to === to) && !(moved[i].from === from && moved[i].to === to)) {
+                            conflicts.push(i)
+                        }
+                    }
+
+                    if (conflicts.length > 0) {
+                        getLogger().debug(`skipping refactor match due conflicting move: ${from} ---> ${to}`)
+
+                        for (const index of conflicts.reverse()) {
+                            const { from, to } = moved[index]
+                            conflictedFrom.add(from)
+                            conflictedTo.add(to)
+                            moved.splice(index, 1)
+                        }
+
+                        continue
+                    }
+
+                    moved.push({ from, to })
+                }
+            }
+        }
+    }
+
+    return moved
+}
+
+interface Move {
+    from: string
+    to: string 
+}
+
+export interface MoveWithSymbols {
+    from: string
+    to: string
+    fromSymbol: Symbol
+    toSymbol: Symbol
+}
+
+function getMoveWithSymbols(move: Move, oldGraph: SymbolGraph, newGraph: SymbolGraph) {
+    const fromSymbol = oldGraph.findSymbolFromResourceKey(move.from)?.value
+    const toSymbol = newGraph.findSymbolFromResourceKey(move.to)?.value
+    if (!fromSymbol || !toSymbol) {
+        return
+    }
+
+    if (renderSymbol(fromSymbol) !== renderSymbol(toSymbol)) {
+        return {
+            ...move,
+            fromSymbol,
+            toSymbol,
+        }
+    }
+
+    const from = fromSymbol.resources.find(r => `${r.type}.${r.name}` === move.from)
+    const to = toSymbol.resources.find(r => `${r.type}.${r.name}` === move.to)
+    if (!from || !to) {
+        return
+    }
+
+    const minLen = Math.min(from.scopes.length, to.scopes.length)
+    for (let i = 1; i < minLen; i++) {
+        const fromScope = from.scopes[i]
+        const toScope = to.scopes[i]
+
+        const fromName = getRenderedStatementFromScope(fromScope) 
+        const toName = getRenderedStatementFromScope(toScope) 
+        if (fromScope.callSite.fileName === toScope.callSite.fileName && fromName === toName) {
+            continue
+        }
+
+        return {
+            ...move,
+            fromSymbol: { ...fromScope.callSite, name: fromName, column: fromScope.assignment?.column ?? fromScope.callSite.column },
+            toSymbol: { ...toScope.callSite, name: toName, column: toScope.assignment?.column ?? toScope.callSite.column }
+        }
+    }
+}
+
+export function getMovesWithSymbols(moves: Move[], oldGraph: SymbolGraph, newGraph: SymbolGraph) {
+    const result: MoveWithSymbols[] = []
+    for (const m of moves) {
+        const move = getMoveWithSymbols(m, oldGraph, newGraph)
+        if (move) {
+            result.push(move)
+        }
+    }
+    return result
 }
 
 // TODO:

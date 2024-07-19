@@ -15,10 +15,6 @@ interface Entity {
     readonly kind: TerraformElement['kind']
 }
 
-interface StringLiteral {
-    readonly value: number | string | object
-}
-
 enum ExpressionKind {
     NumberLiteral,
     Reference,
@@ -140,12 +136,12 @@ function isObjectOrNullPrototype(proto: any) {
 }
 
 export function isGeneratedClassConstructor(o: any) {
-    if (Object.prototype.hasOwnProperty.call(o, terraformClass)) {
+    if (Object.prototype.hasOwnProperty.call(o, terraformClassKey)) {
         return true
     }
 
     const proto = Object.getPrototypeOf(o)
-    if (proto && Object.prototype.hasOwnProperty.call(proto, terraformClass)) {
+    if (proto && Object.prototype.hasOwnProperty.call(proto, terraformClassKey)) {
         return true
     }
 
@@ -167,10 +163,11 @@ if (Symbol.asyncDispose) {
 const permissions = Symbol.for('synapse.permissions')
 const browserImpl = Symbol.for('synapse.browserImpl')
 const objectId = Symbol.for('synapse.objectId')
+export const stubWhenBundled = Symbol.for('synapse.stubWhenBundled')
 
 const unproxy = Symbol.for('unproxy')
 const symbolId = Symbol.for('symbolId') // Used to track references when capturing
-const serializeableSymbols = new Set([permissions, browserImpl, objectId, ...knownSymbols])
+const serializeableSymbols = new Set([permissions, browserImpl, objectId, stubWhenBundled, ...knownSymbols])
 const reflectionType = Symbol.for('reflectionType')
 
 function getSymbols(o: any) {
@@ -403,7 +400,7 @@ export function createSerializer(
     }
 
     class DataClass {
-        static [terraformClass] = true
+        static [terraformClassKey] = 'local'
         constructor(obj: any, data: { encoded: any, isMoveable: boolean, deps: string[], idOverride?: string }) {
             if (!objectTable.get(obj)) {
                 throw new Error(`Object was never registered: ${data}`)
@@ -509,14 +506,14 @@ export function createSerializer(
                     if (serializeableResourceClasses.has(subtype)) {
                         const exp = (obj as any)[expressionSym]
                         if (exp.kind === ExpressionKind.Reference) {
-                            const val = (obj as any)[synapseOutput]
+                            const val = (obj as any)[classOutputSym]
 
                             // Dervived classes of `ConstructClass`
                             if (obj.constructor && !isGeneratedClassConstructor(obj.constructor) && !isObjectOrNullPrototype(Object.getPrototypeOf(obj))) {
                                 return {
                                     id,
-                                    properties: val, // FIXME: doesn't handle extra props
                                     valueType: 'object',
+                                    properties: val, // FIXME: doesn't handle extra props
                                     constructor: serialize(obj.constructor),
                                 }
                             }
@@ -606,8 +603,8 @@ export function createSerializer(
                             return {
                                 id: boundId,
                                 valueType: 'binding',
-                                key,
                                 value: ref,
+                                key,
                             }
                         }
     
@@ -744,9 +741,18 @@ export function createSerializer(
         }
     
         function serializeObjectLiteral(obj: any) {
-            return obj ? Object.fromEntries(
-                Object.entries(obj).map(([k, v]) => [k, serialize(v)])
-            ) : undefined
+            if (!obj) {
+                return
+            }
+
+            // `Object.keys` is the fastest way to iterate over an object in v8
+            // For whatever reason, it also appears to make `Object.entries` faster
+            // after v8 optimizes the code.
+            const r: any = {}
+            for (const k of Object.keys(obj)) {
+                r[k] = serialize(obj[k])
+            }
+            return r
         }
     
         function serializeFullObject(id: number | string, obj: any) {
@@ -759,19 +765,16 @@ export function createSerializer(
                 ;(decomposed as any).__constructor = ctor
             }
     
-            const desc = {
-                valueType: 'object',
-                ...decomposed
-            }
-    
-            const finalDesc = (serializeSym in obj && typeof obj[serializeSym] === 'function') ? obj[serializeSym](desc) : desc
-    
+            const finalDesc = (serializeSym in obj && typeof obj[serializeSym] === 'function') 
+                ? obj[serializeSym](decomposed) 
+                : decomposed
+
             return {
                 id,
-                valueType: finalDesc.valueType,
-                prototype: serialize(finalDesc.__prototype),
-                constructor: serialize(finalDesc.__constructor),
+                valueType: 'object',
                 properties: serializeObjectLiteral(finalDesc.properties),
+                constructor: serialize(finalDesc.__constructor),
+                prototype: serialize(finalDesc.__prototype),
                 descriptors: serializeObjectLiteral(finalDesc.descriptors),
                 __privateFields: serializeObjectLiteral(finalDesc.__privateFields),
                 symbols: serializeObjectLiteral(finalDesc.symbols),
@@ -1333,6 +1336,7 @@ interface Extensions {
     deployTarget?: string
     secrets?: Record<string, string> // TODO: make secrets into a proper data source
     sourceMap?: TerraformSourceMap
+    moveCommands?: { scope: string; name: string }[]
 }
 
 function initTfJson(): TfJson {
@@ -1496,6 +1500,7 @@ function emitTerraformJson(
     }
 
     tfJson['//']!.sourceMap = sourceMapper.getSourceMap()
+    tfJson['//']!.moveCommands = moveCommands
 
     deleteEmptyKeys(tfJson)
 
@@ -1528,6 +1533,21 @@ export function isElement(o: unknown): o is { [internalState]: TerraformElement 
         internalState in o &&
         typeof o[internalState] === 'object'
     )
+}
+
+export function getClassKey(o: unknown): string | undefined {
+    if (typeof o !== 'function') {
+        return
+    }
+
+    const base = (o as any)[terraformClassKey]
+    if (base !== 'resource.synapse_resource.Custom') {
+        return base
+    }
+
+    const usertype = (o as any)[customClassKey]
+
+    return usertype ? `${base}.${usertype}` : base
 }
 
 const getElementKey = (element: Entity & { module?: string }) => `${element.module ?? 'global'}_${element.kind}_${element.type}_${element.name}`
@@ -1681,6 +1701,28 @@ export function getAllResources(obj: any, keepExpressions = false, visited = new
     return getAllResources(Array.from(Object.values(obj)), keepExpressions, visited)
 }
 
+const moveCommands: { scope: string; name: string }[] = []
+export function move(from: string, to?: string): void {
+    const scope = getScopedId()
+    if (!scope) {
+        throw new Error(`Failed to move "${from}": not within a scope`)
+    }
+
+    if (to) {
+        moveCommands.push({
+            name: from,
+            scope: `${scope}--${to}`,
+        })
+
+        return
+    }
+
+    moveCommands.push({
+        name: from,
+        scope,
+    })
+}
+
 function getTestContext() {
     const contexts = getProviders()
     const testSuite = contexts['test-suite']?.[0]
@@ -1699,17 +1741,31 @@ function getTerraformProviders(): Record<string, { [internalState]: TerraformEle
     )
 }
 
+declare var __getDefaultProvider: (type: string) => any | undefined
+function getDefaultProvider(type: string) {
+    if (typeof __getDefaultProvider === 'undefined') {
+        return
+    }
+
+    return __getDefaultProvider(type)
+}
+
+declare var __registerProvider: (cls: new () => any) => boolean
+function registerProvider(cls: new () => any) {
+    if (typeof __registerProvider === 'undefined') {
+        return false
+    }
+
+    return __registerProvider(cls)
+}
+
 function getProviderForElement(element: { name: string, type: string }) {
     const allProviders = getTerraformProviders()
     const elementProviderType = element.type.split('_').shift()!
 
     const slotted = allProviders[elementProviderType]
-    const matched = slotted?.[0]
+    const matched = slotted?.[0] ?? getDefaultProvider(elementProviderType)
     if (!matched) {
-        // Automatic init??
-        // console.log('current providers',slotted?.map(p => p[internalState].name + ' ' + `(${p[internalState].type})`))
-        console.log('current providers (unfiltered)', getProviders())
-
         throw new Error(`No provider found for element: ${element.name} (${element.type})`)
     }
 
@@ -1742,7 +1798,7 @@ export function createTerraformClass<T = any>(
     const isSynapse = type === 'synapse_resource'
 
     const c = class {
-        static [terraformClass] = true
+        static [terraformClassKey] = `${kind}.${type}`
         static [peekNameSym] = () => `${type}.${peekName(type, kind, getScopedId(true))}`
 
         constructor(...args: any[]) {
@@ -1786,12 +1842,14 @@ export function createTerraformClass<T = any>(
             value: type,
             enumerable: true,
         })
+
+        registerProvider(c)
     }
 
     return c
 }
 
-const synapseOutput = Symbol.for('synapseClassOutput')
+export const classOutputSym = Symbol('classOutput')
 
 export function createSynapseClass<T, U>(
     type: string,
@@ -1800,7 +1858,7 @@ export function createSynapseClass<T, U>(
     const tfType = kind === 'provider' ? 'synapse' : 'synapse_resource'
 
     const cls = class extends createTerraformClass(tfType, kind) {
-        static [terraformClass] = true
+        static [terraformClassKey] = `${kind}.${tfType}.${type}`
 
         public constructor(config: T) {
             if (kind === 'provider') {
@@ -1815,7 +1873,7 @@ export function createSynapseClass<T, U>(
 
             return new Proxy(_this, {
                 get: (target, prop, recv) => {
-                    if (prop === synapseOutput) {
+                    if (prop === classOutputSym) {
                         return _this.output
                     }
 
@@ -1880,7 +1938,16 @@ export interface State {
     secrets: Map<string, string>
 }
 
-const terraformClass = Symbol.for('terraformClass')
+const terraformClassKey = Symbol('terraformClassKey')
+export function isProviderClass(o: any) {
+    if (typeof o !== 'function') {
+        return false
+    }
+
+    return o[terraformClassKey]?.startsWith('provider')
+}
+
+export const customClassKey = Symbol('customClassKey')
 
 let globalFunctions: {
     getState: () => State,

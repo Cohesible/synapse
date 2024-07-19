@@ -380,7 +380,9 @@ function detectIndentLevel(jsonText: string) {
 }
 
 export function createSynapseProviderRequirement(name: string, constraint: string) {
-    return [`${providerPrefix}${name}`, `spr:_provider-${name}:${constraint}`] as const
+    const base = name.split('/').pop()!
+
+    return [`${providerPrefix}${base}`, `spr:_provider-${name}:${constraint}`] as const
 }
 
 export function isFileUrl(version: string) {

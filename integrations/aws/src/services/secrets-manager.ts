@@ -52,35 +52,35 @@ const SecretUploader = core.defineResource({
 })
 
 core.addTarget(storage.Secret, Secret, 'aws')
-core.bindModel(SecretsManager.SecretsManager, {
-    'getSecretValue': {
-        'Effect': 'Allow',
-        'Action': 'secretsmanager:GetSecretValue',
-        'Resource': 'arn:{context.Partition}:secretsmanager:{context.Region}:{context.Account}:secret:{0.SecretId}' 
-    },
-    'createSecret': {
-        'Effect': 'Allow',
-        'Action': 'secretsmanager:CreateSecret',
-        'Resource': '*' 
-    },
-    'deleteSecret': {
-        'Effect': 'Allow',
-        'Action': 'secretsmanager:DeleteSecret',
-        'Resource': 'arn:{context.Partition}:secretsmanager:{context.Region}:{context.Account}:secret:{0.SecretId}' 
-    },
-    'updateSecret': {
-        'Effect': 'Allow',
-        'Action': 'secretsmanager:UpdateSecret',
-        'Resource': 'arn:{context.Partition}:secretsmanager:{context.Region}:{context.Account}:secret:{0.SecretId}' 
-    },
-    'listSecrets': {
-        'Effect': 'Allow',
-        'Action': 'secretsmanager:ListSecrets',
-        'Resource': '*' 
-    },
-    'putSecretValue': {
-        'Effect': 'Allow',
-        'Action': 'secretsmanager:PutSecretValue',
-        'Resource': 'arn:{context.Partition}:secretsmanager:{context.Region}:{context.Account}:secret:{0.SecretId}'
-    }   
-})
+// core.bindModel(SecretsManager.SecretsManager, {
+//     'getSecretValue': {
+//         'Effect': 'Allow',
+//         'Action': 'secretsmanager:GetSecretValue',
+//         'Resource': 'arn:{context.Partition}:secretsmanager:{context.Region}:{context.Account}:secret:{0.SecretId}' 
+//     },
+//     'createSecret': {
+//         'Effect': 'Allow',
+//         'Action': 'secretsmanager:CreateSecret',
+//         'Resource': '*' 
+//     },
+//     'deleteSecret': {
+//         'Effect': 'Allow',
+//         'Action': 'secretsmanager:DeleteSecret',
+//         'Resource': 'arn:{context.Partition}:secretsmanager:{context.Region}:{context.Account}:secret:{0.SecretId}' 
+//     },
+//     'updateSecret': {
+//         'Effect': 'Allow',
+//         'Action': 'secretsmanager:UpdateSecret',
+//         'Resource': 'arn:{context.Partition}:secretsmanager:{context.Region}:{context.Account}:secret:{0.SecretId}' 
+//     },
+//     'listSecrets': {
+//         'Effect': 'Allow',
+//         'Action': 'secretsmanager:ListSecrets',
+//         'Resource': '*' 
+//     },
+//     'putSecretValue': {
+//         'Effect': 'Allow',
+//         'Action': 'secretsmanager:PutSecretValue',
+//         'Resource': 'arn:{context.Partition}:secretsmanager:{context.Region}:{context.Account}:secret:{0.SecretId}'
+//     }   
+// })

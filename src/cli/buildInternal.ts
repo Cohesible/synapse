@@ -436,7 +436,14 @@ interface BuildTargetExtras {
     environmentName?: string
 }
 
-export async function createPackageForRelease(pkgDir: string, dest: string, target?: Partial<QualifiedBuildTarget> & BuildTargetExtras, isIntegration?: boolean, useCompiledPkgJson = false) {
+export async function createPackageForRelease(
+    pkgDir: string, 
+    dest: string,
+    target?: Partial<QualifiedBuildTarget> & BuildTargetExtras, 
+    isIntegration?: boolean, 
+    useCompiledPkgJson = false, 
+    keepExportedTypes = false
+) {
     const pkg = await getPackageJsonOrThrow(pkgDir) 
     const bt = await resolveProgramBuildTarget(pkgDir, { environmentName: target?.environmentName })
     if (!bt) {
@@ -456,7 +463,8 @@ export async function createPackageForRelease(pkgDir: string, dest: string, targ
         }
 
         delete copy.devDependencies
-        delete copy.scripts 
+        delete copy.scripts
+        delete copy.bin
 
         return copy
     }
@@ -488,7 +496,7 @@ export async function createPackageForRelease(pkgDir: string, dest: string, targ
     const consolidated = await consolidateBuild(getDataRepository(), pruned, filesToKeep, { strip: true })
     const { snapshot } = await createSnapshot(consolidated.index, programId, deploymentId)
 
-    pruneSnapshot(snapshot, filesToKeep, target?.stripInternal)
+    pruneSnapshot(snapshot, filesToKeep, keepExportedTypes)
 
     // Remap `pointers`
     for (const v of Object.values(snapshot.pointers)) {
@@ -688,7 +696,7 @@ function pruneObject(obj: Record<string, any>, s: Set<string>) {
     }
 }
 
-function pruneSnapshot(snapshot: Snapshot, filesToKeep: string[], stripInternal = false) {
+function pruneSnapshot(snapshot: Snapshot, filesToKeep: string[], keepExportedTypes = false) {
     const s = new Set(filesToKeep)
     if (snapshot.published) {
         pruneObject(snapshot.published, s)
@@ -710,7 +718,7 @@ function pruneSnapshot(snapshot: Snapshot, filesToKeep: string[], stripInternal 
 
     if (snapshot.types) {
         for (const k of Object.keys(snapshot.types)) {
-            if (!typesToKeep.has(k)) {
+            if (!keepExportedTypes && !typesToKeep.has(k)) {
                 delete snapshot.types[k]
             }
         }

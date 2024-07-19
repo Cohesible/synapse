@@ -26,12 +26,10 @@ export interface Scope {
     assignmentSymbol?: Symbol
 }
 
-declare function __addTarget(...args: any[]): void
 declare function __getCurrentId(): string
-declare function __getPermissions(target: any): any
+declare function __symEval(target: any, args: any[]): any
 declare function __getContext(): { run(scope: Scope, fn: (...args: any[]) => any, ...args: any[]): any, get: (type: string) => any }
 declare function __getBuildDirectory(): string
-declare function __getConsole(id?: string, name?: string): any
 declare function __getBackendClient(): BackendClient
 declare function __requireSecret(envVar: string, type: string): void 
 declare function __getArtifactFs(): ArtifactFs
@@ -53,10 +51,7 @@ interface Logger {
 
 declare function __getLogger(): Logger
 
-// export interface LogEvent {
-//     readonly timestamp: string | number // ISO8601 or Unix epoch
-//     readonly data: string | { message: string } | any
-// }
+
 
 /** @internal */
 export function getCurrentId() {
@@ -177,30 +172,7 @@ export const contextType = Symbol.for('synapse.contextType')
 const permissions = Symbol.for('synapse.permissions')
 const moveable2 = Symbol.for('__moveable__2')
 
-// AWS only
-interface Statement {
-    Effect?: 'Allow' | 'Deny' // Defaults to `Allow`
-    Action: string | string[]
-    Resource: string | string[]
-    Condition?: any
-
-    // Only relevant for managed resources. This field is treated as metadata.
-    Lifecycle?: LifecycleStage[]
-}
-
-type LifecycleStage = 'create' | 'update' | 'read' | 'delete'
-
-type Binding<T extends any[], R, U = void> = ((this: U, ...args: T) => R) | Statement | Statement[]
-interface Context {
-    // AWS SPECIFIC
-    partition: string
-    accountId: string
-    regionId: string
-    addStatement(statement: Statement): void
-
-    // GENERIC
-    createUnknown(): any
-}
+type Binding<T extends any[], R, U = void> = ((this: U, ...args: T) => R)
 
 type ExtractSignature<T> = T extends {
     (...args: infer P): Promise<infer R>
@@ -209,8 +181,8 @@ type ExtractSignature<T> = T extends {
 } ? [P, Partial<R>] : T extends (...args: infer P) => infer R ? [P, Partial<R>] : never
 
 type Methods<T> = { [P in keyof T]: T[P] extends (...args: any[]) => any ? P : never }[keyof T]
-type PermissionsModel<T> = { [P in Methods<T>]+?: Binding<ExtractSignature<T[P]>[0], ExtractSignature<T[P]>[1], T & { $context: Context }> }
-type ConstructorPermissionsModel<T extends abstract new (...args: any[]) => any> = (this: InstanceType<T> & { $context: Context }, ...args: ConstructorParameters<T>) => InstanceType<T> | void 
+export type PermissionsModel<T> = { [P in Methods<T>]+?: Binding<ExtractSignature<T[P]>[0], ExtractSignature<T[P]>[1], T> }
+type ConstructorPermissionsModel<T extends abstract new (...args: any[]) => any> = (this: InstanceType<T>, ...args: ConstructorParameters<T>) => InstanceType<T> | void 
 
 /** @internal */
 export function bindModel<T>(ctor: new () => T, model: PermissionsModel<T>): void
@@ -225,7 +197,7 @@ export function bindConstructorModel<T extends abstract new (...args: any[]) => 
 }
 
 /** @internal */
-export function bindFunctionModel<T extends (...args: any[]) => any>(fn: T, model: Binding<Parameters<T>, Awaited<ReturnType<T>>, { $context: Context }>): void {
+export function bindFunctionModel<T extends (...args: any[]) => any>(fn: T, model: Binding<Parameters<T>, Awaited<ReturnType<T>>>): void {
     _bindModel(fn, model, 'function')
 }
 
@@ -357,24 +329,29 @@ function _bindModel(target: any, model: any, type: 'class' | 'object' | 'functio
 // * Rendering models with unknown inputs results in a more permissive solution. The least permissive
 //   solution can only be found by deferring until final synthesis.
 
-/** @internal */
-export function getPermissions(target: any): any {
-    if (typeof __getPermissions === 'undefined') {
-        return []
+
+export function symEval<T, U extends any[]>(target: (...args: U) => Promise<T> | T, ...args: U): T | unknown {
+    if (typeof __symEval === 'undefined') {
+        failMissingRuntime('symEval')
     }
 
-    return __getPermissions(target)
+    return __symEval(target, args)
 }
 
 declare function __defer(fn: () => void): void
 
-/** @internal */
-export function getPermissionsLater(target: any, fn: (result: any) => void) {
-    __defer(() => void fn(getPermissions(target)))
-}
-
 export function defer(fn: () => void) {
     __defer(() => void fn())
+}
+
+declare function __createUnknown(): any
+
+export function createUnknown() {
+    if (typeof __createUnknown === 'undefined') {
+        failMissingRuntime('createUnknown')
+    }
+    
+    return __createUnknown()
 }
 
 interface LocalMetadata {
@@ -463,6 +440,18 @@ export function getContext<T = unknown>(ctor: ContextConstructor<T>): T {
     return ctx
 }
 
+const boundContext = Symbol.for('synapse.boundContext')
+export function getBoundContext<T = unknown>(target: any, ctor: ContextConstructor<T>): T | undefined {
+    const contexts = target?.[boundContext]
+    if (!contexts) {
+        return
+    }
+
+    const type = ctor[contextType]
+    
+    return contexts?.[type]?.[0]
+}
+
 /** @internal */
 export function scope(scope: Scope, fn: (...args: any[]) => any, ...args: any[]): any {
     if (typeof __getContext === 'undefined') {
@@ -481,16 +470,7 @@ export function getOutputDirectory() {
     return __getBuildDirectory()
 }
 
-/** @internal */
-export function getConsole(id?: string, name?: string) {
-    if (typeof __getConsole === 'undefined') {
-        return console as any // Type-erased so we don't ref node types
-    }
-
-    return __getConsole(id, name)
-}
-
-export function addTarget<
+export declare function addTarget<
     T extends abstract new (...args: any[]) => any, 
     U extends T
 >(
@@ -499,19 +479,6 @@ export function addTarget<
     targets: 'aws' | 'azure' | 'gcp' | 'local'
 ): void
 
-// export function addTarget<T, A extends any[], U extends abstract new (...args: A) => T>(
-//     base: (...args: A) => T,
-//     replacement: U,
-//     targets: 'aws' | 'azure' | 'gcp' | 'local'
-// ): void
-
-export function addTarget(...args: any[]) {
-    if (typeof __addTarget === 'undefined') {
-        return
-    }
-
-    return __addTarget(...args)
-}
 
 // TODO: should `update` be given the old args in addition to the new args?
 // Maybe add it to `this`
@@ -590,6 +557,10 @@ export function using<T, U>(ctx: T, fn: (ctx: T) => U): U {
     return __getContext().run({ contexts: Array.isArray(ctx) ? ctx : [ctx] }, fn)
 }
 
+export function move(from: string, to?: string) {
+    return terraform.move(from, to)
+}
+
 /**
  * @internal
  * 
@@ -600,13 +571,6 @@ export function using<T, U>(ctx: T, fn: (ctx: T) => U): U {
 export function requireSecret(envVar: string, type: string) {
     __requireSecret(envVar, type)
 }
-
-// interface LogEvent<T = any> {
-//     sessionId: string
-//     resourceId: string // Terraform logical id for now
-//     timestamp: string // ISO8601
-//     data: T
-// }
 
 /** @internal */
 export interface Secret {
@@ -693,12 +657,6 @@ export function isDataPointer(ref: unknown): ref is DataPointer {
 
 export type OpaquePointer = string & { [pointerSymbol]: unknown }
 
-// //# resource = true
-// export declare class Provider {
-//     constructor(props?: any)
-// }
-
-const synapseOutput = Symbol.for('synapseClassOutput')
 
 export function defineDataSource<T, U extends any[]>(
     handler: (...args: U) => Promise<T> | T,
@@ -716,8 +674,12 @@ export function defineDataSource<T, U extends any[]>(
             updateLifecycle(v, { force_refresh: true })
         }
 
-        return (v as any)[synapseOutput]
+        return (v as any)[terraform.classOutputSym]
     }
+}
+
+export function stubWhenBundled(target: any) {
+    Object.assign(target, { [terraform.stubWhenBundled]: true })
 }
 
 // Common node symbols that are useful in general
@@ -864,8 +826,6 @@ class CustomDataClass extends CustomData {
     }
 }
 
-const kCustomResource = Symbol.for('customResource')
-
 function createCustomResourceClass(id: string, definition: any): any {
     let def: Export
 
@@ -873,7 +833,7 @@ function createCustomResourceClass(id: string, definition: any): any {
     const getDef = () => def ??= new Export(id, definition)
 
     return class extends CustomResource {
-        static [kCustomResource] = true
+        static [terraform.customClassKey] = id
 
         constructor(...args: any[]) {
             super(id, getDef().destination, ...args)
@@ -981,4 +941,55 @@ export class IdentityProvider extends ApiRegistration {
             config: new SerializedObject(props).filePath,
         })
     }
+}
+
+
+export interface LogEvent {
+    readonly timestamp: string | number // ISO8601 or Unix epoch
+    readonly data: string | { message: string } | any
+    readonly sourceType?: 'user' | 'system'
+}
+
+export interface LogQuery {
+    readonly startTime?: number // unix epoch
+    readonly endTime?: number // unix epoch
+    readonly limit?: number
+}
+
+type LogQueryResponse = LogEvent[] | Promise<LogEvent[]> | AsyncIterable<LogEvent[]>
+
+export interface LogProviderProps {
+    readonly resourceType: string
+    readonly queryLogs: (resource: any, query: LogQuery) => LogQueryResponse
+}
+
+//# resource = true
+export class LogProvider extends ApiRegistration {
+    public constructor(props: LogProviderProps) {
+        super({
+            kind: 'log-provider',
+            config: new SerializedObject(props).filePath,
+        })
+
+        // TODO: modules should be bound with the context they're referenced in
+        // rather than the context they're loaded in. 
+        //
+        // Overriding ensures a stable resource key when the resource is created on
+        // module load. But it means only one resource can exist.
+        terraform.overrideId(this, `LogProvider-${props.resourceType.replaceAll('.', '-')}`)
+    }
+}
+
+export function registerLogProvider<T extends object>(
+    ctor: new (...args: any[]) => T, 
+    queryLogs: (resource: T, query: LogQuery) => LogQueryResponse
+) {
+    const key = terraform.getClassKey(ctor)
+    if (!key || !key.startsWith('resource')) {
+        throw new Error(`Not a valid resource class: ${ctor.name} [key: ${key}]`)
+    }
+
+    const resourceType = key.split('.').slice(1).join('.')
+
+    return new LogProvider({ resourceType, queryLogs })
 }

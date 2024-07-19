@@ -284,7 +284,7 @@ export async function bundleExecutable(
     target: string,
     outfile = target,
     workingDirectory = bt.workingDirectory,
-    opt?: BundleOptions & { minifyKeepWhitespace?: boolean; useOptimizer?: boolean; runtimeExecutable?: string; sea?: boolean }
+    opt?: BundleOptions & { minify?: boolean; minifyKeepWhitespace?: boolean; useOptimizer?: boolean; runtimeExecutable?: string; sea?: boolean }
 ) {
     const { mountedFs, resolver, repo } = await loadBuildState(bt)
 

@@ -97,11 +97,22 @@ async function parseRemoteNoBranch(dir: string, remote: string): Promise<Omit<Re
 }
 
 export async function listRemotes(dir = process.cwd()) {
-    const result = await runGit(dir, ['remote', 'show'])
-    const remoteNames = result.trim().split('\n').filter(x => !!x)
-    const remotes = remoteNames.map(n => parseRemoteNoBranch(dir, n))
+    try {
+        const result = await runGit(dir, ['remote', 'show'])
+        const remoteNames = result.trim().split('\n').filter(x => !!x)
+        const remotes = remoteNames.map(n => parseRemoteNoBranch(dir, n))
+    
+        return await Promise.all(remotes)
+    } catch (e) {
+        // TODO: seems to be an issue with running `git` inside containers:
+        // * detected dubious ownership in repository (linux)
+        // * fatal: could not read Username for 'https://github.com': Device not configured (macos)
+        if ((e as any).code !== 128) {
+            throw e
+        }
 
-    return await Promise.all(remotes)
+        return []
+    }
 }
 
 export async function getCurrentBranch(dir = process.cwd()) {

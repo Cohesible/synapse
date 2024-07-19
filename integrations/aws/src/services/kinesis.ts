@@ -7,6 +7,7 @@ import { Role, createSerializedPolicy, spPolicy } from './iam'
 import * as compute from 'synapse:srl/compute'
 import * as storage from 'synapse:srl/storage'
 import { HttpError } from 'synapse:http'
+import { getPermissions } from '../permissions'
 
 export class Stream<T> implements storage.Stream {
     private readonly client = new Kinesis.Kinesis({})
@@ -80,48 +81,48 @@ export class Stream<T> implements storage.Stream {
 }
 
 core.addTarget(storage.Stream, Stream, 'aws')
-core.bindModel(Kinesis.Kinesis, {
-    'putRecord': {
-        'Effect': 'Allow',
-        'Action': 'kinesis:PutRecord',
-        'Resource': '{0.StreamARN}' 
-    },
-    'putRecords': {
-        'Effect': 'Allow',
-        'Action': 'kinesis:PutRecords',
-        'Resource': '{0.StreamARN}' 
-    },
-    'getRecords': {
-        'Effect': 'Allow',
-        'Action': 'kinesis:GetRecords',
-        'Resource': '{0.StreamARN}' 
-    },
-    'createStream': {
-        'Effect': 'Allow',
-        'Action': 'kinesis:CreateStream',
-        'Resource': '*' 
-    },
-    'deleteStream': {
-        'Effect': 'Allow',
-        'Action': 'kinesis:DeleteStream',
-        'Resource': '{0.StreamARN}' 
-    },
-    'listStreams': {
-        'Effect': 'Allow',
-        'Action': 'kinesis:ListStreams',
-        'Resource': '*' 
-    },
-    'listShards': {
-        'Effect': 'Allow',
-        'Action': 'kinesis:ListStreams',
-        'Resource': '{0.StreamARN}' 
-    },
-    'getShardIterator': {
-        'Effect': 'Allow',
-        'Action': 'kinesis:ListStreams',
-        'Resource': '{0.StreamARN}' 
-    }
-})
+// core.bindModel(Kinesis.Kinesis, {
+//     'putRecord': {
+//         'Effect': 'Allow',
+//         'Action': 'kinesis:PutRecord',
+//         'Resource': '{0.StreamARN}' 
+//     },
+//     'putRecords': {
+//         'Effect': 'Allow',
+//         'Action': 'kinesis:PutRecords',
+//         'Resource': '{0.StreamARN}' 
+//     },
+//     'getRecords': {
+//         'Effect': 'Allow',
+//         'Action': 'kinesis:GetRecords',
+//         'Resource': '{0.StreamARN}' 
+//     },
+//     'createStream': {
+//         'Effect': 'Allow',
+//         'Action': 'kinesis:CreateStream',
+//         'Resource': '*' 
+//     },
+//     'deleteStream': {
+//         'Effect': 'Allow',
+//         'Action': 'kinesis:DeleteStream',
+//         'Resource': '{0.StreamARN}' 
+//     },
+//     'listStreams': {
+//         'Effect': 'Allow',
+//         'Action': 'kinesis:ListStreams',
+//         'Resource': '*' 
+//     },
+//     'listShards': {
+//         'Effect': 'Allow',
+//         'Action': 'kinesis:ListStreams',
+//         'Resource': '{0.StreamARN}' 
+//     },
+//     'getShardIterator': {
+//         'Effect': 'Allow',
+//         'Action': 'kinesis:ListStreams',
+//         'Resource': '{0.StreamARN}' 
+//     }
+// })
 
 // TODO: finish this 
 // https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/kinesis_firehose_delivery_stream
@@ -143,7 +144,7 @@ class Firehose {
         const name = lib.createGeneratedIdentifier({ maxLength: 63 })
         const bucket = Firehose.backupBucket
         // FIXME: I should get the same result by using `${name}/${k}`
-        const perms = core.getPermissions((k: string) => bucket.put(`${name}/*`, '')) 
+        const perms = getPermissions((k: string) => bucket.put(`${name}/*`, '')) 
         const role = new Role({ 
             assumeRolePolicy: JSON.stringify(spPolicy('firehose.amazonaws.com')),
         })

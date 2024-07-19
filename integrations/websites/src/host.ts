@@ -7,6 +7,7 @@ import { Bucket, CDN } from 'synapse:srl/storage'
 import { HttpService } from 'synapse:srl/compute'
 import { HostedZone } from 'synapse:srl/net'
 import { execSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 
 export { useServer } from './hooks'
 export { JSXRuntime }
@@ -35,14 +36,28 @@ type RenderSyncFn = (node: JSXNode) => string
 
 export interface Layout {
     readonly parent?: Layout
-    // readonly stylesheet?: Stylesheet
     readonly component: ComponentType<{ children: JSXNode }>
 }
 
 export interface Page<T extends Record<string, string> = {}, U = any> {
-    readonly layout: Layout
+    readonly layout: Layout | ComponentType<{ children: JSXNode }>
     readonly component: ComponentType<T, U>
 }
+
+function createDefaultLayout(createElement: JSXRuntime['createElement']) {
+    return function (props: { children: any }) {
+        return createElement('html', 
+            { 
+                // TODO: detect the appropriate language somehow
+                lang: 'en',
+            },
+            createElement('head'),
+            createElement('body', undefined, ...(Array.isArray(props.children) ? props.children : [props.children]))
+        )
+    }
+}
+
+type PageOrComponent<T extends Record<string, string>, U = any> = Page<T, U> | ComponentType<T, U>
 
 interface RouteablePage<T extends Record<string, string> = {}> extends Page<T> {
     readonly route: string
@@ -51,34 +66,28 @@ interface RouteablePage<T extends Record<string, string> = {}> extends Page<T> {
 export interface WebsiteHost {
     readonly url: string
 
-    addAsset(source: string, name?: string, contentType?: string): string
+    asset(source: string, name?: string, contentType?: string): string
 
-    addPage<T extends string>(route: T, page: Page<CapturedPattern<T>>): RouteablePage<CapturedPattern<T>>
-    addPage<T extends string, U>(route: T, page: Page<CapturedPattern<T>, U>, context: U): RouteablePage<CapturedPattern<T>>
-
-    // XXX: having the `string` overload makes things work correctly ???
-    // addHandler<T extends string, R = unknown>(route: T, handler: HttpHandler<T, string, R>): HttpFetcher<T, string, R>
-    // addHandler<T extends string, U, R = unknown>(route: T, handler: HttpHandler<T, U, R>): HttpFetcher<T, U, R>
+    page<T extends string>(route: T, page: PageOrComponent<CapturedPattern<T>>): RouteablePage<CapturedPattern<T>>
+    page<T extends string, U>(route: T, page: PageOrComponent<CapturedPattern<T>, U>, context: U): RouteablePage<CapturedPattern<T>>
 
     bind<T extends any[], U>(handler: (...args: T) => Promise<U> | U): (...args: T) => Promise<U>
-
-    // addRoute<T extends string, R = unknown>(route: T, handler: HttpHandler<T, string, R>): HttpRoute<[string], R>
-    // addRoute<T extends string, U, R = unknown>(route: T, handler: HttpHandler<T, U, R>): HttpRoute<[request: U], R>
 }
 
 interface WebsiteHostProps {
     readonly domain?: HostedZone
     readonly useCdn?: boolean
     readonly defaultRoot?: string
+    readonly defaultMaxPageAge?: number
 }
-
-// Reserved paths:
-// _assets
-// _api
 
 function finalizePage<T extends Record<string, string>, U>(page: Page<T, U>, context: U) {
     const components: ComponentType[] = []
-    let layout: Layout | undefined = page.layout
+
+    let layout: Layout | undefined = typeof page.layout === 'function' 
+        ? { component: page.layout } 
+        : page.layout
+
     while (layout) {
         components.push(layout.component)
         layout = layout.parent
@@ -88,23 +97,13 @@ function finalizePage<T extends Record<string, string>, U>(page: Page<T, U>, con
     return function (props: T) {
         return components.reduceRight((a, b) => b({ children: a }), initComponent(props, context))
     }
-
-    // return function (props: T) {
-    //     const children = components.reduceRight((a, b) => b({ children: a }), initComponent(props))
-
-    //     return instantiate(context.Provider, {
-    //         children,
-    //         value: contextVal, 
-    //     })
-    // }
 }
 
-const renderComponent = defineDataSource(async ({ render, component, footer }: { render: RenderSyncFn, component: ComponentType, footer: string }) => {
-    const rendered = render(component({}))
+const renderComponent = async ({ render, component, footer }: { render: RenderSyncFn, component: ComponentType, footer: string }) => {
+    const rendered = await render(component({}))
 
-    // XXX: very bad
-    return '<!DOCTYPE html>\n' + rendered.replace(/<\/head>/, `${footer}$&`)
-})
+    return '<!DOCTYPE html>\n' + rendered + '\n' + footer
+}
 
 function getBody(node: JSXNode) {
     if (Symbol.iterator in node) {
@@ -140,7 +139,7 @@ function createEntrypoint<T extends Record<string, string>, U>(
     runtime: JSXRuntime<U>,
     page: FunctionComponent<T, any, U>, 
     routePattern: TypedRegexp<T>,
-    addAsset: WebsiteHost['addAsset'],
+    addAsset: WebsiteHost['asset'],
     hostBind: WebsiteHost['bind'],
 ) {
     const mount = runtime.mount
@@ -174,14 +173,14 @@ function createEntrypoint<T extends Record<string, string>, U>(
 <script type="module" src="${entrypointPath}" async=""></script>
 `
 
-    return renderComponent({ render, component: page, footer })
+    return (props: T) => renderComponent({ render, component: () => page(props), footer })
 }
 
 function createStreamedEntrypoint<T extends Record<string, string>, U>(
     runtime: JSXRuntime<U>,
     page: FunctionComponent<T, any, U>, 
     routePattern: TypedRegexp<T>,
-    addAsset: WebsiteHost['addAsset'],
+    addAsset: WebsiteHost['asset'],
     hostBind: WebsiteHost['bind'],
     injectLocalhostWebsocket = isDev()
 ) {
@@ -232,7 +231,7 @@ const browserImpl = Symbol.for('synapse.browserImpl')
 const moveable = Symbol.for('__moveable__')
 const bound = Symbol('boundToWebsite')
 const boundFunctions = new Map<Function, Function>()
-function bindFunctions(hostBind: WebsiteHost['bind'], addAsset: WebsiteHost['addAsset'], target: any) {
+function bindFunctions(hostBind: WebsiteHost['bind'], addAsset: WebsiteHost['asset'], target: any) {
     if (boundFunctions.has(target)) {
         return boundFunctions.get(target)!
     }
@@ -285,6 +284,65 @@ function replaceCapturedAssets(target: any, desc: any, replacement: Record<strin
     return Object.assign(target, { [moveable]: newFn })
 }
 
+function serialize(v: any): any {
+    if (v instanceof Map) {
+        return [
+            '__MAP__',
+            ...[...v].map(([k, v]) => [k, serialize(v)])
+        ]
+    }
+
+    if (v instanceof Promise && 'status' in v) {
+        if (v.status === 'pending') {
+            return 'PROMISE_PENDING'
+        } else if (v.status === 'rejected') {
+            const reason = (v as any).reason as Error
+            return { __type: 'SERVER_EXCEPTION', __value: { message: reason.message } }
+        } else if (v.status === 'fulfilled') {
+            return (v as any).value
+        }
+    }
+
+    return v
+}
+
+// This sends render state over to the client
+function createCacheInjection(cache: Map<any, any>) {
+    const serialized = JSON.stringify(serialize(cache))
+    const deserialize = `function deserialize(v) { 
+        if (Array.isArray(v) && v[0] === '__MAP__') {
+            return new Map(v.slice(1).map(e => [e[0], deserialize(e[1])]))
+        }
+        return v
+    }`
+
+    const injectCache = `
+    const cache = deserialize(${serialized})
+    if (!globalThis.USE_SERVER_CACHE) {
+        globalThis.USE_SERVER_CACHE = cache
+    } else {
+        for (const [k, v] of cache) {
+            setCachedItem(k, v)
+        }
+    }
+    function setCachedItem(key, val, c = globalThis.USE_SERVER_CACHE, index = 0) {
+        const k = key[index]
+        if (key.length - 1 === index) {
+            c.set(k, val)
+            return val
+        }
+
+        if (!c.has(k)) {
+            c.set(k, new Map())
+        }
+
+        return setCachedItem(key, val, c.get(k), index + 1)
+    }
+    globalThis.UPDATE_SERVER_CACHE = setCachedItem
+    `
+
+    return Buffer.from(`<script>${deserialize}; ${injectCache}</script>`)
+}
 
 // Useful caching directives:
 // stale-while-revalidate
@@ -292,6 +350,9 @@ function replaceCapturedAssets(target: any, desc: any, replacement: Record<strin
 
 type RuntimeContext<T> = T extends JSXRuntime<infer _, infer U> ? U : never
 
+// Reserved paths:
+// _assets
+// _api
 export function createWebsiteHost<T>(
     runtime: JSXRuntime<T>,
     props?: WebsiteHostProps
@@ -307,7 +368,7 @@ export function createWebsiteHost<T>(
         ? new CDN({ bucket: assets, domain: props.domain, indexKey: props.defaultRoot }) 
         : undefined
 
-    const pageMaxAge = isProd() ? 300 : 10
+    const pageMaxAge = props?.defaultMaxPageAge ?? 0
 
     if (cdn) {
         cdn.addOrigin({
@@ -400,92 +461,39 @@ export function createWebsiteHost<T>(
 
     const hasCdn = !!cdn
 
-    function addPage<T extends string, U>(route: T, page: Page<CapturedPattern<T>, U>, context?: U) {
+    function addPage<T extends string, U>(route: T, pageOrComponent: PageOrComponent<CapturedPattern<T>, U>, context?: U) {
         const fixedRoute = route === '/' && !props?.domain && website.defaultPath ? '' as T : route
+        const page: Page = typeof pageOrComponent !== 'function' ? pageOrComponent : {
+            layout: createDefaultLayout(runtime.createElement),
+            component: pageOrComponent,
+        }
 
         const fixedRoot = props?.defaultRoot && route === `/${props.defaultRoot}` ? '/' as T : undefined // XXX: big hack to make `/synapse-redirect` work
         const routeRegexp = buildRouteRegexp(fixedRoot ?? fixedRoute, hasCdn ? undefined : defaultPath)
         const finalizedPage = finalizePage(page, context as U)
 
-        // `defaultPath` implies API Gateway atm.
-        if (runtime.renderStream && !website.defaultPath) {
+        function initContext(): UseServerContext {
+            const cache = new Map<any, any>()
+
+            return { 
+                cache, 
+                handlers: fnMap,
+                onComplete: (key, value, error) => {
+                    // Initially a noop because we haven't sent any state to the client
+                }
+            }
+        }
+
+        function createCacheUpdate(key: any[], val: any) {
+            return Buffer.from(`<script>globalThis.UPDATE_SERVER_CACHE(${JSON.stringify(key)}, ${JSON.stringify(val)})</script>`)
+        }
+
+        if (runtime.renderStream) {
             const getStream = createStreamedEntrypoint(runtime, finalizedPage, routeRegexp, addAsset, bind)
             const r = website.route('GET', fixedRoute, async (req) => {
-                const cache = new Map<any, any>()
-                const ctx: UseServerContext = { 
-                    cache, 
-                    handlers: fnMap,
-                    onComplete: (key, value, error) => {
-                        // Initially a noop because we haven't sent any state to the client
-                    }
-                }
-
+                const ctx = initContext()
                 const stream = await getStream(req.pathParameters as CapturedPattern<T>, ctx)
                 const reader = stream.getReader()
-
-                function serialize(v: any): any {
-                    if (v instanceof Map) {
-                        return [
-                            '__MAP__',
-                            ...[...v].map(([k, v]) => [k, serialize(v)])
-                        ]
-                    }
-
-                    if (v instanceof Promise && 'status' in v) {
-                        if (v.status === 'pending') {
-                            return 'PROMISE_PENDING'
-                        } else if (v.status === 'rejected') {
-                            const reason = (v as any).reason as Error
-                            return { __type: 'SERVER_EXCEPTION', __value: { message: reason.message } }
-                        } else if (v.status === 'fulfilled') {
-                            return (v as any).value
-                        }
-                    }
-
-                    return v
-                }
-
-                function createCacheUpdate(key: any[], val: any) {
-                    return Buffer.from(`<script>globalThis.UPDATE_SERVER_CACHE(${JSON.stringify(key)}, ${JSON.stringify(val)})</script>`)
-                }
-
-                // This sends render state over to the client
-                function createCacheInjection() {
-                    const serialized = JSON.stringify(serialize(cache))
-                    const deserialize = `function deserialize(v) { 
-                        if (Array.isArray(v) && v[0] === '__MAP__') {
-                            return new Map(v.slice(1).map(e => [e[0], deserialize(e[1])]))
-                        }
-                        return v
-                    }`
-
-                    const injectCache = `
-                    const cache = deserialize(${serialized})
-                    if (!globalThis.USE_SERVER_CACHE) {
-                        globalThis.USE_SERVER_CACHE = cache
-                    } else {
-                        for (const [k, v] of cache) {
-                            setCachedItem(k, v)
-                        }
-                    }
-                    function setCachedItem(key, val, c = globalThis.USE_SERVER_CACHE, index = 0) {
-                        const k = key[index]
-                        if (key.length === index - 1) {
-                            c.set(k, val)
-                            return val
-                        }
-
-                        if (!c.has(k)) {
-                            c.set(k, new Map())
-                        }
-
-                        return setCachedItem(key, val, c.get(k), index + 1)
-                    }
-                    globalThis.UPDATE_SERVER_CACHE = setCachedItem
-                    `
-
-                    return Buffer.from(`<script>${deserialize}; ${injectCache}</script>`)
-                }
 
                 const rs = (require('node:stream/web') as typeof import('node:stream/web')).ReadableStream
                 const stream2 = rs.from<Uint8Array>((async function*() {
@@ -520,8 +528,8 @@ export function createWebsiteHost<T>(
                         }
 
                         // XXX: hacky!
-                        if (!onComplete && cache.size > 0 && Buffer.from(chunk.value).toString().includes('</body></html>')) {
-                            yield createCacheInjection()
+                        if (!onComplete && ctx.cache.size > 0 && Buffer.from(chunk.value).toString().includes('</body></html>')) {
+                            yield createCacheInjection(ctx.cache)
                             setOnComplete()
                         }
                     }
@@ -537,15 +545,24 @@ export function createWebsiteHost<T>(
             return {} as any
         }
 
-        const indexText = createEntrypoint(runtime, finalizedPage, routeRegexp, addAsset, bind)
+        const renderEntrypoint = createEntrypoint(runtime, finalizedPage, routeRegexp, addAsset, bind)
 
-        const r = website.route('GET', fixedRoute, (req) => {
-            return new Response(indexText, {
+        const r = website.route('GET', fixedRoute, async (req) => {
+            const ctx = initContext()
+            const indexText = await runWithContext(ctx, () => renderEntrypoint(req.pathParameters))
+            const result = ctx.cache.size > 0
+                ? indexText.replace('</html>', '</html>\n' + createCacheInjection(ctx.cache).toString('utf-8'))
+                : indexText
+
+            const hash = createHash('sha256').update(result).digest('hex')
+            const etag = `"${hash}"`
+
+            return new Response(result, { 
                 headers: {
+                    'cache-control': `max-age=${pageMaxAge}, must-revalidate`,
                     'content-type': 'text/html; charset=utf-8',
-                    'cache-control': `max-age=${pageMaxAge}`,
-                    // TODO: etag
-                }
+                    'etag': etag,
+                },
             })
         })
 
@@ -583,8 +600,8 @@ export function createWebsiteHost<T>(
 
     return {
         url: website.invokeUrl,
-        addAsset,
-        addPage,
+        asset: addAsset,
+        page: addPage,
         bind,
     }
 }

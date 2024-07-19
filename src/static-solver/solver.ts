@@ -15,12 +15,13 @@ function isUsing(node: ts.VariableStatement) {
 
 type SubstitutionFunction = (node: ts.Node, scopes: ts.Node[]) => any
 
-const internalBrand = Symbol.for('__internalFunction')
-const unknown = Symbol.for('unknown')
-const uninitialized = Symbol.for('uninitialized') 
-const evaluatorSymbol = Symbol.for('lazyEvaluator')
-const typeSymbol = Symbol.for('__type')
-const unionSymbol = Symbol.for('union')
+const internalBrand = Symbol('internalFunction')
+const uninitialized = Symbol('uninitialized') 
+const evaluatorSymbol = Symbol('lazyEvaluator')
+const typeSymbol = Symbol('type')
+const unionSymbol = Symbol('union')
+
+const unknown = String('*')
 
 export function isInternalFunction(fn: (...args: any[]) => unknown): fn is typeof fn & { [internalBrand]: InternalFunctionData } {
     return (typeof fn === 'function' || (typeof fn === 'object' && fn !== null)) && internalBrand in fn
@@ -492,7 +493,7 @@ export function createStaticSolver(
             }
         }
 
-        const usingStateKey = '__kUsingState__'
+        const usingStateKey = '__usingState__'
         function getUsingState() {
             if (!state.has(usingStateKey)) {
                 state.set(usingStateKey, [])
@@ -750,7 +751,7 @@ export function createStaticSolver(
                 const scopedState = new Map<string, any>()
                 scopedState.set('this', actualThisArg)
                 if (isGenerator) {
-                    scopedState.set('__kGeneratorState__', [])
+                    scopedState.set('__generatorState__', [])
                 }
 
                 function resolveParam(p: ts.ParameterDeclaration, i: number) {
@@ -800,7 +801,7 @@ export function createStaticSolver(
                 }
 
                 if (isGenerator) {
-                    return scopedState.get('__kGeneratorState__')
+                    return scopedState.get('__generatorState__')
                 }
 
                 return result
@@ -931,8 +932,14 @@ export function createStaticSolver(
 
         function solveConditionalExpression(node: ts.ConditionalExpression) {
             const cond = solve(node.condition)
-            solve(node.whenTrue)
-            solve(node.whenFalse)
+            const whenTrue = solve(node.whenTrue)
+            const whenFalse = solve(node.whenFalse)
+
+            if (cond === unknown || isUnion(cond)) {
+                return unknown
+            }
+
+            return cond ? whenTrue : whenFalse
         }
 
         function solvePrefixUnaryExpression(node: ts.PrefixUnaryExpression) {
@@ -1123,7 +1130,7 @@ export function createStaticSolver(
         function solveYieldExpression(node: ts.YieldExpression) {
             if (node.expression) {
                 const val = solve(node.expression)
-                const genState = state.get('__kGeneratorState__') // XXX
+                const genState = state.get('__generatorState__') // XXX
                 if (genState) {
                     genState.push(val)
                 }

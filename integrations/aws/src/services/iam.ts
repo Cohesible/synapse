@@ -4,6 +4,7 @@ import * as STS from '@aws-sdk/client-sts'
 import { Fn } from 'synapse:terraform'
 import { randomUUID } from 'node:crypto'
 import { generateIdentifier } from 'synapse:lib'
+import { addStatement } from '../permissions'
 
 interface Statement { 
     Effect: 'Allow' | 'Deny'
@@ -221,12 +222,7 @@ export class User extends aws.IamUser {
 
 core.bindModel(STS.STS, {
     assumeRole: function (req) {
-        const roleArn = typeof req.RoleArn === 'symbol' ? '*' : req.RoleArn ?? '*'
-        this.$context.addStatement({
-            Effect: 'Allow',
-            Action: 'sts:AssumeRole',
-            Resource: roleArn,
-        })
+        addStatement({ Effect: 'Allow', Action: 'sts:AssumeRole', Resource: req.RoleArn })
 
         return {}
     }

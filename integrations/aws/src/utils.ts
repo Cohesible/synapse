@@ -23,4 +23,3 @@ export function getFileHash(p: string) {
 export function getDataHash(data: string | Buffer) {
     return crypto.createHash('sha512').update(data).digest('hex')
 }
-

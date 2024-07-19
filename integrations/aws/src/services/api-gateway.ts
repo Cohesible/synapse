@@ -13,6 +13,7 @@ import * as net from 'synapse:srl/net'
 import * as compute from 'synapse:srl/compute'
 import * as storage from 'synapse:srl/storage'
 import { Provider } from '..'
+import { addResourceStatement, getPermissionsLater } from '../permissions'
 
 export class Gateway {
     private readonly client = new NodeHttpHandler()
@@ -64,6 +65,17 @@ export class Gateway {
 
         this.id = apig.arn // TODO: use this form arn:aws:execute-api:${region}:${account}:${api-id}/${stage}/*
         this.region = region.name
+
+        const mergeHandlers = this.props?.mergeHandlers ?? true
+        if (mergeHandlers) {
+            const router = createRequestRouter()
+            this.requestRouter = {
+                ...router,
+                fn: this.addRouteInfra('$default', router.routeRequest)
+            }
+
+            core.move('this.route')
+        }
     }
 
     private _addRoute(method: string, path: string, handler: RequestHandler | RequestHandlerWithBody) {
@@ -71,19 +83,10 @@ export class Gateway {
         const wrapped = wrapRequestHandler(handler, authHandler)
 
         const route = `${method} ${path}`
-        const mergeHandlers = this.props?.mergeHandlers ?? true
-        if (mergeHandlers) {
-            if (!this.requestRouter) {
-                const router = createRequestRouter()
-                this.requestRouter = {
-                    ...router,
-                    fn: this.addRouteInfra('$default', router.routeRequest)
-                }
-            }
-
+        if (this.requestRouter) {
             this.requestRouter.addRoute(route, wrapped)
 
-            core.getPermissionsLater(handler, statements => {
+            getPermissionsLater(wrapped, statements => {
                 this.requestRouter!.fn.principal.addPolicy({
                     // [\w+=,.@-]+{1,128}
                     name: `Route-${route.replace(/[\s\/]+/g, '_').replace(/[{}]/g, '')}`,
@@ -434,7 +437,7 @@ function createRequestRouter() {
             matchRoutes(path, routes.map(e => [e.pattern, e]))
         )
 
-        console.log('All matched routes:', matched.map(r => r.value.route))
+        console.log('all matched routes:', matched.map(r => r.value.route))
 
         const sorted = matched.sort((a, b) => compareRoutes(b.value.route, a.value.route))
         const first = sorted[0]
@@ -454,14 +457,29 @@ function createRequestRouter() {
 
         const stage = request.requestContext.stage
         const trimmedPath = request.rawPath.replace(`/${stage}`, '')
-        console.log(stage, trimmedPath)
+        console.log('got request, stage:', stage, 'pathname:', trimmedPath)
 
-        return runHandler(() => {
+        return runHandler(async () => {
             const selectedRoute = findRoute(trimmedPath, routes)
-            console.log('Using route:', selectedRoute.value.route)
+            console.log('using route:', selectedRoute.value.route)
             request.pathParameters = selectedRoute.match.groups ?? {}
-    
-            return selectedRoute.value.handler(request)
+
+            const resp = await selectedRoute.value.handler(request)
+            if (resp instanceof Response) {
+                const etag = resp.headers.get('etag')
+                if (etag && request.headers['if-none-match'] === etag) {
+                    const headers = new Headers(resp.headers)
+                    headers.delete('etag')
+                    headers.delete('content-type')
+
+                    return new Response(undefined, {
+                        status: 304,
+                        headers, 
+                    })
+                }
+            }
+
+            return resp
         })
     }
 
@@ -525,37 +543,28 @@ function addDomain(stage: aws.Apigatewayv2Stage, domain: HostedZone) {
     return domainName.domainName
 }
 
-// FIXME: add a way to conditionally add permissions?
-// very tempting to just use arbitrary functions instead of templates
-core.bindModel<Gateway>(Gateway, {
-    callOperation: {
-        'Effect': 'Allow',
-        'Action': 'execute-api:Invoke',
-        // 'Resource': 'arn:{context.Partition}:execute-api:${context.Region}:${context.Account}:${this.resource.id}/Default/${replace(0, " ", "/")}'
-        'Resource': 'arn:{context.Partition}:execute-api:{context.Region}:{context.Account}:*'
-    },
-    forward: {
-        'Effect': 'Allow',
-        'Action': 'execute-api:Invoke',
-        // 'Resource': 'arn:{context.Partition}:execute-api:${context.Region}:${context.Account}:${this.resource.id}/Default/${replace(0, " ", "/")}'
-        'Resource': 'arn:{context.Partition}:execute-api:{context.Region}:{context.Account}:*'
-    }
-})
 
-// {
-//     "Version": "2012-10-17",
-//     "Statement": [
-//       {
-//         "Effect": "Permission",
-//         "Action": [
-//           "execute-api:*" // execute-api:Invoke or execute-api:InvalidateCache
-//         ],
-//         "Resource": [
-//           "arn:aws:execute-api:region:account-id:api-id/stage/METHOD_HTTP_VERB/Resource-path"
-//         ]
-//       }
-//     ]
-//   } 
+core.bindModel<Gateway>(Gateway, {
+    callOperation: function() {
+        addResourceStatement({
+            service: 'execute-api',
+            action: 'Invoke',
+            // <api-id>/<stage>/<http-verb>/<path>
+            resource: `${this.resource.id}/*`
+        }, this)
+
+        return core.createUnknown()
+    },
+    forward: function() {
+        addResourceStatement({
+            service: 'execute-api',
+            action: 'Invoke',
+            resource: `${this.resource.id}/*`
+        }, this)
+
+        return core.createUnknown()
+    },
+})
 
 // TODO:
 // automatically setup logs for APIG if we detect it's not enabled
@@ -583,7 +592,7 @@ export class WebsocketGateway {
             disableExecuteApiEndpoint: domain !== undefined,
         })
         this.resource = apig
-        const stageName = 'Default'
+        const stageName = '$default'
         const stage = new aws.Apigatewayv2Stage({
             apiId: apig.id,
             // accessLogSettings: {} <-- nice to have
@@ -597,7 +606,7 @@ export class WebsocketGateway {
         } else {
             this.invokeUrl = stage.invokeUrl
             this.hostname = apig.apiEndpoint.replace(/https:\/\//, '')
-            this.defaultPath = `/${stage.name}`
+            this.defaultPath = stageName === '$default' ? undefined : `/${stage.name}`
         }
 
         const region = new aws.RegionData()
@@ -650,7 +659,6 @@ export class WebsocketGateway {
             const ctx = {
                 apiId: this.resource.id,
                 region: this.region,
-                stage: 'Default',
             }
             const router = websocketRouter(ctx, {})
             this.requestRouter = {
@@ -661,13 +669,12 @@ export class WebsocketGateway {
 
         this.requestRouter.addListener(event, handler)
 
-        core.getPermissionsLater(handler, statements => {
+        getPermissionsLater(handler, statements => {
             const context = core.getContext(Provider)
             statements.push({
                 'Effect': 'Allow',
                 'Action': 'execute-api:ManageConnections',
-                // 'Resource': 'arn:{context.Partition}:execute-api:${context.Region}:${context.Account}:${this.resource.id}/Default/${replace(0, " ", "/")}'
-                'Resource': `arn:${context.partition}:execute-api:${context.regionId}:${context.accountId}:*` // XXX
+                'Resource': `arn:${context.partition}:execute-api:${context.regionId}:${context.accountId}:${this.resource.id}/*`
             })
             this.requestRouter!.fn.principal.addPolicy({
                 // [\w+=,.@-]+{1,128}
@@ -684,7 +691,6 @@ export class WebsocketGateway {
             connectionId: connectionId,
             body,
             method: 'POST',
-            stage: 'Default',
         })
     }
 }
@@ -699,7 +705,7 @@ export class WebsocketGateway {
 interface CommandRequest {
     apiId: string
     region: string
-    stage: string
+    stage?: string
     connectionId: string
     method: string
     body?: any
@@ -708,7 +714,8 @@ interface CommandRequest {
 async function sendCommand(client: NodeHttpHandler, req: CommandRequest) {
     const body = req.body instanceof TypedArray ? req.body : req.body ? JSON.stringify(req.body) : undefined // XXX: FIXME: not robust
 
-    const url = new URL(`https://${req.apiId}.execute-api.${req.region}.amazonaws.com/${req.stage}/@connections/${req.connectionId}`)
+    const pathname = `${req.stage ? `${req.stage}/` : ''}@connections/${req.connectionId}`
+    const url = new URL(`https://${req.apiId}.execute-api.${req.region}.amazonaws.com/${pathname}`)
     const builtRequest = new smithyHttp.HttpRequest({
         body,
         method: req.method,
@@ -789,21 +796,20 @@ export function sendWebsocketMessage(socket: { id: string }, message: any) {
 }
 
 core.bindFunctionModel(sendCommand, function (_, req) {
-    this.$context.addStatement({
-        Action: 'execute-api:ManageConnections',
-        Resource: `arn:${this.$context.partition}:execute-api:${req.region}:${this.$context.accountId}:${req.apiId}/${req.stage}/POST/@connections/*`
-    })
+    addResourceStatement({ 
+        service: 'execute-api',
+        action: 'ManageConnections',
+        resource: `${req.apiId}/${req.stage ?? '*'}/POST/@connections/*`
+    }, this)
 
-    return this.$context.createUnknown()
+    return core.createUnknown()
 })
 
 function websocketRouter(
     ctx: Pick<CommandRequest, 'apiId' | 'stage' | 'region'>,
     listeners: WebsocketListeners
 ) {
-    async function handleRequest(request: ApiGatewayWebsocketEventV2) {
-        console.log(request)
-    
+    async function handleRequest(request: ApiGatewayWebsocketEventV2) {    
         const socket = { id: request.requestContext.connectionId, ...ctx }
         const event = request.requestContext.eventType
         switch (event) {

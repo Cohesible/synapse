@@ -1,0 +1,9 @@
+{
+    "compilerOptions": {
+        "target": "ES2022",
+        "jsx": "react-jsx",
+        "module": "NodeNext",
+        "moduleResolution": "NodeNext"
+    },
+    "include": ["app.tsx"]
+}

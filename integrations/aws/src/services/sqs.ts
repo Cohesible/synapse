@@ -4,6 +4,7 @@ import * as aws from 'synapse-provider:aws'
 import { LambdaFunction } from './lambda'
 import { Fn } from 'synapse:terraform'
 import * as storage from 'synapse:srl/storage'
+import { addResourceStatement } from '../permissions'
 
 export class Queue<T = string>  {
     private readonly client = new SQS.SQS({})
@@ -73,11 +74,16 @@ async function sendMessage(target: aws.SqsQueue, message: string) {
     })
 }
 
+function addSqsStatement(recv: any, action: string | string[], resource = '*') {
+    addResourceStatement({
+        service: 'sqs',
+        action,
+        resource,
+    }, recv)
+}
+
 core.bindFunctionModel(sendMessage, function (target) {
-    this.$context.addStatement({
-        Action: 'sqs:SendMessage',
-        Resource: `arn:${this.$context.partition}:sqs:${this.$context.regionId}:${this.$context.accountId}:${target.name}`
-    })
+    addSqsStatement(this, 'SendMessage', target.name)
 })
 
 
@@ -137,15 +143,15 @@ core.addTarget(storage.Queue, Queue, 'aws')
 // It's easier to create helper functions and bind permissions to those because
 // the APIs accept URLs rather than resource names/ARNs
 core.bindModel(SQS.SQS, {
-    'createQueue': {
-        'Effect': 'Allow',
-        'Action': 'sqs:CreateQueue',
-        'Resource': '*' 
+    'createQueue': function () {
+        addSqsStatement(this, 'CreateQueue')
+
+        return core.createUnknown()
     },
-    'listQueues': {
-        'Effect': 'Allow',
-        'Action': 'sqs:ListQueues',
-        'Resource': '*' 
-    }
+    'listQueues': function () {
+        addSqsStatement(this, 'ListQueues')
+
+        return core.createUnknown()
+    },
 })
 

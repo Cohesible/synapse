@@ -1,5 +1,5 @@
 import { Bundle } from 'synapse:lib'
-import { getPermissions, bindFunctionModel } from 'synapse:core'
+import { symEval, bindFunctionModel } from 'synapse:core'
 
 // .infra.js mappings
 function infraMappings() {
@@ -18,7 +18,7 @@ function permissions() {
         throw new Error('Hello!')
     })
 
-    getPermissions(foo)
+    symEval(foo)
 }
 
 function capturing() {

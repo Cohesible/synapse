@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { memoize } from '../utils'
-import { DeploymentContext, ProviderRequest, assertNotData, loadPointer } from './server'
+import { DeploymentContext, ProviderRequest, assertNotData, loadPointer, loadPointerFromCtx } from './server'
 import type { TfState } from './state'
 import { getSynapseResourceInput, getSynapseResourceOutput, getSynapseResourceType } from './deployment'
 
@@ -35,7 +35,6 @@ function createServiceRegistry() {
 
     async function setRegistration(id: string, kind: string, config: any) {
         const provider = getServiceProvider(kind)
-        console.log(id, config)
         await provider.load(id, config)
         registered.set(id, config)
     }
@@ -89,7 +88,7 @@ function createServiceRegistry() {
         const promises: Promise<void>[] = []
         for (const [id, { kind, config }] of resources) {
             async function doResolve() {
-                const resolved = await loadPointer(ctx.createModuleLoader(), config)
+                const resolved = await loadPointerFromCtx(ctx, id, config)
                 await setRegistration(id, kind, resolved)
             }
             promises.push(doResolve())

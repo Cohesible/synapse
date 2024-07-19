@@ -78,7 +78,7 @@ function usePromise<T>(val: Promise<T> & { status?: 'pending' | 'fulfilled' | 'r
 
 function getCachedItem<U>(key: any[], c: Map<any, any>, index = 0): U | undefined {
     const k = key[index]
-    if (key.length === index - 1) {
+    if (key.length - 1 === index) {
         return c.get(k)
     }
 
@@ -91,7 +91,7 @@ function getCachedItem<U>(key: any[], c: Map<any, any>, index = 0): U | undefine
 
 function setCachedItem<U>(val: U, key: any[], c: Map<any, any>, index = 0): U {
     const k = key[index]
-    if (key.length === index - 1) {
+    if (key.length - 1 === index) {
         c.set(k, val)
         return val
     }

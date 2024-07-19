@@ -310,7 +310,7 @@ fn _removeDir(parent: [:0]const u8, path: [:0]const u8) !void {
         .SUCCESS => {},
         .INVAL => NodeErrors.EINVAL,
         .NOMEM => error.SystemResources,
-        .OPNOTSUPP => parentDir.deleteDirZ(path),
+        .OPNOTSUPP => parentDir.deleteTree(path.ptr[0..path.len]),
         .NOENT => NodeErrors.ENOENT,
         else => |err| std.posix.unexpectedErrno(err),
     };

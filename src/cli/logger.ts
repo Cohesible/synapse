@@ -128,7 +128,9 @@ export async function getSortedLogs() {
                 ...(await getFs().stat(f)),
             })
         } catch (e) {
-            if ((e as any).code !== 'ENOENT') {
+            if ((e as any).code === 'EPERM') {
+                // File is probably open somewhere else
+            } else if ((e as any).code !== 'ENOENT') {
                 throw e
             }
         }
@@ -189,7 +191,8 @@ export function logToStderr(logger: Logger, logLevel: LogLevel = 'debug') {
         if (ev.level === 'raw') { // This is for terraform logs
             stream.write(ev.args[0])
         } else if (logLevelOrder(ev.level) <= level) {
-            stream.write(`[${ev.level.toUpperCase()}] ${print(...ev.args)}\n`)
+            const timestamp = ev.timestamp.toISOString()
+            stream.write(`${timestamp} [${ev.level.toUpperCase()}] ${print(...ev.args)}\n`)
         }
     })
 
@@ -197,7 +200,8 @@ export function logToStderr(logger: Logger, logLevel: LogLevel = 'debug') {
         const displayName = ev.taskType ? `${ev.taskType} (${ev.taskName})` : `${ev.taskName}`
 
         if (ev.duration > (ev.slowThreshold ?? 100)) {
-            stream.write(`[PERF] ${print(displayName, fmtDuration(ev.duration))}\n`)
+            const timestamp = ev.timestamp.toISOString()
+            stream.write(`${timestamp} [PERF] ${print(displayName, fmtDuration(ev.duration))}\n`)
         }
     })
 

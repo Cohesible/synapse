@@ -387,7 +387,6 @@ const compileOptions = [
     { name: 'no-incremental', type: 'boolean', description: 'Disables incremental compilation' },
     { name: 'no-synth', type: 'boolean', description: 'Synthesis inputs are emitted instead of executed', hidden: true }, // TODO: better description
     { name: 'no-infra', type: 'boolean', description: 'Disables generation of synthesis inputs', hidden: true },
-    { name: 'exclude-providers', type: 'boolean', description: 'Removes generated provider *.d.ts files from program analysis', hidden: true },
     { name: 'skip-install', type: 'boolean' },
     { name: 'host-target', type: hostTargetType, hidden: true },
     { name: 'strip-internal', type: 'boolean', hidden: true }
@@ -428,11 +427,11 @@ registerTypedCommand(
             noInfra: opt['no-infra'],
             noSynth: opt['no-synth'],
             incremental: !opt['no-incremental'],
-            excludeProviderTypes: opt['exclude-providers'],
             skipInstall: opt['skip-install'],
             hostTarget: opt['host-target'],
             forcedInfra: opt['force-infra'],
             stripInternal: opt['strip-internal'],
+            environmentName: opt['environment'],
         })
     }
 )
@@ -468,7 +467,12 @@ registerTypedCommand(
     {
         isImportantCommand: true,
         args: [varargsFiles],
-        options: [...deployOptions, { name: 'rollback-if-failed', type: 'boolean', hidden: true }, { name: 'plan-depth', type: 'number', hidden: true }],
+        options: [
+            { name: 'rollback-if-failed', type: 'boolean', hidden: true }, 
+            { name: 'plan-depth', type: 'number', hidden: true }, 
+            { name: 'debug', type: 'boolean', hidden: true },
+            ...deployOptions, 
+        ],
         requirements: { program: true, process: true },
         inferBuildTarget: true,
         description: 'Creates or updates a deployment'
@@ -486,6 +490,7 @@ registerTypedCommand(
                 symbols: opt['symbol'],
                 forceRefresh: opt['refresh'],
                 planDepth: opt['plan-depth'],
+                debug: opt['debug'],
             })
         }
 
@@ -619,6 +624,8 @@ registerTypedCommand(
             { name: 'skip-install', type: 'boolean', hidden: true },
             { name: 'archive', type: 'string', hidden: true },
             { name: 'new-format', type: 'boolean', hidden: true },
+            { name: 'overwrite', type: 'boolean', hidden: true },
+            { name: 'visibility', type: createEnumType('public', 'private'), hidden: true },
             ...buildTargetOptions,
         ],
     },
@@ -630,6 +637,8 @@ registerTypedCommand(
             archive: opt['archive'],
             newFormat: opt['new-format'],
             environmentName: opt['environment'],
+            overwrite: opt['overwrite'],
+            visibility: opt['visibility'],
         })
     }
 )
@@ -706,7 +715,11 @@ registerTypedCommand(
     {
         internal: true,
         args: [varargsFiles],
-        options: [{ name: 'reset', type: 'boolean' }, { name: 'dryRun', type: 'boolean' }, ...buildTargetOptions],
+        options: [
+            { name: 'reset', type: 'boolean' }, 
+            { name: 'outfile', type: 'string' },
+            ...buildTargetOptions
+        ],
     },
     async (...args) => {
         const [files, opt] = unpackArgs(args)
@@ -779,7 +792,7 @@ registerTypedCommand(
 registerTypedCommand(
     'add',  
     {
-        internal: true,
+        hidden: true,
         args: [{ name: 'packages', type: 'string', allowMultiple: true, min: 1 }],
         options: [
             { name: 'dev', shortName: 'd', type: 'boolean' }, 
@@ -841,6 +854,16 @@ registerTypedCommand(
     }
 )
 
+registerTypedCommand(
+    'emit-blocks',
+    {
+        internal: true,
+        args: [{ name: 'dest', type: 'string' }],
+    },
+    async (dest) => {
+        return synapse.emitBlocks(dest)
+    }
+)
 
 registerTypedCommand(
     'show-logs',  
@@ -1124,6 +1147,18 @@ registerTypedCommand(
     (target, opt) => synapse.inspectBlock(target, opt)
 )
 
+registerTypedCommand(
+    'query-logs',  
+    {
+        args: [{ name: 'ref', type: 'string', allowMultiple: true }],
+        options: [{ name: 'system', type: 'boolean', description: 'Shows system log messages' }]
+    },
+    (...args) => {
+        const [refs, opt] = unpackArgs(args)
+
+        return synapse.queryResourceLogs(refs[0], opt)
+    }
+)
 
 registerTypedCommand(
     'commands',  
@@ -1461,6 +1496,7 @@ async function parseArgs(args: string[], desc: CommandDescriptor) {
 }
 
 async function getBuildTarget(cmd: CommandDescriptor, params: string[]) {
+    const start = performance.now()
     const cwd = process.cwd()
     const environmentIndex = params.indexOf('--environment')
     const environmentName = (environmentIndex !== -1 ? params[environmentIndex+1] : undefined) ?? process.env.SYNAPSE_ENV
@@ -1480,6 +1516,8 @@ async function getBuildTarget(cmd: CommandDescriptor, params: string[]) {
 
         return resolveProgramBuildTarget(cwd, { program: programFiles[0], environmentName })
     }
+
+    synapse.getLogger().debug(`getBuildTarget() took ${Math.floor((performance.now() - start) * 1000) / 1000}ms`)
 
     return res
 }
@@ -1504,7 +1542,7 @@ export async function executeCommand(cmd: string, params: string[]) {
         return synapse.runTask('run', cmd, () => command.fn(...args), 1)
     }
 
-    const buildTarget = await getBuildTarget(command.descriptor, params) // 3ms or so
+    const buildTarget = await getBuildTarget(command.descriptor, params)
     if (!buildTarget) {
         if (command.descriptor.requirements) {
             throw new RenderableError('No build target', () => {

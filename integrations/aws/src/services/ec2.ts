@@ -10,6 +10,7 @@ import * as net from 'synapse:srl/net'
 import * as compute from 'synapse:srl/compute'
 import * as storage from 'synapse:srl/storage'
 import { spPolicy } from './iam'
+import { addResourceStatement, getPermissions } from '../permissions'
 
 export class Vpc {
     public readonly resource: aws.Vpc
@@ -225,7 +226,7 @@ export class Instance {
             })
         }
 
-        const statements = core.getPermissions(target)
+        const statements = getPermissions(target)
         const inlinePolicyResource = statements.length > 0
             ? {
                 name: 'InlinePolicy', // name is required!!!!!!!
@@ -357,14 +358,20 @@ core.addTarget(compute.Host, Instance, 'aws')
 core.addTarget(compute.KeyPair, KeyPair, 'aws')
 
 core.bindModel(EC2.EC2, {
-    'describeInstances': {
-        'Effect': 'Allow',
-        'Action': 'ec2:DescribeInstances',
-        'Resource': '*',
+    'describeInstances': function (req) {
+        addResourceStatement({
+            service: 'ec2',
+            action: 'DescribeInstances',
+        }, this)
+
+        return core.createUnknown()
     },
-    'describeNetworkInterfaces': {
-        'Effect': 'Allow',
-        'Action': 'ec2:DescribeNetworkInterfaces',
-        'Resource': '*',
+    'describeNetworkInterfaces': function (req) {
+        addResourceStatement({
+            service: 'ec2',
+            action: 'DescribeNetworkInterfaces',
+        }, this)
+
+        return core.createUnknown()
     }
 })

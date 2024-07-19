@@ -9,6 +9,7 @@ import { statSync } from 'fs'
 import { getFileHash, getDataHash, listFiles } from '../utils'
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import { getContentType } from 'synapse:http'
+import { addResourceStatement } from '../permissions'
 
 export class Bucket implements storage.Bucket {
     private readonly client = new S3.S3({})
@@ -168,102 +169,99 @@ function _getUploadPartSignedUrl(client: S3.S3, req: UploadPartRequest, expiresI
 
 core.addTarget(storage.Bucket, Bucket, 'aws')
 
+function addS3Statement(recv: any, action: string | string[], resource: string) {
+    addResourceStatement({
+        service: 's3',
+        region: '',
+        account: '',
+        action,
+        resource,
+    }, recv)
+}
+
 core.bindFunctionModel(_getSignedUrl, function (client, bucket, key) {
-    this.$context.addStatement({
-        Action: 's3:GetObject',
-        Resource: `arn:${this.$context.partition}:s3:::${bucket}/${typeof key === 'symbol' ? '*' : key}`
-    })
+    addS3Statement(this, 'GetObject', `${bucket}/${key}`)
+
     return ''
 })
 
 core.bindFunctionModel(_getUploadPartSignedUrl, function (client, req) {
-    this.$context.addStatement({
-        Action: 's3:PutObject',
-        Resource: `arn:${this.$context.partition}:s3:::${req.bucket}/${typeof req.key === 'symbol' ? '*' : req.key}`
-    })
+    addS3Statement(this, 'PutObject', `${req.bucket}/${req.key}`)
+
     return ''
 })
 
 core.bindModel(S3.S3, {
-    'putObject': {
-        'Effect': 'Allow',
-        'Action': 's3:PutObject',
-        'Resource': 'arn:{context.Partition}:s3:::{0.Bucket}/{0.Key}' 
+    'putObject': function (req) {
+        addS3Statement(this, 'PutObject', `${req.Bucket}/${req.Key}`)
+
+        return core.createUnknown()
     },
-    'getObject': {
-        'Effect': 'Allow',
-        'Action': 's3:GetObject',
-        'Resource': 'arn:{context.Partition}:s3:::{0.Bucket}/{0.Key}' 
+    'getObject': function (req) {
+        addS3Statement(this, 'GetObject', `${req.Bucket}/${req.Key}`)
+
+        return core.createUnknown()
     },
-    'headObject': {
-        'Effect': 'Allow',
-        'Action': 's3:GetObject',
-        'Resource': 'arn:{context.Partition}:s3:::{0.Bucket}/{0.Key}' 
+    'headObject': function (req) {
+        addS3Statement(this, 'GetObject', `${req.Bucket}/${req.Key}`)
+
+        return core.createUnknown()
     },
-    'listBuckets': {
-        'Effect': 'Allow',
-        'Action': 's3:ListAllMyBuckets',
-        'Resource': 'arn:{context.Partition}:s3:::*'
+    'listBuckets': function (req) {
+        addS3Statement(this, 'ListAllMyBuckets', '*')
+
+        return core.createUnknown()
     },
-    'deleteObject': {
-        'Effect': 'Allow',
-        'Action': 's3:DeleteObject',
-        'Resource': 'arn:{context.Partition}:s3:::{0.Bucket}/{0.Key}' 
+    'deleteObject': function (req) {
+        addS3Statement(this, 'DeleteObject', `${req.Bucket}/${req.Key}`)
+
+        return core.createUnknown()
     },
-    'listObjects': {
-        'Effect': 'Allow',
-        'Action': 's3:ListBucket',
-        'Resource': 'arn:{context.Partition}:s3:::{0.Bucket}' 
+    'listObjects': function (req) {
+        addS3Statement(this, 'ListBucket', req.Bucket)
+
+        return core.createUnknown()
     },
     'listObjectsV2': function (req) {
-        this.$context.addStatement({
-            'Action': 's3:ListBucket',
-            'Resource': `arn:${this.$context.partition}:s3:::${req.Bucket}`
-        })
+        addS3Statement(this, 'ListBucket', req.Bucket)
 
-        return { Contents: [{ Key: this.$context.createUnknown() }] }
+        return { Contents: [{ Key: core.createUnknown() }] }
     },
-    'createBucket': {
-        'Effect': 'Allow',
-        'Action': 's3:CreateBucket',
-        'Resource': 'arn:{context.Partition}:s3:::{0.Bucket}' 
+    'createBucket': function (req) {
+        addS3Statement(this, 'CreateBucket', req.Bucket)
+
+        return core.createUnknown()
     },
-    'deleteBucket': {
-        'Effect': 'Allow',
-        'Action': 's3:DeleteBucket',
-        'Resource': 'arn:{context.Partition}:s3:::{0.Bucket}' 
+    'deleteBucket': function (req) {
+        addS3Statement(this, 'DeleteBucket', req.Bucket)
+
+        return core.createUnknown()
     },
-    'putBucketPolicy': {
-        'Effect': 'Allow',
-        'Action': 's3:PutBucketPolicy',
-        'Resource': 'arn:{context.Partition}:s3:::{0.Bucket}' 
+    'putBucketPolicy': function (req) {
+        addS3Statement(this, 'PutBucketPolicy', req.Bucket)
+
+        return core.createUnknown()
     },
-    'getBucketPolicy': {
-        'Effect': 'Allow',
-        'Action': 's3:GetBucketPolicy',
-        'Resource': 'arn:{context.Partition}:s3:::{0.Bucket}' 
+    'getBucketPolicy': function (req) {
+        addS3Statement(this, 'GetBucketPolicy', req.Bucket)
+
+        return core.createUnknown()
     },
-    'copyObject': [
-        {
-            'Effect': 'Allow',
-            'Action': ['s3:GetObject', 's3:GetObjectTagging'],
-            'Resource': 'arn:{context.Partition}:s3:::{0.CopySource}' 
-        },
-        {
-            'Effect': 'Allow',
-            'Action': ['s3:PutObject', 's3:PutObjectTagging'],
-            'Resource': 'arn:{context.Partition}:s3:::{0.Bucket}/{0.Key}' 
-        }
-    ],
-    'createMultipartUpload': {
-        'Effect': 'Allow',
-        'Action': 's3:PutObject',
-        'Resource': 'arn:{context.Partition}:s3:::{0.Bucket}/{0.Key}'
+    'copyObject': function (req) {
+        addS3Statement(this, ['GetObject', 'GetObjectTagging'], req.CopySource)
+        addS3Statement(this, ['PutObject', 'PutObjectTagging'], `${req.Bucket}/${req.Key}`)
+
+        return core.createUnknown()
     },
-    'completeMultipartUpload': {
-        'Effect': 'Allow',
-        'Action': 's3:PutObject',
-        'Resource': 'arn:{context.Partition}:s3:::{0.Bucket}/{0.Key}'
+    'createMultipartUpload': function (req) {
+        addS3Statement(this, 'PutObject', `${req.Bucket}/${req.Key}`)
+
+        return core.createUnknown()
+    },
+    'completeMultipartUpload': function (req) {
+        addS3Statement(this, 'PutObject', `${req.Bucket}/${req.Key}`)
+
+        return core.createUnknown()
     },
 })
 

@@ -2,7 +2,7 @@ import * as core from 'synapse:core'
 import * as storage from 'synapse:srl/storage'
 import * as compute from 'synapse:srl/compute'
 import { HttpError } from 'synapse:http'
-import { LocalKVStore, getStorePath } from './bucket'
+import { LocalKVStore } from './bucket'
 import { createHash } from 'node:crypto'
 
 function hashObj(o: any) {
@@ -10,7 +10,7 @@ function hashObj(o: any) {
 }
 
 export class Table<K, V> implements storage.Table<K, V> {
-    private readonly resource = new LocalKVStore(getStorePath())
+    private readonly resource = new LocalKVStore()
 
     public async get(key: K): Promise<V | undefined> {
         const d = await this.resource.get(hashObj(key), 'utf-8')

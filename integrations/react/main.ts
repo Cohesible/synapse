@@ -3,8 +3,10 @@ import type { HostedZone } from 'synapse:srl/net'
 import { createRoot, hydrateRoot } from 'react-dom/client'
 import { renderToPipeableStream, renderToString } from 'react-dom/server'
 import { JSXRuntime, createWebsiteHost, WebsiteHost } from '@cohesible/synapse-websites'
+import { createElement } from 'react'
 
 const runtime: JSXRuntime<React.ReactNode> = {
+    createElement,
     mount: (container, children, opt) => {
         if (opt.rehydrate) {
             return hydrateRoot(container, children)

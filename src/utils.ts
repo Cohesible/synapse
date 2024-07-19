@@ -382,6 +382,8 @@ export function getName2(node: ts.Node): string | undefined {
         return node.text
     }
 
+    // We could use the string literal 'this' instead of finding the containing decl.
+    // Although this could be problematic when child classes override parent methods.
     if (node.kind === ts.SyntaxKind.ThisKeyword) {
         const parent = ts.findAncestor(node, ts.isClassDeclaration) ?? ts.findAncestor(node, ts.isClassExpression) ?? ts.findAncestor(node, ts.isObjectLiteralExpression) ?? ts.findAncestor(node, ts.isFunctionExpression) ?? ts.findAncestor(node, ts.isFunctionDeclaration)
         if (!parent) {

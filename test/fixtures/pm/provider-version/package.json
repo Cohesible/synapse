@@ -1,0 +1,7 @@
+{
+    "synapse": {
+        "providers": {
+            "aws": "5.53.0"
+        }
+    }
+}

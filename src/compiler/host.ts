@@ -700,9 +700,9 @@ export async function synth(entrypoints: string[], deployables: string[], opt: S
     let permsCount = 0
     // FIXME: `thisArg` is a hack used for the specific case of checking ctor perms
     // would be cleaner to have a different function handle this case
-    const solvePerms = (target: any, getContext: (t: any) => any, globals?: { console?: any }, args?: any[], thisArg?: any) => {
+    const solvePerms = (target: any, globals?: { console?: any }, args?: any[], thisArg?: any) => {
         return runTask('perms', target.name ?? `fn-${permsCount++}`, () => {
-            return solver.evaluate(target, getContext, globals, args, thisArg)
+            return solver.evaluate(target, globals, args, thisArg)
         }, 10)
     }
 

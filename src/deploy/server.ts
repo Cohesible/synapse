@@ -12,7 +12,7 @@ import { BuildFsFragment, ProcessStore } from '../artifacts'
 import { PackageService } from '../pm/packages'
 import { TerraformPackageManifest } from '../runtime/modules/terraform'
 import { Fs, SyncFs, readDirRecursive } from '../system'
-import { Pointers, createPointer, isDataPointer, pointerPrefix } from '../build-fs/pointers'
+import { Pointers, coerceToPointer, createPointer, isDataPointer, pointerPrefix } from '../build-fs/pointers'
 import { ImportMap, SourceInfo } from '../runtime/importMaps'
 import { getWorkingDir } from '../workspaces'
 import { apiRegistrationResourceType, getServiceRegistry } from './registry'
@@ -70,6 +70,12 @@ export async function loadPointer(loader: ModuleLoader, val: any) {
     val = await resolvePointer(val)
 
     return val === undefined ? val : deserializeObject(loader, val)
+}
+
+export async function loadPointerFromCtx(ctx: DeploymentContext, resource: string, val: any) {
+    const fs = await ctx.processStore.getResourceStore(resource) 
+
+    return runWithArtifactFs(fs, () => loadPointer(ctx.createModuleLoader(), coerceToPointer(val)))
 }
 
 async function resolvePointer(val: any) {

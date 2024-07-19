@@ -11,6 +11,7 @@ import { Role, spPolicy } from './iam'
 import * as net from 'synapse:srl/net'
 import * as compute from 'synapse:srl/compute'
 import * as storage from 'synapse:srl/storage'
+import { addResourceStatement, getPermissions } from '../permissions'
 
 export class ContainerService {
     private readonly client = new ECS.ECS({})
@@ -49,7 +50,7 @@ export class ContainerService {
                 "aws:SourceAccount":`${identity.accountId}`
             }
         }
-        const statements = core.getPermissions(target)
+        const statements = getPermissions(target)
         const taskRole = new Role({
             assumeRolePolicy: JSON.stringify(spPolicy("ecs-tasks.amazonaws.com", condition)),
             inlinePolicy: statements.length > 0 ? [{
@@ -235,69 +236,61 @@ function createDefaultImage(id: string, bundle: lib.Bundle, regionName: string) 
     return repo
 }
 
+function addEcsStatement(recv: any, action: string | string[], resource = '*') {
+    addResourceStatement({
+        service: 'ecs',
+        action,
+        resource,
+    }, recv)
+}
+
 core.addTarget(compute.Container, ContainerService, 'aws')
 core.bindModel(ECS.ECS, {
-    'runTask': {
-        'Effect': 'Allow',
-        'Action': 'ecs:RunTask',
+    'runTask': function (req) {
         // arn:aws:ecs:us-east-1:111122223333:task-definition/TaskFamilyName:1</code>.
-        'Resource': '{0.taskDefinition}' 
+        addEcsStatement(this, 'RunTask', req.taskDefinition)
+
+        return core.createUnknown()
     },
-    'stopTask': {
-        'Effect': 'Allow',
-        'Action': 'ecs:StopTask',
-        'Resource': 'arn:{context.Partition}:ecs:{context.Region}:{context.Account}:task/{0.cluster}/{0.task}' 
+    'stopTask': function (req) {
+        addEcsStatement(this, 'StopTask', `task/${req.cluster}/${req.task}`)
+
+        return core.createUnknown()
     },
-    'createCluster': {
-        'Effect': 'Allow',
-        'Action': 'ecs:CreateCluster',
-        'Resource': '*' 
+    'createCluster': function (req) {
+        addEcsStatement(this, 'CreateCluster')
+
+        return core.createUnknown()
     },
-    'deleteCluster': {
-        'Effect': 'Allow',
-        'Action': 'ecs:DeleteCluster',
-        'Resource': 'arn:{context.Partition}:ecs:{context.Region}:{context.Account}:cluster/{0.cluster}' 
+    'deleteCluster': function (req) {
+        addEcsStatement(this, 'DeleteCluster', `cluster/${req.cluster}`)
+
+        return core.createUnknown()
     },
-    'listClusters': {
-        'Effect': 'Allow',
-        'Action': 'ecs:ListClusters',
-        'Resource': '*' 
+    'listClusters': function (req) {
+        addEcsStatement(this, 'ListClusters')
+
+        return core.createUnknown()
     },
-    'listTasks': {
-        'Effect': 'Allow',
-        "Action": "ecs:ListTasks",
-        //"Resource": "arn:{context.Partition}:ecs:{context.Region}:{context.Account}:container-instance/${0.cluster}/${0.serviceName}"
-        // Seems a bit broken? They should fix this
-        "Resource": "*"
+    'listTasks': function (req) {
+        addEcsStatement(this, 'ListTasks', `container-instance/${req.cluster}/${req.containerInstance ?? '*'}`)
+
+        return core.createUnknown()
     },
-    'updateService': {
-        'Effect': 'Allow',
-        "Action": "ecs:UpdateService",
-        "Resource": "arn:{context.Partition}:ecs:{context.Region}:{context.Account}:service/{0.cluster}/{0.service}"
+    'updateService': function (req) {
+        addEcsStatement(this, 'UpdateService', `service/${req.cluster}/${req.service}`)
+
+        return core.createUnknown()
     },
-    'describeTasks': {
-        'Effect': 'Allow',
-        "Action": "ecs:DescribeTasks",
-        "Resource": "{0.tasks}",
+    'describeTasks': function (req) {
+        addEcsStatement(this, 'DescribeTasks', `task/${req.cluster}/*`)
+
+        return core.createUnknown()
     }
 })
 
-// {
-//     "Sid": "VisualEditor0",
-//     "Effect": "Allow",
-//     "Action": "ecs:ListTasks",
-//     "Resource": "*",
-//     "Condition": {
-//         "ArnEquals": {
-//             "ecs:cluster": "arn:aws:ecs:ap-southeast-2:[account id]:cluster/MyEcsCluster"
-//         }
-//     }
-// }
-
 // ECS is non-standard for permissions :(
-// https://docs.aws.html#amazonelasticcontainerservice-resources-for-iam-policies
-// container instances (ListTasks): arn:${Partition}:ecs:${Region}:${Account}:container-instance/${ClusterName}/${ContainerInstanceId}
-// task: arn:${Partition}:ecs:${Region}:${Account}:task/${ClusterName}/${TaskId}
+// https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazonelasticcontainerservice.html
 
 
 

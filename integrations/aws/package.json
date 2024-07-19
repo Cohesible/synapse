@@ -20,6 +20,7 @@
     },
     "exports": {
         ".": "./src/index.ts",
+        "./permissions": "./src/permissions.ts",
         "./*": "./src/services/*.ts"
     },
     "types": "./src/index.d.ts",

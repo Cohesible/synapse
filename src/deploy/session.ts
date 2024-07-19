@@ -311,7 +311,9 @@ export async function createSession(ctx: SessionContext, opt?: DeployOptions) {
                 await getFs().deleteFile(stateDest)
             }
 
-            //await getServiceRegistry().loadFromState(ctx, state)
+            if (opt?.loadRegistry) {
+                await getServiceRegistry().loadFromState(ctx, state)
+            }
         }
 
         if (!noSave) {
@@ -454,6 +456,7 @@ export async function createSession(ctx: SessionContext, opt?: DeployOptions) {
         setTemplate,
         templateService: ctx.templateService,
         moduleLoader,
+        ctx,
     }
 }
 

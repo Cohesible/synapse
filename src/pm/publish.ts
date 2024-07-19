@@ -92,7 +92,7 @@ function getLinkedPkgPath(name: string, deploymentId?: string) {
     return path.resolve(packagesDir, deploymentId ? `${name}-${deploymentId}` : name)
 }
 
-async function publishTarball(tarball: Buffer, pkgJson: PackageJson) {
+async function publishTarball(tarball: Buffer, pkgJson: PackageJson, allowOverwrite?: boolean, visibility?: 'public' | 'private') {
     if (!pkgJson.version) {
         throw new Error('Package is missing a version')
     }
@@ -104,10 +104,18 @@ async function publishTarball(tarball: Buffer, pkgJson: PackageJson) {
         packageId: remotePkgId,
         packageHash: hash,
         packageJson: pkgJson,
+        allowOverwrite,
     })
+
+    if (visibility === 'public') {
+        await client.updatePackageMetadata({
+            packageId: remotePkgId,
+            public: true,
+        })
+    }
 }
 
-async function publishTarballToRemote(tarballPath: string) {
+async function publishTarballToRemote(tarballPath: string, allowOverwrite?: boolean, visibility?: 'public' | 'private') {
     const tarball = Buffer.from(await getFs().readFile(tarballPath))
     const files = extractTarball(await gunzip(tarball))
     const pkgJsonFile = files.find(f => f.path === 'package.json')
@@ -117,12 +125,12 @@ async function publishTarballToRemote(tarballPath: string) {
 
     const pkgJson = JSON.parse(pkgJsonFile.contents.toString('utf-8'))
 
-    await publishTarball(tarball, pkgJson)
+    await publishTarball(tarball, pkgJson, allowOverwrite, visibility)
 }
 
-export async function publishToRemote(tarballPath?: string) {
+export async function publishToRemote(tarballPath?: string, allowOverwrite?: boolean, visibility?: 'public' | 'private') {
     if (tarballPath) {
-        return publishTarballToRemote(tarballPath)
+        return publishTarballToRemote(tarballPath, allowOverwrite, visibility)
     }
 
     const bt = getBuildTargetOrThrow()
@@ -135,9 +143,9 @@ export async function publishToRemote(tarballPath?: string) {
     }
 
     try {
-        await createPackageForRelease(packageDir, tmpDest, { environmentName: bt.environmentName }, true, true)
+        await createPackageForRelease(packageDir, tmpDest, { environmentName: bt.environmentName }, true, true, true)
         const tarball = await createSynapseTarball(tmpDest)
-        await publishTarball(tarball, pkgJson.data)
+        await publishTarball(tarball, pkgJson.data, allowOverwrite, visibility)
     } finally {
         await getFs().deleteFile(tmpDest).catch(throwIfNotFileNotFoundError)
     }
@@ -164,7 +172,7 @@ export async function linkPackage(opt?: PublishOptions & { globalInstall?: boole
     const pkgName = pkg.data.name ?? path.basename(pkg.directory)
     const resolvedDir = getLinkedPkgPath(pkgName, bt.deploymentId)
     if (opt?.useNewFormat) {
-        return createPackageForRelease(packageDir, resolvedDir, undefined, true, true)
+        return createPackageForRelease(packageDir, resolvedDir, undefined, true, true, true)
     }
 
     const pruned = await createMergedView(bt.programId, bt.deploymentId)
@@ -211,15 +219,9 @@ export async function linkPackage(opt?: PublishOptions & { globalInstall?: boole
         await setKey('projectOverrides', overrides)
     }
 
-    switch (pkgName) {
-        case 'synapse-aws':
-            await replaceIntegration('aws')
-            break
-        case 'synapse-local':
-            await replaceIntegration('local')
-            break
+    if (pkgName.startsWith('synapse-')) {
+        await replaceIntegration(pkgName.slice('synapse-'.length))
     }
-
 
     // Used internally for better devex
     // This can make things really slow if there are many dependents
@@ -310,7 +312,10 @@ async function getOverridesFromProject() {
     const packages = await listPackages(projectId)
     for (const [k, v] of Object.entries(packages)) {
         const procId = await findDeployment(v, projectId, bt.environmentName, bt.branchName)
-        res[k] = getLinkedPkgPath(k, procId)
+        const pkgLocation = getLinkedPkgPath(k, procId)
+        if (await getFs().fileExists(pkgLocation)) {
+            res[k] = pkgLocation
+        }
     }
 
     return res

@@ -232,6 +232,10 @@ export function createManifestRepo(client = createNpmRegistryClient(), manifestC
     const manifests = new Map<string, Promise<PackageManifest | OptimizedPackageManifest | undefined | void> | OptimizedPackageManifest>()
     async function _getCachedManifest(name: string) {
         const cached = await manifestCache.get<PackageManifest | OptimizedPackageManifest>(name).catch(async e => {
+            if ((e as any).code === 'EISDIR' && name.startsWith('/')) {
+                throw new Error(`Attempted to fetch manifest for file-based package: ${name}`)
+            }
+
             if ((e as any).name !== 'SyntaxError') {
                 throw e
             }

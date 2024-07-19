@@ -2,11 +2,11 @@ import * as path from 'node:path'
 import * as vm from 'node:vm'
 import * as util from 'node:util'
 import { createRequire, isBuiltin } from 'node:module'
-import type * as terraform from './runtime/modules/terraform'
+import * as terraform from './runtime/modules/terraform'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { runTask, getLogger } from './logging'
 import { PackageResolver, PackageService } from './pm/packages'
-import { BuildTarget, LocalWorkspace, getV8CacheDirectory } from './workspaces'
+import { BuildTarget, LocalWorkspace, getV8CacheDirectory, getWorkingDir } from './workspaces'
 
 
 // BUG: ReferenceError: runtime is not defined
@@ -23,6 +23,7 @@ import { CodeCache, createCodeCache } from './runtime/utils'
 import { getFs } from './execution'
 import { coerceToPointer, isDataPointer, pointerPrefix, toAbsolute } from './build-fs/pointers'
 import { createNpmLikeCommandRunner } from './pm/publish'
+import { createUnknown } from './static-solver'
 
 function getReplacementsForTarget(data: TargetsFile[string], target: string): Record<string, ReplacementSymbol> {
     const replacements: Record<string, ReplacementSymbol> = {}
@@ -90,7 +91,7 @@ export function createrLoader(
 ) {
     const {
         deployTarget, 
-        workingDirectory = process.cwd(),
+        workingDirectory = getWorkingDir(),
         outDir = workingDirectory,
     } = options
     
@@ -109,14 +110,14 @@ export function createrLoader(
     function createRuntime(
         sources: { name: string, source: string }[],
         getSource: (fileName: string, id: string, virtualLocation: string) => string,
-        solvePerms: (target: any, getContext: (target: any) => any, globals?: Record<string, any>, args?: any[], thisArg?: any) => any,
+        solvePerms: (target: any, globals?: Record<string, any>, args?: any[], thisArg?: any) => any,
     ) {
         const capturedSymbolData = new Map<any, Context>()
         const onExitScope = options.exportSymbolData
             ? (context: Context, val: any) => { capturedSymbolData.set(val, context) }
             : undefined
 
-        const context = createContextStorage({}, { onExitScope }, workingDirectory)
+        const context = createContextStorage({ onExitScope }, workingDirectory)
 
         function createTerraformState(): terraform.State {
             return {
@@ -328,21 +329,9 @@ export function createrLoader(
             return createModuleLinker(getFs(), moduleResolver, { createCjs, createEsm }, ctx)
         }
 
-        const ctxTarget = deployTarget ?? 'local'
-        const getContext = (t: any) => {
-            const boundContexts = t[kBoundContext] as Record<string, any> | undefined
-            if (!boundContexts) {
-                getLogger().log('perms: no bound context found, using current context')
-
-                return context.get(ctxTarget)?.[0]
-            }
-
-            return boundContexts[ctxTarget]
-        }
-
         const hostPermissions: any[] = []
         function solveHostPerms(target: any, args?: any[], thisArg?: any) {
-            const s = solvePerms(target, getContext, undefined, args, thisArg)
+            const s = solvePerms(target, undefined, args, thisArg)
             hostPermissions.push(...s)
         }
 
@@ -441,44 +430,8 @@ export function createrLoader(
         function createVmContext() {
             const _globalThis = createGlobalProxy(globalThis) as typeof globalThis
 
-            // LOGGING 
-            let logger: any
-            let loggerModule: any
-            function getRuntimeLogger() {
-                if (!options.loggerModule || logger === null) {
-                    return
-                }
-                if (logger) {
-                    return logger
-                }
-
-                loggerModule = defaultRequire(options.loggerModule)
-                const Logger = loggerModule?.default?.loggerConstructor
-                const l = Logger ? new Logger('0', '0', deploymentId) : undefined
-                if (!l) {
-                    logger = null
-                    return
-                }
-                
-                return (logger = l)
-            }
-        
-            function getConsole(id: string, name?: string) {
-                const logger = getRuntimeLogger()
-                if (!logger) {
-                    return _globalThis.console
-                }
-        
-                return loggerModule.createConsole(id, logger, name)
-            }
-            // END LOGGING
-
-            function getPermissions(obj: any) {
-                // return solvePerms(obj, getContext, {
-                //     console: logger ? loggerModule.createConsole('', logger) : undefined
-                // })
-
-                return solvePerms(obj, getContext)
+            function symEval(obj: any, args: any[]) {
+                return solvePerms(obj, undefined, args)
             }
 
             function getPointer(fileName: string, key: string) {
@@ -536,11 +489,11 @@ export function createrLoader(
                 get __getCredentials() {
                     return getCredentialsFn()
                 },
-                __getConsole: getConsole,
                 __getContext: () => context,
                 __createAsset: createAsset,
                 __getBuildDirectory: () => outDir,
-                __getPermissions: getPermissions,
+                __symEval: symEval,
+                __createUnknown: createUnknown,
                 __getLogger: getLogger,
                 __getArtifactFs: () => artifactFs,
                 __defer: (fn: () => void) => {
@@ -557,6 +510,8 @@ export function createrLoader(
                 __requireSecret: (envVar: string, type: string) => constructsModule.registerSecret(envVar, type),
                 __scope__: context.run,
                 __wrapExports: wrapExports,
+                __getDefaultProvider: context.providerContext.getDefaultProvider,
+                __registerProvider: context.providerContext.registerProvider,
             })
 
             const globals = vm.runInContext('this', ctx)
@@ -648,12 +603,25 @@ export function createrLoader(
                         ...Object.getOwnPropertyDescriptors(val),
                         ...Object.fromEntries(
                             Object.entries(targets).map(([k, v]) => {
-                                return [k, { get: () => require2(v.moduleSpecifier)[v.symbolName], enumerable: true }] as const
+                                function getVal() {
+                                    const val = require2(v.moduleSpecifier)[v.symbolName]
+                                    if (terraform.isProviderClass(val)) {
+                                        context.providerContext.registerProvider(val)
+                                    }
+
+                                    Object.defineProperty(stub, k, { value: val, enumerable: true, configurable: true })
+
+                                    return val
+                                }
+
+                                return [k, { get: getVal, enumerable: true, configurable: true }] as const
                             })
                         )
                     }
 
-                    return Object.create(null, desc)
+                    const stub = Object.create(null, desc)
+
+                    return stub
                 }
 
                 const require2 = createRequire2(location)
@@ -749,7 +717,18 @@ export function createrLoader(
             return defaultRequire('synapse:srl') as typeof import('synapse:srl')
         }
 
-        return { createRequire2, runText, executeDeferred, constructsModule, getHostPerms, getCore, getSrl, getContext: () => context, createLinker, globals: ctx.globals }
+        return { 
+            createRequire2, 
+            runText, 
+            executeDeferred, 
+            constructsModule, 
+            getHostPerms, 
+            getCore, 
+            getSrl, 
+            getContext: () => context, 
+            createLinker, 
+            globals: ctx.globals,
+        }
     }
 
     const bootstrapName = '#bootstrap.js'
@@ -816,6 +795,8 @@ export function createrLoader(
         entrypoints: string[], 
         runtime: ReturnType<typeof createRuntime>
     ) {
+        runtime.getContext().providerContext.enter()
+
         const coreProvider = new (runtime.getCore()).Provider(providerParams as any)
         const targetProvider = new (runtime.getSrl()).Provider('#default')
         const req = runtime.createRequire2(bootstrapPath)
@@ -844,6 +825,8 @@ export function createrLoader(
         entrypoints: string[], 
         runtime: ReturnType<typeof createRuntime>
     ) {
+        runtime.getContext().providerContext.enter()
+
         const coreProvider = new (runtime.getCore()).Provider(providerParams as any)
         const targetProvider = new (runtime.getSrl()).Provider('#default')
         const linker = runtime.createLinker()
@@ -851,7 +834,7 @@ export function createrLoader(
         await runTask('run', 'bootstrap', async () => {
             await runtime.getContext().run({ contexts: [coreProvider, targetProvider] }, async () => {
                 for (const fileName of entrypoints) {
-                    const esm = await linker.getEsm(process.cwd(), fileName)
+                    const esm = await linker.getEsm(getWorkingDir(), fileName)
                     await linker.evaluateEsm(esm)
                 }
             })
@@ -936,7 +919,7 @@ function wrapPath(Fn: typeof terraform['Fn'], internalState: typeof terraform.in
 
     exports.resolve = function resolve(...segments: string[]) {
         if (segments.some(s => typeof s === 'function' && internalState in s)) {
-            return process.cwd() + '/' + segments[segments.length - 1] // XXX: not correct
+            return getWorkingDir() + '/' + segments[segments.length - 1] // XXX: not correct
         }
 
         return originalResolve(...segments)
@@ -1067,7 +1050,7 @@ function createFakeModule(id: string, ctx: ContextStorage) {
                 const ctor = _newTarget ?? _target
                 if (Symbol.for('synapse.permissions') in ctor) {
                     const contexts = Object.fromEntries(Object.entries(ctx.getNamedContexts()).map(([k, v]) => [k, v[0]]))
-                    Object.assign(result, { [kBoundContext]: contexts })
+                    Object.assign(result, { [boundContext]: contexts })
                 }
 
                 return result
@@ -1165,7 +1148,7 @@ function _shouldTrap(target: any) {
 const unproxy = Symbol.for('unproxy')
 const moveable2 = Symbol.for('__moveable__2')
 const unproxyParent = Symbol.for('unproxyParent')
-const kBoundContext = Symbol.for('boundContext')
+const boundContext = Symbol.for('synapse.boundContext')
 const reflectionType = Symbol.for('reflectionType')
 
 // This is an issue with React when capturing JSX elements:
@@ -1412,7 +1395,7 @@ function createSerializationProxy(
             const ctor = _newTarget ?? _target
             if (result && typeof result === 'object' && Symbol.for('synapse.permissions') in ctor) {
                 const contexts = Object.fromEntries(Object.entries(ctx?.getNamedContexts() ?? {}).map(([k, v]) => [k, v[0]]))
-                Object.assign(result, { [kBoundContext]: contexts })
+                Object.assign(result, { [boundContext]: contexts })
 
                 const cm = ctor[Symbol.for('synapse.permissions')].$constructor
                 if (cm !== undefined) {
@@ -1583,10 +1566,6 @@ function patchBind(FunctionCtor: typeof Function, ObjectCtor: typeof Object) {
     return { dispose: () => void (FunctionCtor.prototype.bind = original) }
 }
 
-interface FsContext {
-    readonly workingDirectory: string
-}
-
 interface Context {
     readonly moduleId?: string
     readonly scope: string[]
@@ -1620,16 +1599,13 @@ interface ContextHooks {
 
 type ContextStorage = ReturnType<typeof createContextStorage>
 function createContextStorage(
-    initialContext: Context['namedContexts'] = {},
     hooks: ContextHooks = {},
     workingDir: string
 ) {
     const storage = new AsyncLocalStorage<Context>()
-    const getNamedContexts = () => {
-        const ctx = storage.getStore()?.namedContexts ?? initialContext
+    const providerContext = createProviderContextStorage()
 
-        return { ...ctx }
-    }
+    const getNamedContexts = () => storage.getStore()?.namedContexts ?? {}
 
     function mergeContexts(left: any, right: any) {
         for (const [k, v] of Object.entries(right)) {
@@ -1638,32 +1614,40 @@ function createContextStorage(
         }
     }
 
-    function run<T extends any[], U>(scope: Scope, fn: (...args: T) => U, ...args: T): U {
-        const oldStore = storage.getStore()
+    function getNewNamedContexts(scope: Pick<Scope, 'contexts'>, oldContexts: Context['namedContexts']) {
+        if (!scope.contexts) {
+            return oldContexts
+        }
 
-        const namedContexts = { ...getNamedContexts() }
-        if (scope.contexts !== undefined) {
-            for (const ctx of scope.contexts) {
-                const contextType = getContextType(ctx)
-                const contextContribution = ctx[contextSym]
-                if (!contextType && !contextContribution) {
-                    throw new Error(`Object does not contribute a context: ${ctx}`)
-                }
+        const namedContexts = { ...oldContexts }
+        for (const ctx of scope.contexts) {
+            const contextType = getContextType(ctx)
+            const contextContribution = ctx[contextSym]
+            if (!contextType && !contextContribution) {
+                throw new Error(`Object does not contribute a context: ${ctx}`)
+            }
 
-                if (contextType) {
-                    mergeContexts(namedContexts, { [contextType]: ctx })
-                }
-                if (contextContribution) {
-                    for (const ctx2 of contextContribution) {
-                        const contextType = getContextType(ctx2)
-                        if (!contextType) {
-                            throw new Error(`Object does not contribute a context: ${ctx2}`)
-                        }
-                        mergeContexts(namedContexts, { [contextType]: ctx2 })
+            if (contextType) {
+                mergeContexts(namedContexts, { [contextType]: ctx })
+            }
+            if (contextContribution) {
+                for (const ctx2 of contextContribution) {
+                    const contextType = getContextType(ctx2)
+                    if (!contextType) {
+                        throw new Error(`Object does not contribute a context: ${ctx2}`)
                     }
+                    mergeContexts(namedContexts, { [contextType]: ctx2 })
                 }
             }
         }
+
+        return namedContexts
+    }
+
+    function run<T extends any[], U>(scope: Scope, fn: (...args: T) => U, ...args: T): U {
+        const oldStore = storage.getStore()
+
+        const namedContexts = getNewNamedContexts(scope, oldStore?.namedContexts ?? {})
 
         const symbols = oldStore?.symbols ?? []
         const scope2 = [...(oldStore?.scope2 ?? []), scope]
@@ -1738,7 +1722,7 @@ function createContextStorage(
     }
 
     function get(type: keyof Context['namedContexts']) {
-        return getNamedContexts()[type]
+        return getNamedContexts()?.[type]
     }
 
     function save(): Context {
@@ -1765,6 +1749,124 @@ function createContextStorage(
         getScopes,
         getModuleId,
         getNamedContexts,
+
+        providerContext,
     }
 }
 
+// does `a` subclass `b`?
+function isSubclass(a: new (...args: any[]) => any, b: new (...args: any[]) => any, visited = new Set<any>()) {
+    if (!a.prototype) {
+        return false
+    }
+
+    if (visited.has(a)) {
+        return false
+    }
+
+    visited.add(a)
+
+    const proto = Object.getPrototypeOf(a.prototype)
+    if (proto === null) {
+        return false
+    }
+    
+    if (proto === b.prototype) {
+        return true
+    }
+
+    const next = Object.getPrototypeOf(a)
+    if (next === null) {
+        return false
+    }
+
+    return isSubclass(next, b, visited)
+}
+
+interface ProviderContext {
+    defaultProviders: Map<string, any | undefined>
+    registeredProviders: Map<string, new () => any>
+    didCopy?: boolean
+}
+
+function createProviderContextStorage() {
+    const storage = new AsyncLocalStorage<ProviderContext>()
+
+    function doCopy(ctx: ProviderContext) {
+        if (ctx.didCopy) {
+            return
+        }
+
+        ctx.defaultProviders = new Map(ctx.defaultProviders)
+        ctx.registeredProviders = new Map(ctx.registeredProviders)
+        ctx.didCopy = true
+    }
+
+    function registerProvider(cls: new () => any) {
+        const ctx = storage.getStore()
+        if (!ctx) {
+            return false
+        }
+
+        const type = getContextType(cls)
+        if (!type) {
+            throw new Error(`Failed to register provider "${cls.name}": missing context type`)
+        }
+        
+        // TODO: think more about this 
+        // if (ctx.registeredProviders.has(type)) {
+        //     const existingClass = ctx.registeredProviders.get(type)!
+        //     if (cls === existingClass) {
+        //         return true
+        //     }
+
+        //     if (!isSubclass(cls, existingClass)) {
+        //         throw new Error(`Failed to register provider "${cls.name}": a provider for type "${type}" already exists: ${existingClass.name}`)
+        //     }
+        // }
+
+        doCopy(ctx)
+        ctx.registeredProviders.set(type, cls)
+
+        return true
+    }
+
+    function getDefaultProvider(type: string) {
+        const ctx = storage.getStore()
+        if (!ctx) {
+            return
+        }
+
+        if (ctx.defaultProviders.has(type)) {
+            return ctx.defaultProviders.get(type)
+        }
+
+        doCopy(ctx)
+
+        const c = ctx.registeredProviders.get(type)
+        if (!c) {
+            ctx.defaultProviders.set(type, undefined)
+            return
+        }
+
+        const inst = new c()
+        ctx.defaultProviders.set(type, inst)
+
+        return inst
+    }
+
+    function enter() {
+        const ctx: ProviderContext = {
+            defaultProviders: new Map(),
+            registeredProviders: new Map(),
+        }
+
+        storage.enterWith(ctx)
+    }
+
+    return {
+        enter,
+        registerProvider,
+        getDefaultProvider,
+    }
+}

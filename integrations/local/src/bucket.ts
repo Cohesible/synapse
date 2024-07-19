@@ -3,7 +3,7 @@ import * as core from 'synapse:core'
 import * as path from 'node:path'
 import * as storage from 'synapse:srl/storage'
 import { getContentType } from 'synapse:http'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { getLocalPath } from './provider'
 
 function isFileNotFoundError(e: unknown) {
@@ -16,28 +16,25 @@ function throwIfNotFileNotFoundError(e: unknown) {
     }
 }
 
+const kvPath = getLocalPath('kv')
+function getStoreFilePath(id: string) {
+    return path.resolve(kvPath, id)
+}
+
 export class LocalKVStore extends core.defineResource({
-    create: async (filePath: string) => {
-        await fs.mkdir(filePath, { recursive: true })
+    create: async () => {
+        const id = randomUUID()
+        await fs.mkdir(getStoreFilePath(id), { recursive: true })
 
-        return { filePath }
+        return { id }
     },
-    update: async (state, filePath) => {
-        if (state.filePath === filePath) {
-            return state
-        }
-        
-        await fs.mkdir(filePath, { recursive: true })
-        await fs.rm(state.filePath, { force: true, recursive: true }).catch(throwIfNotFileNotFoundError)
-
-        return { filePath }
-    },
+    update: state => state,
     delete: async (state) => {
-        await fs.rm(state.filePath, { force: true, recursive: true }).catch(throwIfNotFileNotFoundError)
+        await fs.rm(getStoreFilePath(state.id), { force: true, recursive: true }).catch(throwIfNotFileNotFoundError)
     },
 }) {
     async put(key: string, value: Uint8Array) {
-        const p = path.resolve(this.filePath, key)
+        const p = path.resolve(getStoreFilePath(this.id), key)
         await fs.mkdir(path.dirname(p), { recursive: true })
         await fs.writeFile(p, value)
     }
@@ -45,7 +42,7 @@ export class LocalKVStore extends core.defineResource({
     async get(key: string): Promise<Blob | undefined>
     async get(key: string, encoding: storage.Encoding): Promise<string | undefined>
     async get(key: string, encoding?: storage.Encoding): Promise<string | Blob | undefined> {        
-        const data = await fs.readFile(path.resolve(this.filePath, key), encoding).catch(e => {
+        const data = await fs.readFile(path.resolve(getStoreFilePath(this.id), key), encoding).catch(e => {
             throwIfNotFileNotFoundError(e)
             return undefined
         })
@@ -58,7 +55,7 @@ export class LocalKVStore extends core.defineResource({
     }
 
     async stat(key: string) {        
-        const stats = await fs.stat(path.resolve(this.filePath, key))
+        const stats = await fs.stat(path.resolve(getStoreFilePath(this.id), key))
 
         return {
             size: stats.size,
@@ -68,7 +65,7 @@ export class LocalKVStore extends core.defineResource({
 
     async list(prefix?: string) {        
         const keys: string[] = []
-        const root = this.filePath
+        const root = getStoreFilePath(this.id)
         const prefixes = prefix ? prefix.split('/') : []
         const getRelPath = (from: string, to: string) => process.platform === 'win32'
             ? path.relative(from, to).replaceAll(path.sep, '/')
@@ -96,7 +93,7 @@ export class LocalKVStore extends core.defineResource({
     }
 
     async delete(key: string) {        
-        await fs.rm(path.resolve(this.filePath, key)).catch(throwIfNotFileNotFoundError)
+        await fs.rm(path.resolve(getStoreFilePath(this.id), key)).catch(throwIfNotFileNotFoundError)
     }
 }
 
@@ -110,17 +107,8 @@ class LocalObject extends core.defineResource({
     },
 }) {}
 
-const kvPath = getLocalPath('kv')
-
-export function getStorePath() {
-    const id = core.getCurrentId()
-    const hashed = createHash('sha256').update(id).digest('hex')
-
-    return kvPath + path.sep + hashed
-}
-
 export class Bucket implements storage.Bucket {
-    private readonly resource = new LocalKVStore(getStorePath())
+    private readonly resource = new LocalKVStore()
 
     public get(key: string): Promise<Blob | undefined>
     public get(key: string, encoding: storage.Encoding): Promise<string | undefined>

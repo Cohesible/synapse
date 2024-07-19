@@ -7,8 +7,7 @@ import { getPreviousDeploymentProgramHash, getTemplateWithHashes, readState } fr
 import { TfJson } from '../../runtime/modules/terraform'
 import { getBuildTarget } from '../../execution'
 import { getWorkingDir } from '../../workspaces'
-import { SymbolNode, createMergedGraph, createSymbolGraphFromTemplate } from '../../refactoring'
-import { renderBetterSymbolName } from './deploy'
+import { SymbolNode, createMergedGraph, createSymbolGraphFromTemplate, evaluateMoveCommands } from '../../refactoring'
 import { TfState } from '../../deploy/state'
 import { renderCmdSuggestion } from '../commands'
 
@@ -80,6 +79,7 @@ function diffConfig(
 ): ConfigDiff {
     const diff: ConfigDiff = {}
     diff.deployTarget = getDelta(inputOptions.deployTarget, config.csc.deployTarget)
+    diff.environmentName = getDelta(inputOptions.environmentName, config.csc.environmentName)
 
     for (const [k, v] of Object.entries(diff)) {
         if (v === undefined) {
@@ -95,13 +95,11 @@ function mapOptionName(name: string) {
         case 'deployTarget':
             return 'target'
         case 'environmentName':
-            return 'environment'
+            return 'env'
     }
 
     return name
 }
-
-const showResourceSummary = false
 
 interface CompileSummaryOpt {
     showResourceSummary?: boolean
@@ -145,11 +143,12 @@ export function createCompileView(inputOptions?: CompilerOptions & { hideLogs?: 
         }
 
         function renderEntry(k: string, v: ConfigDelta) {
-            return `${mapOptionName(k)}: ${bold(colorize(v.clobbered ? 'red' : 'blue', v.resolved ?? v.input))}`
+            return dim(`${mapOptionName(k)}: ${bold(colorize(v.clobbered ? 'red' : 'blue', v.resolved ?? v.input))}`)
         }
 
         const resolved = entries.filter(([k, v]) => v.resolved !== undefined)
-        const text = dim(`(${resolved.map(([k, v]) => renderEntry(k, v))}${dim(')')}`)
+        const rendered = resolved.map(([k, v]) => renderEntry(k, v)).join(dim(', '))
+        const text = `${dim('(')}${rendered}${dim(')')}`
         setConfigText(text)
     })
 
@@ -226,7 +225,6 @@ export async function getPreviousDeploymentData() {
 function showSimplePlanSummary(template: TfJson, target: string, entrypoints: string[], previousData?: PreviousData) {
     const printLine = getDisplay().getOverlayedView().writeLine
 
-    const workingDir = getWorkingDir()
     const graph = createSymbolGraphFromTemplate(template)
     const oldGraph = previousData?.oldTemplate ? createSymbolGraphFromTemplate(previousData?.oldTemplate.template) : undefined
     const mergedGraph = oldGraph ? createMergedGraph(graph, oldGraph) : undefined
@@ -285,41 +283,18 @@ function showSimplePlanSummary(template: TfJson, target: string, entrypoints: st
     }
 
     printLine()
-    if (showResourceSummary) {
-        const header = '---------------- Resource Summary ----------------'
-
-        function summarizeSymbol(sym: SymbolNode['value'], entries: ReturnType<typeof getResourceCounts>) {
-            const symName = renderBetterSymbolName(sym, workingDir, header.length)
-            printLine(symName)
-            for (const [k, v] of entries) {
-                if (k === '<Closure>') continue
-                // XXX: big hack to hide custom resource nodes
-                if (v === 1 && sym.name.endsWith(`new ${k}`)) continue
-    
-                const suffix = v > 1 ? ` (x${v})` : ''
-                printLine(`  |_ ${k}${suffix}`)
-            }
-        }
-
-        printLine(header)
-    
-        for (const [s, c] of counts) {
-            summarizeSymbol(s.value, c)
-        }
-    
-        printLine()
-    }
 
     // entrypoint && !entrypoint.startsWith('--') ? `${cliName} test ${entrypoint}` : 
     const isUpdate = !!previousData?.state && previousData.state.resources.length > 0
     const deployCmd = renderCmdSuggestion('deploy')
+    const verb = isUpdate ? 'update' : 'start'
     if (hasTests) {
         const testCmd = renderCmdSuggestion('test') 
         printLine(`Commands you can use next:`)
-        printLine(`  ${colorize('cyan', deployCmd)} to ${isUpdate ? 'update' : 'start'} your application`)
-        printLine(`  ${colorize('cyan', testCmd)} to ${isUpdate ? 'update' : 'start'} and test your application`)
+        printLine(`  ${deployCmd} to ${verb} your application`)
+        printLine(`  ${testCmd} to ${verb} and test your application`)
     } else {
-        printLine(`Run ${colorize('cyan', deployCmd)} to ${isUpdate ? 'update' : 'start'} your application`)
+        printLine(`Run ${deployCmd} to ${verb} your application`)
     }
 
     printLine()    
@@ -327,6 +302,13 @@ function showSimplePlanSummary(template: TfJson, target: string, entrypoints: st
     const previousTarget = previousData?.oldTemplate?.template['//']?.deployTarget
     if (previousTarget && previousTarget !== target) {
         printLine(colorize('yellow', `Previous deployment used a different target: ${previousTarget}`))
+    }
+
+    if (previousData?.state) {
+        const moves = evaluateMoveCommands(template, previousData?.state)
+        if (moves && moves.length > 0) {
+            printLine(`Detected possible refactors. Run ${renderCmdSuggestion('migrate')} to proceed.`)
+        }
     }
 }
 

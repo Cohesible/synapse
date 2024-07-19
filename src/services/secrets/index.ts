@@ -1,13 +1,37 @@
 import * as path from 'node:path'
 import { getGlobalCacheDirectory } from '../../workspaces'
-import { secrets } from '@cohesible/resources'
+// import * as secrets from '@cohesible/resources/secrets'
 import { getFs } from '../../execution'
 import { getLogger } from '../../logging'
-import { throwIfNotFileNotFoundError } from '../../utils'
+import { memoize, throwIfNotFileNotFoundError } from '../../utils'
 import { getInmemSecretService } from './inmem'
 
+interface Secret {
+    value: string
+    expiration?: string
+}
 
-const secretsCache = new Map<string, secrets.Secret>()
+interface SecretResource {
+    id: string
+    secretType: string
+}
+
+const getClient = memoize(() => {
+    return {
+        listSecrets: async () => [] as SecretResource[],
+        getSecretValue: async (id: string): Promise<Secret> => {
+            throw new Error('Not implemented')
+        },
+        createSecret: async (req: { secretType: string }) => {
+            throw new Error('Not implemented')
+        },
+        putSecretValue: async (id: string, secretType: string) => {
+            throw new Error('Not implemented')
+        }
+    }
+})
+
+const secretsCache = new Map<string, Secret>()
 
 // XXX: we should not be storing this in plaintext. OS keychain would be best
 const getSecretsCacheFile = () => path.resolve(
@@ -32,7 +56,7 @@ async function readSecretsCache() {
     }
 
     for (const [k, v] of Object.entries(JSON.parse(data))) {
-        secretsCache.set(k, v as secrets.Secret)
+        secretsCache.set(k, v as Secret)
     }
 }
 
@@ -48,13 +72,13 @@ async function getSecretValue(secretType: string) {
         return { value: process.env[envVar]! }
     }
 
-    const resp = await secrets.client.listSecrets()
+    const resp = await getClient().listSecrets()
     const filtered = resp.filter(s => s.secretType === secretType)
     if (filtered.length === 0) {
         throw new Error(`No secrets found matching type: ${secretType}`)
     }
 
-    return secrets.client.getSecretValue(filtered[0].id)
+    return getClient().getSecretValue(filtered[0].id)
 }
 
 export async function getSecret(type: string) {
@@ -77,16 +101,16 @@ export async function getSecret(type: string) {
 }
 
 async function getOrCreateSecret(secretType: string) {
-    const resp = await secrets.client.listSecrets()
-    const filtered = resp.filter(s => s.kind === secretType)
+    const resp = await getClient().listSecrets()
+    const filtered = resp.filter(s => s.secretType === secretType)
     if (filtered.length > 0) {
         return filtered[0]
     }
 
-    return await secrets.client.createSecret({ secretType })
+    return await getClient().createSecret({ secretType })
 }
 
 export async function putSecret(secretType: string, value: string, expiresIn?: number) {
     const secret = await getOrCreateSecret(secretType)
-    await secrets.client.putSecretValue(secret.id, value)
+    await getClient().putSecretValue(secret.id, value)
 }

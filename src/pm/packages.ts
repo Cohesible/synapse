@@ -31,7 +31,7 @@ import { cleanDir, fastCopyDir, removeDir } from '../zig/fs-ext'
 import { colorize, printLine } from '../cli/ui'
 import { OptimizedPackageManifest, PackageManifest, PublishedPackageJson, createManifestRepo, createMultiRegistryClient, createNpmRegistryClient } from './manifests'
 import { createGitHubPackageRepo, downloadGitHubPackage, githubPrefix } from './repos/github'
-import { createSynapsePackageRepo, sprPrefix } from './repos/spr'
+import { createSynapsePackageRepo, downloadSynapsePackage, sprPrefix } from './repos/spr'
 
 // legacy
 const providerRegistryHostname = ''
@@ -476,7 +476,6 @@ interface NpmRepoOptions {
 interface NpmPackageRepository extends PackageRepository {
     close: () => Promise<void>
     maybeDownloadPackage: (url: string, dest: string) => Promise<{ cached: boolean; dest: string }>
-    isDownloading: (dest: string) => boolean
 }
 
 function createNpmPackageRepo(opt?: NpmRepoOptions): NpmPackageRepository {
@@ -628,17 +627,13 @@ function createNpmPackageRepo(opt?: NpmRepoOptions): NpmPackageRepository {
         return p
     }
 
-    function isDownloading(dest: string) {
-        return pending.has(dest)
-    }
-
-    return { listVersions, getDependencies, getPeerDependencies, resolvePattern, getPackageJson, maybeDownloadPackage,isDownloading, close } 
+    return { listVersions, getDependencies, getPeerDependencies, resolvePattern, getPackageJson, maybeDownloadPackage, close } 
 }
 
 function parseCspmRef(url: string) {
     const ident = url.slice(url.startsWith('cspm') ? 5 : 4)
     if (!ident.startsWith('#')) {
-        throw new Error(`Public packages not implemented`)
+        throw new Error(`Public packages not implemented: ${ident}`)
     }
 
     return ident.slice(1)
@@ -782,7 +777,7 @@ function createSprRepoWrapper(
 
     function maybeMatchProvider(name: string) {
         const prefixLen = name.startsWith('cspm:') ? 5 : 4
-        const providerMatch = name.slice(prefixLen).match(/^_provider-([a-z]+):(.+)$/)
+        const providerMatch = name.slice(prefixLen).match(/^_provider-([a-z\/]+):(.+)$/)
         if (providerMatch) {
             return { name: providerMatch[1], version: parseVersionConstraint(providerMatch[2]) }
         }
@@ -833,7 +828,7 @@ function createSprRepoWrapper(
 
         if (name.startsWith(providerPrefix)) {
             return {
-                name: name.slice(providerPrefix.length),
+                name: name.slice(providerPrefix.length).split('/').pop()!,
                 version,
                 dist: {
                     tarball: getProviderSource(name.slice(providerPrefix.length)),
@@ -900,7 +895,7 @@ function createSprRepoWrapper(
             }
 
             if (pattern.startsWith(sprPrefix)) {
-                const resolved = await sprRepo.resolvePattern(spec, pattern)
+                const resolved = await sprRepo.resolvePattern(spec, pattern.slice(sprPrefix.length))
 
                 return { name: `spr:${resolved.name}`, version: resolved.version }
             }
@@ -1306,6 +1301,19 @@ function rebuildTree(data: ReturnType<typeof flattenImportMap>): RebuiltRootTree
         const deps = (s as any).data.dependencies ?? {}
         const peers = (s as any).data.peers ?? {}
 
+        function getName(data: PackageInfo) {
+            switch (data.type) {
+                case 'file':
+                    return `file:${data.name}`
+                case 'spr':
+                    return `${sprPrefix}${data.name}`
+                case 'synapse-provider':
+                    return `${providerPrefix}${data.name}`
+            }
+
+            return data.name
+        }
+
         const t: RebuiltTree = {
             id: root.ids++,
             name: s.data.name,
@@ -1316,7 +1324,7 @@ function rebuildTree(data: ReturnType<typeof flattenImportMap>): RebuiltRootTree
             peers: {},
             ghosts: {},
             resolved: {
-                name: s.data.type === 'synapse-provider' ? `${providerPrefix}${s.data.name}` : s.data.name,
+                name: getName(s.data),
                 version: s.data.version,
                 dependencies: deps,
                 peers: peers,
@@ -2179,6 +2187,24 @@ export async function writeToNodeModules(
                     })
                 }
             }
+
+            if (snapshot?.store && pkgInfo?.type === 'spr') {
+                const repo = getDataRepository()
+                const promises: Promise<void>[] = []
+                for (const [k, v] of Object.entries(snapshot.store.index.files)) {
+                    if (k.endsWith('.d.ts')) {
+                        promises.push(repo.readData(v.hash).then(d => fs.writeFile(path.resolve(dest, k), d)))
+                    }
+                }
+
+                promises.push(
+                    getFs().deleteFile(path.resolve(dest, '.synapse')).catch(throwIfNotFileNotFoundError),
+                    getFs().deleteFile(path.resolve(dest, 'package.json')).catch(throwIfNotFileNotFoundError),
+                )
+
+                await Promise.all(promises)
+                await copyIntoDir(pkgLocation, dest)
+            }
         }
 
         const oldEntry = oldPackages?.[directory]?.packageFile
@@ -2199,7 +2225,7 @@ export async function writeToNodeModules(
             return getFs().fileExists(path.resolve(dest, 'node_modules'))
         }
 
-        if (mode !== 'none' && pkgInfo?.type !== 'file') {
+        if (mode !== 'none' && pkgInfo?.type !== 'file' && !hasSnapshot) {
             // We need to wait for the parent copy to finish when using fast copy
             const parentDir = path.relative(installDir, dir)
             await promises[parentDir]
@@ -3326,8 +3352,8 @@ function getPackageDest(packagesDir: string, info: PackageInfo) {
     }
 
     const type = info.type ?? 'npm'
-    const qualifiedName = type === 'cspm' || type === 'spr'
-        ? `${info.name}-${info.resolved!.integrity!.slice(0, 10)}`
+    const qualifiedName = type === 'spr'
+        ? `${info.name}/${info.resolved!.integrity!.slice('sha256:'.length, 'sha256:'.length + 10)}`
         : `${info.name}-${info.version}`
     
     return path.resolve(packagesDir, type, qualifiedName)
@@ -3370,7 +3396,7 @@ export function createPackageInstaller(params?: PackageInstallerParams) {
         }
 
         const type = info.type ?? 'npm'
-        const url = info.resolved?.url
+        const url = info.resolved?.url || (info.type === 'spr' ? info.resolved?.integrity : undefined)
         if (!url) {
             return { type: 'err', reason: new Error(`Missing download url`) } as const
         }
@@ -3403,13 +3429,11 @@ export function createPackageInstaller(params?: PackageInstallerParams) {
         return pending
     
         async function maybeDownload() {
-            // const packagePath = path.resolve(dest, 'package.json')
-            const prefetched = info.type === 'npm' && getNpmPackageRepo().isDownloading(dest)
-            if (await fs.fileExists(dest) && !prefetched) {
+            if (await fs.fileExists(dest)) {
                 return { cacheHit: true, dest }
             }
 
-            if (type !== 'file' && !prefetched) {
+            if (type !== 'file') {
                 getLogger().debug(`Downloading package "${info.name}-${info.version}"`)
             }
     
@@ -3436,10 +3460,6 @@ export function createPackageInstaller(params?: PackageInstallerParams) {
 
             return { cacheHit: false, dest }
         }
-    }
-
-    async function downloadSynapsePackage(info: PackageInfo, dest = getPackageDest(packagesDir, info)) {
-
     }
 
     async function downloadToolPackage(info: PackageInfo, dest = getPackageDest(packagesDir, info)) {
@@ -3745,7 +3765,7 @@ export function createPackageInstaller(params?: PackageInstallerParams) {
     return {
         getImportMap,
         installProviderTypes,
-        downloadPackage: downloadPackage,
+        downloadPackage,
 
         getPublishedMappings,
         getPublishedMappings2,
@@ -3992,6 +4012,7 @@ export async function createPackageService(moduleResolver: ModuleResolver, repo 
             ? new Map(Object.entries(installation.importMap.sources).filter(x => !!x[1]).map(x => [x[1], x[0]] as const))
             : undefined
 
+        const rootMapping = installation.importMap?.mappings['#root']
         if (installation.importMap) {
             const expanded = expandImportMap(installation.importMap)
             moduleResolver.registerMapping(expanded, workingDirectory)
@@ -4014,7 +4035,21 @@ export async function createPackageService(moduleResolver: ModuleResolver, repo 
         }
 
         async function setupSynapsePkg(k: string, v: (typeof packages)[string]) {
-            const pkgDir = path.resolve(workingDirectory, v.directory)
+            // FIXME: won't work correctly for nested `spr` packages
+            function getPkgDir() {
+                if (!v.specifier || !rootMapping || !rootMapping[v.specifier]) {
+                    return v.directory
+                }
+
+                const loc = installation!.importMap!.locations[rootMapping[v.specifier]]
+                if (!loc) {
+                    return v.directory
+                }
+
+                return loc.location
+            }
+
+            const pkgDir = getPkgDir()
             const snapshot = v.snapshot ?? await getSnapshot(pkgDir)
             if (!snapshot) {
                 // throw new Error(`Missing build artifacts for package: ${k}`) 

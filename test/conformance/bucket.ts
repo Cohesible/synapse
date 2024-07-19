@@ -5,11 +5,16 @@ import { describe, it, expect, expectEqual } from 'synapse:test'
 describe('Bucket', () => {
     const b = new Bucket()
 
-    // TODO: rethink this API. Most JS APIs do not throw on missing keys.
-    it('throws if the key is absent', async () => {
-        const err = await b.get('missing-key').catch(e => e)
-        expect(err instanceof Error)
-        expectEqual(err.name, 'NoSuchKey')
+    it('returns undefined if the key is absent', async () => {
+        const data = await b.get('missing-key')
+        expectEqual(data, undefined)
+    })
+
+    it('returns a blob by default', async () => {
+        const data = 'hi'
+        await b.put('my-key', data)
+        const blob = await b.get('my-key')
+        expect(blob instanceof Blob)
     })
 
     it('stores', async () => {
@@ -21,9 +26,8 @@ describe('Bucket', () => {
     it('deletes', async () => {
         await b.put('delete-me', 'dummy')
         await b.delete('delete-me')
-        const err = await b.get('delete-me').catch(e => e)
-        expect(err instanceof Error)
-        expectEqual(err.name, 'NoSuchKey')
+        const data = await b.get('delete-me')
+        expectEqual(data, undefined)
     })
 
     it('stores (nested)', async () => {

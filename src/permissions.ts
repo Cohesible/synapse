@@ -250,96 +250,17 @@ function isProxy(o: any, checkPrototype = false) {
     return !!o && ((checkPrototype && unproxy in o) || !!Reflect.getOwnPropertyDescriptor(o, moveable2))
 }
 
-function substitute(template: any, args: any[], addStatement: (s: any) => void, thisArg?: any, context?: any): any {
-    if (typeof template === 'string') {
-        let result = template
-
-        const matched: boolean[] = []
-        for (let i = 0; i < args.length; i++) {
-            const arg = args[i]
-            const regexp = new RegExp(`\\{${i}\\.([A-Za-z0-9]+)\\}`, 'g')
-            result = result.replace(regexp, (_, prop) => {
-                matched[i] = true
-                // TODO: unions
-                if (isUnknown(arg[prop]) || isUnion(arg[prop])) {
-                    return '*'
-                } 
-                return arg[prop] ?? '*'
-            })
-        }
-
-        // ARGS2
-        for (let i = 0; i < args.length; i++) {
-            if (matched[i]) continue
-            const arg = args[i]
-            const regexp = new RegExp(`\\{${i}}`, 'g')
-            result = result.replace(regexp, (_) => {
-                matched[i] = true
-                if (isUnknown(arg)) {
-                    return '*'
-                } 
-                return arg ?? '*'
-            })
-        }
-
-        // ARGS3
-        // BIG HACK
-        for (let i = 0; i < args.length; i++) {
-            if (matched[i]) continue
-            const arg = args[i]
-            const regexp = new RegExp(`[^$]\\{([^\{\}]*)${i}\\.([A-Za-z0-9]+)([^\{\}]*)\\}`, 'g')
-            result = result.replace(regexp, (_, $1, $2, $3) => {
-                matched[i] = true
-                if (isUnknown(arg) || isUnknown(arg[$2])) {
-                    return '*'
-                } 
-                return `\{${$1}${arg[$2].toString().replace(/^\{/, '').replace(/\}$/, '')}${$3}\}`
-            })
-        }
-
-        if (context) {
-            if (original in context) {
-                context = context[original]
-            }
-
-            // FIXME: `replace` thinks these are functions and tries to call them
-            result = result.replace(/\{context\.Partition\}/g, context.partition.toString())
-            result = result.replace(/\{context\.Region\}/g, context.regionId.toString())
-            result = result.replace(/\{context\.Account\}/g, context.accountId.toString())
-        }
-
-        return result
-    } else if (Array.isArray(template)) {
-        // XXX: ugly hack, need to clean-up the permissions API
-        if (typeof template[0] === 'string') {
-            return template.map(v => substitute(v, args, addStatement, thisArg, context))
-        }
-
-        template.forEach(v => substitute(v, args, addStatement, thisArg, context))
+function substitute(template: any, args: any[], thisArg?: any): any {
+    if (Array.isArray(template)) {
+        template.forEach(v => substitute(v, args, thisArg))
 
         return createUnknown()
     } else if (typeof template === 'function') {
-        if (context && original in context) {
-            context = context[original]
-        }
-
-        const $context = Object.create(context ?? null, { 
-            addStatement: { value: addStatement },
-            createUnknown: { value: createUnknown },
-        })
-
-        const thisArgWithCtx = Object.create(thisArg ?? null, {
-            $context: { value: $context }
-        })
-
-        return template.apply(thisArgWithCtx, args)
+        return template.apply(thisArg, args)
     } else if (typeof template === 'object' && !!template) {
-        const result: any = {}
         for (const [k, v] of Object.entries(template)) {
-            result[k] = substitute(v, args, addStatement, thisArg, context)
+            substitute(v, args, thisArg)
         }
-
-        addStatement(result)
 
         return createUnknown()
     } else {
@@ -388,7 +309,7 @@ export function createPermissionsBinder() {
             getStatements().push(s)
         }
 
-        function evaluate(target: any, getContext: (target: any) => any, globals?: { console?: any }, args: any[] = [], thisArg?: any) {
+        function evaluate(target: any, globals?: { console?: any }, args: any[] = [], thisArg?: any) {
             const solver = createSolver()
             const factoryFunctions = new Map<string, (...args: any[]) => any>()
             function getFactoryFunction(fileName: string) {
@@ -413,7 +334,7 @@ export function createPermissionsBinder() {
                 skipCache()
 
                 return function (...args: any[]) {
-                    return substitute(model, args, addStatement, t, getContext(t))
+                    return substitute(model, args, t)
                 }
             }
 
@@ -423,7 +344,7 @@ export function createPermissionsBinder() {
                 const proto = {} as Record<string, any>
                 for (const [k, v] of Object.entries(model)) {
                     proto[k] = function (...args: any[]) {
-                        return substitute(v, args, addStatement, t, getContext(t))
+                        return substitute(v, args, t)
                     }
                 }
 
@@ -458,7 +379,7 @@ export function createPermissionsBinder() {
                     return function (...args: any[]) { 
                         if (model.$constructor) {
                             const t = thisArg ?? obj
-                            substitute(model.$constructor, args, addStatement, t, getContext(t))
+                            substitute(model.$constructor, args, t)
                         }
 
                         return createInstance(model.methods, obj)

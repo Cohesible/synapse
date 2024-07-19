@@ -8,6 +8,7 @@ import * as net from 'synapse:srl/net'
 import * as compute from 'synapse:srl/compute'
 import * as storage from 'synapse:srl/storage'
 import { HttpError } from 'synapse:http'
+import { addResourceStatement } from '../permissions'
 
 // DBB name: 3-255
 // [a-zA-Z0-9_.-]+
@@ -467,64 +468,85 @@ core.addTarget(compute.SimpleLock, SimpleLock, 'aws')
 
 core.addTarget(storage.Table, Table, 'aws')
 core.bindModel(DynamoDB.DynamoDB, {
-    'putItem': {
-        'Effect': 'Allow',
-        'Action': 'dynamodb:PutItem',
-        'Resource': 'arn:{context.Partition}:dynamodb:{context.Region}:{context.Account}:table/{0.TableName}' 
+    'putItem': function (req) {
+        addResourceStatement({
+            service: 'dynamodb',
+            action: 'PutItem',
+            resource: `table/${req.TableName}`
+        }, this)
+
+        return core.createUnknown()
     },
-    'getItem': {
-        'Effect': 'Allow',
-        'Action': 'dynamodb:GetItem',
-        'Resource': 'arn:{context.Partition}:dynamodb:{context.Region}:{context.Account}:table/{0.TableName}' 
+    'getItem': function (req) {
+        addResourceStatement({
+            service: 'dynamodb',
+            action: 'GetItem',
+            resource: `table/${req.TableName}`
+        }, this)
+
+        return core.createUnknown()
     },
     'batchGetItem': function (req) {
         const items = req.RequestItems!
         const tables = new Set(Object.keys(items))
         for (const t of tables) {
-            const arn = `arn:${this.$context.partition}:dynamodb:${this.$context.regionId}:${this.$context.accountId}:table/${t}`
-            this.$context.addStatement({
-                Effect: 'Allow',
-                Action: 'dynamodb:BatchGetItem',
-                Resource: arn,
-            })
+            addResourceStatement({
+                service: 'dynamodb',
+                action: 'BatchGetItem',
+                resource: `table/${t}`
+            }, this)
         }
 
-        return { Responses: Object.fromEntries(Array.from(tables).map(t => [t, this.$context.createUnknown()])) }
+        return { Responses: Object.fromEntries(Array.from(tables).map(t => [t, core.createUnknown()])) }
     },
     'batchWriteItem': function (req) {
         const items = req.RequestItems!
         const tables = new Set(Object.keys(items))
         for (const t of tables) {
-            const arn = `arn:${this.$context.partition}:dynamodb:${this.$context.regionId}:${this.$context.accountId}:table/${t}`
-            this.$context.addStatement({
-                Effect: 'Allow',
-                Action: 'dynamodb:BatchWriteItem',
-                Resource: arn,
-            })
+            addResourceStatement({
+                service: 'dynamodb',
+                action: 'BatchWriteItem',
+                resource: `table/${t}`
+            }, this)
         }
 
         return {}
     },
-    'deleteItem': {
-        'Effect': 'Allow',
-        'Action': 'dynamodb:DeleteItem',
-        'Resource': 'arn:{context.Partition}:dynamodb:{context.Region}:{context.Account}:table/{0.TableName}' 
+    'deleteItem': function (req) {
+        addResourceStatement({
+            service: 'dynamodb',
+            action: 'DeleteItem',
+            resource: `table/${req.TableName}`
+        }, this)
+
+        return core.createUnknown()
     },
-    'updateItem': {
-        'Effect': 'Allow',
-        'Action': 'dynamodb:UpdateItem',
-        'Resource': 'arn:{context.Partition}:dynamodb:{context.Region}:{context.Account}:table/{0.TableName}' 
+    'updateItem': function (req) {
+        addResourceStatement({
+            service: 'dynamodb',
+            action: 'UpdateItem',
+            resource: `table/${req.TableName}`
+        }, this)
+
+        return core.createUnknown()
     },
-    'scan': {
-        'Effect': 'Allow',
-        'Action': 'dynamodb:Scan',
-        'Resource': 'arn:{context.Partition}:dynamodb:{context.Region}:{context.Account}:table/{0.TableName}' 
+    'scan': function (req) {
+        addResourceStatement({
+            service: 'dynamodb',
+            action: 'Scan',
+            resource: `table/${req.TableName}`
+        }, this)
+
+        return core.createUnknown()
     },
-    'listTables': {
-        'Effect': 'Allow',
-        'Action': 'dynamodb:ListTables',
-        'Resource': '*' 
-    }
+    'listTables': function (req) {
+        addResourceStatement({
+            service: 'dynamodb',
+            action: 'ListTables',
+        }, this)
+
+        return core.createUnknown()
+    },
 })
 
 export class Counter {

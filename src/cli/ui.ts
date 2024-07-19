@@ -896,7 +896,17 @@ export function createDisplay() {
             await writer.flush()
         }
 
-        return { write: (text: string) => write(text, true), writeLine, createRow, createFooter, dispose, clearScreen }
+        return { 
+            write: (text: string) => write(text, true), 
+            writeLine, 
+            createRow, 
+            createFooter, 
+            dispose, 
+            clearScreen,
+            get disposed() {
+                return disposed
+            }
+        }
     }
 
     function cancelPending(data: ViewData) {
@@ -1106,6 +1116,9 @@ export function createDisplay() {
             createRow: (text) => createDisplayRow(text),
             dispose: async () => {},
             clearScreen: async () => {},
+            get disposed() {
+                return false
+            },
         }
     }
 
@@ -1117,12 +1130,16 @@ export function createDisplay() {
             await v.dispose()
         }
 
-        writer.showCursor()
+        if (process.stdout.isTTY) {
+            writer.showCursor()
+        }
+
         if (closeStdout) {
             await writer.end()
         } else {
             await writer.flush()
         }
+
         writer.tty?.dispose()
     }
 
@@ -1313,7 +1330,7 @@ export function createTreeView(name: string, display = getDisplay()) {
 
 // This is preferred over `console.log` because we want to change the output depending on where the tool is ran
 export function print(msg: string) {
-    if (!process.stdout.isTTY) {
+    if (!process.stdout.isTTY || getDisplay().getOverlayedView().disposed) {
         return process.stdout.write(stripAnsi(msg))
     }
 

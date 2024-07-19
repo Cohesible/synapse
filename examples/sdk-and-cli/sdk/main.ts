@@ -5,12 +5,12 @@ import { fetch } from 'synapse:http'
 const bucket = new Bucket()
 const service = new HttpService({ auth: 'none' })
 
-const getRoute = service.addRoute('GET /{key+}', async req => {
+const getRoute = service.route('GET', '/{key+}', async req => {
     const { key } = req.pathParameters
     return bucket.get(key, 'utf-8')
 })
 
-const putRoute = service.addRoute('PUT /{key+}', async (req, body: string) => {
+const putRoute = service.route('PUT', '/{key+}', async (req, body: string) => {
     const { key } = req.pathParameters
     await bucket.put(key, body)
 })
