@@ -1,4 +1,4 @@
-import { getLogger } from '../..'
+import { getLogger } from '../../logging'
 import { DeployLogEvent, FailedTestEvent, TestEvent, TestLogEvent } from '../../logging'
 import { colorize, format, printLine } from '../ui'
 import * as nodeUtil from 'node:util'
@@ -17,6 +17,8 @@ export function createTestView() {
         return dur < 5 ? 0 : dur
     }
 
+    const cachedTests = new Map<number, number[]>()
+
     const indentLevel = new Map<number, number>()
     function getIndent(ev: TestEvent) {
         if (ev.parentId === undefined) {
@@ -33,6 +35,15 @@ export function createTestView() {
     }
 
     const l = getLogger().onTest(ev => {
+        if (ev.status === 'cached') {
+            const parentId = ev.parentId ?? -1
+            const arr = cachedTests.get(parentId) ?? []
+            arr.push(ev.id)
+            cachedTests.set(parentId, arr)
+
+            return
+        }
+
         // TODO: dynamically show # of tests pending when in tty
         if (ev.status === 'pending') {
             return
@@ -79,19 +90,28 @@ export function createTestView() {
         }
     }
 
-    const testLogs: (TestLogEvent | DeployLogEvent)[] = []
+    const testLogs: TestLogEvent[] = []
+    getLogger().onTestLog(ev => testLogs.push(ev))
 
-    // getLogger().onTestLog(ev => testLogs.push(ev))
-    // TODO: tests always emit deploy logs atm
-    // This is OK because we can get the test id from the resource id
-    getLogger().onDeployLog(ev => testLogs.push(ev))
-
-    function dispose() {
+    function dispose(failures: FailedTestEvent[], showAllLogs?: boolean) {
         l.dispose()
-        if (testLogs.length > 0) {
+
+        if (cachedTests.size > 0) {
+            let count = 0
+            for (const [k, v] of cachedTests) {
+                count += v.length
+            }
+
+            printLine()
+            printLine(colorize('gray', `Skipped ${count} unchanged tests`))
+        }
+
+        const failedTests = new Set(failures.map(ev => ev.id))
+        const filtered = showAllLogs ? testLogs : testLogs.filter(ev => failedTests.has(ev.id))
+        if (filtered.length > 0) {
             printLine()
             printLine('Test logs:')
-            for (const ev of testLogs) {
+            for (const ev of filtered) {
                 printLine(`    ${format(...ev.args)}`)
             }
         }

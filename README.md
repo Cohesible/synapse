@@ -25,11 +25,17 @@ Features:
 ```main.ts
 import { Bucket } from 'synapse:srl/storage'
 
+// `Bucket` is a storage resource, which can be deployed locally or to the cloud
 const bucket = new Bucket()
 
 export async function main() {
-    await bucket.put('hello', 'world!')
-    console.log(await bucket.get('hello', 'utf-8'))
+    const data = await bucket.get('hello', 'utf-8')
+    console.log('hello', data)
+
+    if (data === undefined) {
+        await bucket.put('hello', 'world!')
+        console.log('Wrote to the bucket, run me again!')
+    }
 }
 ```
 

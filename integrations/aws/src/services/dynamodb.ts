@@ -13,21 +13,48 @@ import { addResourceStatement } from '../permissions'
 // DBB name: 3-255
 // [a-zA-Z0-9_.-]+
 
+interface TableItem {
+    // The `__` is legacy and kept around for backwards compat
+    readonly __key: string
+    /** @deprecated */
+    readonly __value?: any
+    readonly value?: any
+    readonly sortKey?: string
+}
+
+function deserializeTableItem(rawItem: Record<string, DynamoDB.AttributeValue>) {
+    const item = deserialize(rawItem) as TableItem
+    if (item.__value) {
+        return JSON.parse(item.__value)
+    }
+
+    return item.value!
+}
+
 export class Table<K, V> {
     private readonly client = createClient(DynamoDB.DynamoDB)
     public readonly resource: aws.DynamodbTable
-    private readonly keyPrefix = undefined
 
-    public constructor() {
+    public constructor(private readonly opt?: { sortKeyDelimiter?: string }) {
         // FIXME: use map type
+        const attribute: aws.DynamodbTableAttributeProps[] = [{
+            name: '__key',
+            type: 'S',
+        }]
+
+        if (opt?.sortKeyDelimiter) {
+            attribute.push({
+                name: 'sortKey',
+                type: 'S',
+            })
+        }
+
         this.resource = new aws.DynamodbTable({
             name: generateIdentifier(aws.DynamodbTable, 'name'),
             billingMode: 'PAY_PER_REQUEST',
             hashKey: '__key',
-            attribute: [{
-                name: '__key',
-                type: 'S',
-            }],
+            rangeKey: opt?.sortKeyDelimiter ? 'sortKey' : undefined,
+            attribute,
             pointInTimeRecovery: lib.isProd() ? { enabled: true } : undefined,
             // TODO: enable this via a CLI flag too?
             deletionProtectionEnabled: lib.isProd() ? true : undefined,
@@ -40,13 +67,12 @@ export class Table<K, V> {
             Key: this.makeKey(key),
             ConsistentRead: true, // TODO: make configurable
         })
-    
-        const data = resp.Item?.['__value']?.['S']
-        if (data === undefined) {
-            return data as any
+
+        if (!resp.Item) {
+            return
         }
 
-        return JSON.parse(data)
+        return deserializeTableItem(resp.Item)
     }
 
     public async set(key: K, val: V): Promise<void> {
@@ -54,7 +80,7 @@ export class Table<K, V> {
             TableName: this.resource.name,
             Item: {
                 ...this.makeKey(key),
-                __value: { S: JSON.stringify(val) } // BUG: this fails for non-serializable shapes
+                value: serialize(val),
             },
         })
     }
@@ -67,13 +93,23 @@ export class Table<K, V> {
     }
 
     public async keys(): Promise<K[]> {
+        if (!this.opt?.sortKeyDelimiter) {
+            const resp = await this.client.scan({
+                TableName: this.resource.name,
+                ProjectionExpression: '#k',
+                ExpressionAttributeNames: { '#k': '__key' },
+            })
+    
+            return resp.Items!.map(i => i['__key']['S']! as K)
+        }
+
         const resp = await this.client.scan({
             TableName: this.resource.name,
-            ProjectionExpression: '#k',
-            ExpressionAttributeNames: { '#k': '__key' },
+            ProjectionExpression: '#k, #s',
+            ExpressionAttributeNames: { '#k': '__key', '#s': 'sortKey' },
         })
 
-        return resp.Items!.map(i => i['__key']['S']! as K)
+        return resp.Items!.map(i => `${i['__key']['S']!}${this.opt.sortKeyDelimiter}${i['sortKey']['S']!}` as K)
     }
 
     async *values(): AsyncIterable<V[]> {
@@ -81,13 +117,12 @@ export class Table<K, V> {
         while (true) {
             const resp = await this.client.scan({
                 TableName: this.resource.name,
-                ProjectionExpression: '#v',
-                ExpressionAttributeNames: { '#v': '__value' },
+                ProjectionExpression: 'value',
                 ExclusiveStartKey: startKey,
             })
     
-            yield resp.Items!.map(i => JSON.parse(i['__value']!['S']!))
-    
+            yield resp.Items!.map(deserializeTableItem)
+
             startKey = resp.LastEvaluatedKey
             if (!startKey) {
                 break
@@ -116,12 +151,11 @@ export class Table<K, V> {
 
         const result: { key: K, value: V }[] = []
         for (const item of items) {
-            const itemKey = item['__key']['S']
-            const key = keys.find(k => this.makeKey(k)['__key']['S'] === itemKey)
+            const itemKey = this.getCompositeKey(item)
+            const key = keys.find(k => k === itemKey)
             if (!key) continue // Item wasn't in response
 
-            const data = item['__value']['S']!
-            result.push({ key, value: JSON.parse(data) })
+            result.push({ key, value: deserializeTableItem(item) })
         }
 
         return result
@@ -138,7 +172,7 @@ export class Table<K, V> {
                             PutRequest: {
                                 Item: {
                                     ...this.makeKey(i.key),
-                                    __value: { S: JSON.stringify(i.value) } // BUG: this fails for non-serializable shapes
+                                    value: serialize(i.value),
                                 }
                             }
                         }
@@ -152,15 +186,31 @@ export class Table<K, V> {
         }
     }
 
-    // TODO
-    // public async query(expression: any): Promise<T[]> {
-    // }
+    private getCompositeKey(item: Record<string, DynamoDB.AttributeValue>) {
+        if (!this.opt?.sortKeyDelimiter) {
+            return item['__key']['S']
+        }
+
+        return `${item['__key']['S']}${this.opt.sortKeyDelimiter}${item['sortKey']['S']}`
+    }
 
     private makeKey(key: K) {
+        if (!this.opt?.sortKeyDelimiter) {
+            return { __key: { S: String(key) } }
+        }
+
+        const parts = String(key).split(this.opt.sortKeyDelimiter)
+        if (parts.length === 1) {
+            throw new Error(`Key is missing sort key delimiter "${this.opt.sortKeyDelimiter}"`)
+        }
+
+        if (parts.length > 2) {
+            throw new Error(`Key contains more than one sort key delimiter "${this.opt.sortKeyDelimiter}"`)
+        }
+
         return {
-            __key: {
-                S: this.keyPrefix !== undefined ? `${this.keyPrefix}#${String(key)}` : String(key)
-            }
+            __key: { S: parts[0] },
+            sortKey: { S: parts[1] },
         }
     }
 }
@@ -280,7 +330,7 @@ function serialize(obj: any): DynamoDB.AttributeValue {
         case 'object':
             return serializeObject(obj)
         default:
-            throw new Error(`Unable to serialize object: ${obj}`)
+            throw new Error(`Unable to serialize object: ${obj} [type: ${typeof obj}]`)
     }
 
     function serializeObject(o: any): DynamoDB.AttributeValue {
@@ -294,7 +344,7 @@ function serialize(obj: any): DynamoDB.AttributeValue {
         
         const proto = Object.getPrototypeOf(o)
         if (proto !== Object.prototype && proto !== null) {
-            throw new Error(`Unable to serialize object: ${o}`)
+            throw new Error(`Unable to serialize non-trivial object: ${o}`)
         }
 
         const res: Record<string, DynamoDB.AttributeValue> = {}
@@ -331,7 +381,7 @@ function deserialize(item: Record<string, DynamoDB.AttributeValue>): any {
             return null
         }
 
-        // BUG: throw here?
+        throw new Error(`Unknown value type: ${Object.keys(value)}`)
     }
 }
 

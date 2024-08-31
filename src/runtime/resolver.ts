@@ -73,7 +73,7 @@ function createLookupTable<T = unknown>() {
                 locationType: v.locationType,
             }
 
-            // Sift the mapping upwards to simulate node
+            // Sift the mapping upwards to simulate node (TODO: is this still needed?)
             if (key !== rootKey) {
                 const m = trie.get(rootKey)?.mappings
                 if (m && !m[k]) {
@@ -164,7 +164,7 @@ export interface PatchedPackage {
     readonly files: Record<string, (contents: string) => string>
 }
 
-export type ModuleTypeHint =  'cjs' | 'esm' | 'native' | 'pointer' | 'builtin' | 'json' | 'sea-asset'
+export type ModuleTypeHint =  'cjs' | 'esm' | 'native' | 'pointer' | 'builtin' | 'json' | 'sea-asset' | 'wasm'
 
 // Module resolution has two phases:
 // 1. Determine the _virtual_ file that a specifier + location maps to
@@ -175,7 +175,7 @@ export type ModuleTypeHint =  'cjs' | 'esm' | 'native' | 'pointer' | 'builtin' |
 // separate entities.
 
 export type ModuleResolver = ReturnType<typeof createModuleResolver>
-export function createModuleResolver(fs: Pick<SyncFs, 'readFileSync' | 'fileExistsSync'>, workingDirectory: string) {
+export function createModuleResolver(fs: Pick<SyncFs, 'readFileSync' | 'fileExistsSync'>, workingDirectory: string, includeTs = false) {
     const lookupTable = createLookupTable<SourceInfo>()
     const globals: Record<string, string> = {}
     const resolvedSubpaths = new Map<string, string>()
@@ -231,16 +231,28 @@ export function createModuleResolver(fs: Pick<SyncFs, 'readFileSync' | 'fileExis
         }
 
         const candidates = [
-            path.resolve(absPath, 'index.js'),
-            path.resolve(absPath, 'index.json'),
+            `${absPath}${path.sep}index.js`,
+            `${absPath}${path.sep}index.json`,
             absPath
         ]
+
+        if (includeTs) {
+            if (extname === '.ts') {
+                return absPath
+            }
+
+            candidates.unshift(`${absPath}${path.sep}index.ts`)
+        }
     
         if (specifier !== '.') {
             candidates.unshift(`${absPath}.infra.js`) // XXX: needed when not compiling with `--include-js`
             candidates.unshift(`${absPath}.json`)
             candidates.unshift(`${absPath}.js`)
             // candidates.unshift(`${absPath}.node`)
+
+            if (includeTs) {
+                candidates.unshift(`${absPath}.ts`)
+            }
         }
 
         for (const p of candidates) {
@@ -256,6 +268,10 @@ export function createModuleResolver(fs: Pick<SyncFs, 'readFileSync' | 'fileExis
                 }
                 return p
             }
+        }
+
+        if (extname === '.node' || extname === '.wasm') {
+            return absPath
         }
 
         throw new Error(`Failed to resolve module: ${specifier} [importer: ${location}]`)

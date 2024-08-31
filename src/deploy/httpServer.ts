@@ -2,7 +2,7 @@ import type * as http from 'node:http'
 // import * as http2 from 'http2'
 import * as url from 'node:url'
 import * as stream from 'node:stream'
-import { getLogger } from '..'
+import { getLogger } from '../logging'
 
 // https://developer.mozilla.org/en-US/docs/Web/HTTP/Methods
 type HttpMethod = 'GET' | 'POST' | 'PUT' | 'HEAD' | 'DELETE' | 'PATCH' | string

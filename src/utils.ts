@@ -363,12 +363,23 @@ export function isSymbolOfType<T extends ts.Node>(
     return !!sym?.valueDeclaration && fn(sym.valueDeclaration)
 }
 
-function isEnclosingNode(node: ts.Node) {
-    return ts.isSourceFile(node) || ts.isFunctionDeclaration(node) || ts.isMethodDeclaration(node) || ts.isClassDeclaration(node) || isMutuallyExclusiveBlockScope(node)
-}
-
 function getScopeNode(node: ts.Node) {
-    const parent = ts.findAncestor(node, isEnclosingNode)
+    const parent = ts.findAncestor(node, p => {
+        switch (p.kind) {
+            case ts.SyntaxKind.SourceFile:
+            case ts.SyntaxKind.ClassDeclaration:
+            case ts.SyntaxKind.MethodDeclaration:
+            case ts.SyntaxKind.FunctionDeclaration:
+                return true
+
+            case ts.SyntaxKind.Block:
+                if (p.parent.kind === ts.SyntaxKind.IfStatement) {
+                    return true
+                }
+        }
+
+        return false
+    })
     if (!parent) {
         failOnNode(`No enclosing element found`, node)
     }
@@ -376,8 +387,44 @@ function getScopeNode(node: ts.Node) {
     return parent
 }
 
+function getNameForThis(node: ts.Node) {
+    const parent = ts.findAncestor(node, p => {
+        switch (p.kind) {
+            case ts.SyntaxKind.ClassExpression:
+            case ts.SyntaxKind.ClassDeclaration:
+            case ts.SyntaxKind.FunctionExpression:
+            case ts.SyntaxKind.FunctionDeclaration:
+                return true
+
+            // case ts.SyntaxKind.GetAccessor:
+            // case ts.SyntaxKind.SetAccessor:
+            // case ts.SyntaxKind.MethodDeclaration:
+            //     if (p.parent.kind === ts.SyntaxKind.ObjectLiteralExpression) {
+            //         return true
+            //     }
+
+            default:
+                return false
+        }
+    })
+
+    if (!parent) {
+        failOnNode(`Failed to get container declaration`, node)
+    }
+
+    // TODO: search for a name for the object literal
+    // switch (parent.kind) {
+    //     case ts.SyntaxKind.GetAccessor:
+    //     case ts.SyntaxKind.SetAccessor:
+    //     case ts.SyntaxKind.MethodDeclaration:
+    //         return getName(parent.parent)
+    // }
+
+    return getName(parent)
+}
+
 // doesn't handle aliased identifiers yet
-export function getName2(node: ts.Node): string | undefined {
+export function getName(node: ts.Node): string | undefined {
     if (ts.isIdentifier(node)) {
         return node.text
     }
@@ -385,20 +432,7 @@ export function getName2(node: ts.Node): string | undefined {
     // We could use the string literal 'this' instead of finding the containing decl.
     // Although this could be problematic when child classes override parent methods.
     if (node.kind === ts.SyntaxKind.ThisKeyword) {
-        const parent = ts.findAncestor(node, ts.isClassDeclaration) ?? ts.findAncestor(node, ts.isClassExpression) ?? ts.findAncestor(node, ts.isObjectLiteralExpression) ?? ts.findAncestor(node, ts.isFunctionExpression) ?? ts.findAncestor(node, ts.isFunctionDeclaration)
-        if (!parent) {
-            failOnNode(`Failed to get container declaration`, node)
-        }
-
-        return getName2(parent)
-    }
-
-    if (ts.isObjectLiteralElement(node)) {
-        if (!node.name) {
-            return
-        }
-
-        return getName2(node.name)
+        return getNameForThis(node)
     }
 
     if (ts.isVariableDeclaration(node) || ts.isPropertyDeclaration(node)) {
@@ -406,11 +440,7 @@ export function getName2(node: ts.Node): string | undefined {
         //     failOnNode(`Could not get name of node`, node)
         // }
 
-        return getName2(node.name)
-    }
-
-    if (ts.isGetAccessorDeclaration(node)) {
-        return getName2(node.name)
+        return getName(node.name)
     }
 
     if (ts.isClassDeclaration(node) || ts.isFunctionDeclaration(node) || ts.isMethodDeclaration(node)) {
@@ -418,12 +448,12 @@ export function getName2(node: ts.Node): string | undefined {
             failOnNode(`Could not get name of declaration node`, node)
         }
 
-        return getName2(node.name)
+        return getName(node.name)
     }
 
     if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
         const parts = splitExpression(node.expression)
-        const names = parts.map(getName2).filter(isNonNullable)
+        const names = parts.map(getName).filter(isNonNullable)
 
         return names.join('--')
     }
@@ -434,11 +464,27 @@ export function getName2(node: ts.Node): string | undefined {
             failOnNode('No class declaration found for constructor', node)
         }
 
-        return getName2(parent)!
+        return getName(parent)!
     }
 
     if (ts.isPropertyAccessExpression(node)) {
-        return [getName2(node.expression), getName2(node.name)].join('--')
+        return [getName(node.expression), getName(node.name)].join('--')
+    }
+
+    if (ts.isFunctionExpression(node)) {
+        if (node.name) {
+            return getName(node.name)
+        }
+
+        return '__anonymous'
+    }
+
+    if (ts.isClassExpression(node)) {
+        if (node.name) {
+            return getName(node.name)
+        }
+
+        return '__anonymous'
     }
 
     if (ts.isExpressionWithTypeArguments(node)) {
@@ -447,23 +493,19 @@ export function getName2(node: ts.Node): string | undefined {
             failOnNode('No class declaration found for extends clause', node)
         }
 
-        return getName2(parent)
+        return getName(parent)
     }
 
-    if (ts.isFunctionExpression(node)) {
-        if (node.name) {
-            return getName2(node.name)
+    if (ts.isObjectLiteralElement(node)) {
+        if (!node.name) {
+            return
         }
 
-        return '__anonymous'
+        return getName(node.name)
     }
 
-    if (ts.isClassExpression(node)) {
-        if (node.name) {
-            return getName2(node.name)
-        }
-
-        return '__anonymous'
+    if (ts.isGetAccessorDeclaration(node)) {
+        return getName(node.name)
     }
 
     if (node.kind === ts.SyntaxKind.SuperKeyword) {
@@ -473,18 +515,33 @@ export function getName2(node: ts.Node): string | undefined {
             failOnNode('No class declaration found when using `super` keyword', node)
         }
 
-        return getName2(superClass)
+        return getName(superClass)
     }
 }
 
 function getNameWithDecl(node: ts.Node): string {
-    const baseName = getName2(node)
+    const baseName = getName(node)
     if (!baseName) {
         failOnNode('No name', node)
     }
 
-    const parent = ts.findAncestor(node, ts.isVariableDeclaration) || ts.findAncestor(node, ts.isPropertyDeclaration)
-    const parentName = parent ? getName2(parent) : undefined
+    const parent = ts.findAncestor(node, p => {
+        switch (p.kind) {
+            case ts.SyntaxKind.PropertyAssignment:
+            case ts.SyntaxKind.PropertyDeclaration:
+            case ts.SyntaxKind.VariableDeclaration:
+                return true
+
+            case ts.SyntaxKind.ClassDeclaration:
+            case ts.SyntaxKind.FunctionDeclaration:
+            case ts.SyntaxKind.ExpressionStatement:
+                return 'quit'
+        }
+
+        return false
+    })
+
+    const parentName = parent ? getName(parent) : undefined
     if (parentName !== undefined) {
         return [parentName, baseName].join('--')
     }
@@ -502,13 +559,6 @@ function getNameWithDecl(node: ts.Node): string {
 //
 // These are only qualified w.r.t to a single instantiation scope
 
-function isMutuallyExclusiveBlockScope(node: ts.Node) {
-    if (!ts.isBlock(node)) {
-        return false
-    }
-
-    return ts.isIfStatement(node.parent)
-}
 
 const cachedNames = new Map<ts.Node, string>()
 const scopeNames = new Map<ts.Node, Set<string>>()
@@ -527,13 +577,13 @@ export function getInstantiationName(node: ts.Node) {
     function getNameWithinScope(node: ts.Node) {
         // Variable statements/declarations must be unique within a scope
         if (ts.isVariableStatement(node)) {
-            return getName2(node.declarationList.declarations[0])!
+            return getName(node.declarationList.declarations[0])!
         } else if (ts.isVariableDeclaration(node)) {
-            return getName2(node)!
+            return getName(node)!
         } else if (ts.isClassDeclaration(node)) {
-            return getName2(node)!
+            return getName(node)!
         } else if (ts.isPropertyDeclaration(node)) {
-            return getName2(node)!
+            return getName(node)!
         }
     
         const scope = ts.getOriginalNode(getScopeNode(node))
@@ -642,6 +692,10 @@ export function isDeclared(node: ts.Node) {
     return ts.canHaveModifiers(node) && !!ts.getModifiers(node)?.find(m => m.kind === ts.SyntaxKind.DeclareKeyword)
 }
 
+export function isSymbolAssignmentLike(node: ts.Node) {
+    return ts.isVariableDeclaration(node) || ts.isPropertyDeclaration(node) || ts.isPropertyAssignment(node)
+}
+
 // Handles these cases:
 // * Properties e.g. { <name>: <node> }
 // * Functions e.g. <node function <name> { ... }>
@@ -653,9 +707,9 @@ export function inferName(node: ts.Node): string | undefined {
         return node.text
     }
 
-    if (ts.isVariableDeclaration(node) || ts.isPropertyDeclaration(node) || ts.isPropertyAssignment(node)) {
-        return inferName(node.name)
-    }
+    // if (isAssignmentLike(node)) {
+    //     return inferName(node.name)
+    // }
 
     if (ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) {
         if (!node.name) {
@@ -677,12 +731,27 @@ export function inferName(node: ts.Node): string | undefined {
         return inferName(node.parent)
     }
 
-    if (node.parent && ts.isVariableDeclaration(node.parent)) {
-        return inferName(node.parent)
+    if (node.parent && isSymbolAssignmentLike(node.parent)) {
+        const name = node.parent.name
+        if (ts.isIdentifier(name) || ts.isPrivateIdentifier(name) || ts.isStringLiteralLike(name)) {
+            return name.text
+        }
+
+        // TODO: bindings, computed names
+        return
     }
 
     if (node.parent?.parent && ts.isHeritageClause(node.parent.parent)) {
-        return inferName(node.parent.parent.parent)
+        const name = node.parent.parent.parent.name
+        if (!name) {
+            return 'default'
+        }
+
+        return name.text
+    }
+
+    if (node.parent.kind === ts.SyntaxKind.ParenthesizedExpression) {
+        return inferName(node.parent)
     }
 }
 
@@ -1526,28 +1595,64 @@ export function createRwMutex() {
 }
 
 interface FileHasherCache {
-    [file: string]: { hash: string; mtime: number }
+    [file: string]: { 
+        hash: string
+        mtime: number
+        checkTime?: number
+    }
+}
+
+interface FileHasherCacheWithTime {
+    files: FileHasherCache
+    mtime?: number
 }
 
 // This is should ideally only be used for source files
-export function createFileHasher(fs: Pick<Fs, 'readFile' | 'writeFile' | 'stat'>, cacheLocation: string) {
+export function createFileHasher(fs: Pick<Fs, 'readFile' | 'writeFile' | 'deleteFile' | 'stat'>, cacheLocation: string) {
+    // We use a single timestamp to represent the entire session
+    const checkTime = Date.now()
+    const location = path.resolve(cacheLocation, 'files.json')
+
     async function loadCache(): Promise<FileHasherCache> {
+        const data = await fs.readFile(location, 'utf-8').catch(throwIfNotFileNotFoundError)
+        if (!data) {
+            return {}
+        }
+
         try {
-            return JSON.parse(await fs.readFile(path.resolve(cacheLocation, 'files.json'), 'utf-8'))
+            return JSON.parse(data)
         } catch (e) {
-            throwIfNotFileNotFoundError(e)
+            // It seems like every JSON parse error contains "JSON" in the message
+            if (!(e instanceof SyntaxError) || !e.message.includes('JSON')) {
+                throw e
+            }
+
+            await fs.deleteFile(location)
+
             return {}
         }
     }
 
-    async function saveCache(data: FileHasherCache) {
-        const existing = await loadCache()
-        for (const [k, v] of Object.entries(existing)) {
-            if (!data[k] || data[k].mtime < v.mtime) {
-                data[k] = v
+    function pruneOldEntries(files: FileHasherCache) {
+        // 1 week covers a good amount of frequently-used files
+        // Per-program caches wouldn't need a time-based eviction policy
+        const threshold = 7 * 24 * 60 * 60 * 1000
+        for (const key of Object.keys(files)) {
+            if (files[key].checkTime !== checkTime && (checkTime - (files[key].checkTime ?? 0) > threshold)) {
+                delete files[key]
             }
         }
-        await fs.writeFile(path.resolve(cacheLocation, 'files.json'), JSON.stringify(data))
+
+        return files
+    }
+
+    async function saveCache(data: FileHasherCache) {
+        const files = pruneOldEntries(data)
+
+        // We're not concerned with clobbering concurrent writes
+        // This cache is currently global for simplicity, but it can easily be
+        // narrowed to per-project or per-program.
+        await fs.writeFile(location, JSON.stringify(files))
     }
 
     const getCache = memoize(loadCache)
@@ -1565,20 +1670,27 @@ export function createFileHasher(fs: Pick<Fs, 'readFile' | 'writeFile' | 'stat'>
             throw e
         })
 
+        // TODO: try rounding `mtime`?
         const cache = await cachePromise
         const cached = cache[fileName]
         if (cached && cached.mtime === stat.mtimeMs) {
+            cached.checkTime = checkTime
+
             return { hash: cached.hash }
         }
 
         const data = await fs.readFile(fileName)
         const hash = getHash(data)
-        cache[fileName] = { mtime: stat.mtimeMs, hash }
+        cache[fileName] = { mtime: stat.mtimeMs, hash, checkTime }
 
         return { hash }
     }
 
     async function flush() {
+        if (!getCache.cached) {
+            return
+        }
+
         await saveCache(await getCache())
         getCache.clear()
     }
@@ -1673,7 +1785,19 @@ export function gunzip(data: string | ArrayBuffer) {
 }
 
 export function isRelativeSpecifier(spec: string) {
-    return spec === '.' || spec.startsWith('./') || spec.startsWith('../') || spec === '..'
+    if (spec[0] !== '.') {
+        return false
+    }
+
+    if (!spec[1] || spec[1] === '/') {
+        return true
+    }
+
+    if (spec[1] !== '.') {
+        return false
+    }
+
+    return !spec[2] || spec[2] === '/'
 }
 
 // `localeCompare` calls `new Intl.Collator` which can take a bit of time to create
@@ -1840,9 +1964,9 @@ export function levenshteinDistance(a: string, b: string) {
 }
 
 interface CostFunctions<T> {
-    insert: (left: T) => number
+    remove: (left: T) => number
+    insert: (right: T) => number
     update: (left: T, right: T) => number
-    remove: (right: T) => number
 }
 
 type InsertOp<T> = ['insert', T]
@@ -1869,7 +1993,7 @@ export function arrayEditDistance<T>(a: T[], b: T[], costs: Partial<CostFunction
     const n = b.length + 1
     const dists: number[][] = []
     const ops: EditOp<T>[][][] = []
-    const { insert, update, remove } = costs
+    const { remove, insert, update } = costs
 
     for (let i = 0; i < m; i++) {
         dists[i] = []
@@ -1882,14 +2006,14 @@ export function arrayEditDistance<T>(a: T[], b: T[], costs: Partial<CostFunction
 
     for (let i = 1; i < m; i++) {
         const left = a[i - 1]
-        dists[i][0] = !insert ? i : dists[i - 1][0] + insert(left)
-        ops[i][0] = [...ops[i - 1][0], ['insert', left]]
+        dists[i][0] = !remove ? i : dists[i - 1][0] + remove(left)
+        ops[i][0] = [...ops[i - 1][0], ['remove', left]]
     }
 
     for (let j = 1; j < n; j++) {
         const right = b[j - 1]
-        dists[0][j] = !remove ? j : dists[0][j - 1] + remove(right)
-        ops[0][j] = [...ops[0][j - 1], ['remove', right]]
+        dists[0][j] = !insert ? j : dists[0][j - 1] + insert(right)
+        ops[0][j] = [...ops[0][j - 1], ['insert', right]]
     }
 
     for (let i = 1; i < m; i++) {
@@ -1897,8 +2021,8 @@ export function arrayEditDistance<T>(a: T[], b: T[], costs: Partial<CostFunction
             const left = a[i - 1]
             const right = b[j - 1]
             const c = [
-                dists[i - 1][j] + (insert ? insert(left) : 1),
-                dists[i][j - 1] + (remove ? remove(right) : 1),
+                dists[i - 1][j] + (remove ? remove(left) : 1),
+                dists[i][j - 1] + (insert ? insert(right) : 1),
                 dists[i - 1][j - 1] + (left === right ? 0 : update ? update(left, right) : 1),
             ]
 
@@ -1906,10 +2030,10 @@ export function arrayEditDistance<T>(a: T[], b: T[], costs: Partial<CostFunction
 
             switch (c.indexOf(m)) {
                 case 0:
-                    ops[i][j] = [...ops[i - 1][j], ['insert', left]]
+                    ops[i][j] = [...ops[i - 1][j], ['remove', left]]
                     break
                 case 1:
-                    ops[i][j] = [...ops[i][j - 1], ['remove', right]]
+                    ops[i][j] = [...ops[i][j - 1], ['insert', right]]
                     break
                 case 2:
                     ops[i][j] = [...ops[i - 1][j - 1], [left === right ? 'noop' : 'update', left, right]]

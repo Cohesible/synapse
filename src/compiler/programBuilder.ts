@@ -8,14 +8,14 @@ import { SourceMapHost, getNullTransformationContext } from '../static-solver/ut
 import { createSchemaFactory } from './validation'
 import { IncrementalHost, createIncrementalHost, getAllDependencies } from './incremental'
 import { ResolvedProgramConfig, getOutputFilename, shouldInvalidateCompiledFiles } from './config'
-import { getLogger, runTask } from '..'
+import { getLogger, runTask } from '../logging'
 import { createGraphCompiler, getModuleType } from '../static-solver'
 import { ResourceTypeChecker, createResourceGraph } from './resourceGraph'
 import { getWorkingDir } from '../workspaces'
 import { getArtifactFs, getProgramFs } from '../artifacts'
 import { getBuildTargetOrThrow } from '../execution'
-import { compileZig } from '../zig/compile'
-import { hasMainFunction, hasZigImport } from './entrypoints'
+import { compileAllZig, getZigCompilationGraph } from '../zig/compile'
+import { hasMainFunction, getZigImports } from './entrypoints'
 import { isWindows, makeRelative, resolveRelative } from '../utils'
 
 export interface ProgramBuilder {
@@ -70,7 +70,7 @@ export function createProgramBuilder(
         // We probably don't need to load this during `watch`?
         const oldSources = incremental ? await readSources() : undefined
         const oldHashes = oldSources ? Object.fromEntries(
-            Object.entries(oldSources).map(([k, v]) => [path.resolve(workingDir, k), v.hash])
+            Object.entries(oldSources).map(([k, v]) => [resolveRelative(workingDir, k), v.hash])
         ) : undefined
 
         // Disabling the incremental flag just means we won't try to use anything from a 
@@ -122,19 +122,13 @@ export function createProgramBuilder(
         const allSourceFiles = new Set(config.tsc.files.filter(x => !!x.match(/\.tsx?$/)).map(normalizeFileName))
         
         // ZIG COMPILATION
-        const isZigCompilationEnabled = !!(config.csc as any).zigFiles
-        const zigImportingFiles = isZigCompilationEnabled
-            ? new Map(await Promise.all([...allSourceFiles].map(async x => [x, await hasZigImport(path.relative(workingDir, x))] as const)))
-            : undefined
-
-        if (isZigCompilationEnabled) {
-            const includedZigFiles = new Set<string>((config.csc as any).zigFiles)
-            for (const f of includedZigFiles) {
-                const z = await compileZig(path.resolve(workingDir, f), config)
-                if (z) {
-                    getLogger().log('Compiled zig file', z)
-                }
+        const zigGraph = await runTask('zig', 'graph', () => getZigCompilationGraph([...allSourceFiles], workingDir), 1)
+        if (zigGraph?.changed) {
+            // TODO: check this earlier or make it not required
+            if (!config.tsc.cmd.options.allowArbitraryExtensions) {
+                throw new Error('Compiling with Zig modules requires adding "allowArbitraryExtensions" to your tsconfig.json "compilerOptions" section')
             }
+            await compileAllZig([...zigGraph.changed], config)
         }
 
         const changed = compilation.changed
@@ -178,7 +172,7 @@ export function createProgramBuilder(
                 if (r > 0) {
                     getLogger().debug(`Marked ${f} as infra file`)
                     infraFiles.add(f)
-                } else if (resourceGraph.hasCalledCallables(f) || zigImportingFiles?.get(f)) {
+                } else if (resourceGraph.hasCalledCallables(f) || zigGraph?.zigImportingFiles.has(f)) {
                     getLogger().debug(`Marked ${f} for runtime transforms`)
                     needsRuntimeTransform.add(f)
                 }
@@ -202,6 +196,9 @@ export function createProgramBuilder(
             }
         }
 
+        // note: `getTypeChecker` can make this call seem much worse than it really is
+        // For large projects, typescript init (like program and typechecker) usually 
+        // takes up more than 75% of the total time for small incremental changes.
         runTask('compile', 'mode analysis', () => determineCompilationModes(program), 10)
 
         const compilerHost = createHost(graphCompiler, resourceGraph, sourcemapHost, program, config.csc)
@@ -297,9 +294,6 @@ export function createProgramBuilder(
         // note: `watch` needs to be treated the same as `incremental`
         await runTask('compile', 'emit', async () => {
             await emitHost.complete(compilerHost, rootDir, outDir, getIncluded(), config.csc)
-            // if (!config.csc.noInfra) {
-            //     await compilerHost.finish(incremental)
-            // }
         }, 1)
 
         return {

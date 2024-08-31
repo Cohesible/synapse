@@ -272,150 +272,6 @@ export function createScopeTracker() {
     return { enter, getScope, getScopes, iterateScopes, dump }
 }
 
-// function first<T>(iter: Iterator<T, void>): T | undefined {
-//     const n = iter.next()
-//     if (n.done) {
-//         return
-//     }
-    
-//     return n.value
-// }
-
-// function find<T, U extends T = T>(iter: Iterator<T, void>, fn: (val: T) => val is U): U | undefined {
-//     const n = iter.next()
-//     if (n.done) {
-//         return
-//     }
-
-//     if (fn(n.value)) {
-//         return n.value
-//     }
-// }
-
-// function find2<T>(iter: Iterator<T, void>, fn: (val: T) => boolean): T | undefined {
-//     const n = iter.next()
-//     if (n.done) {
-//         return
-//     }
-
-//     if (fn(n.value)) {
-//         return n.value
-//     }
-// }
-
-// function getInstantiationName2(node: ts.Node, tracker: ReturnType<typeof createScopeTracker>): string {
-//     function getName(node: ts.Node): string  {
-//         if (ts.isIdentifier(node)) {
-//             return node.text
-//         }
-    
-//         if (node.kind === ts.SyntaxKind.ThisKeyword) {
-//             const p = find2(
-//                 tracker.iterateScopes('classes', 'functions'), 
-//                 n => !(n.kind === ts.SyntaxKind.Constructor || n.kind === ts.SyntaxKind.ArrowFunction)
-//             )
-
-//             // const parent = ts.findAncestor(node, ts.isClassDeclaration) ?? ts.findAncestor(node, ts.isClassExpression) ?? ts.findAncestor(node, ts.isObjectLiteralExpression) ?? ts.findAncestor(node, ts.isFunctionExpression) ?? ts.findAncestor(node, ts.isFunctionDeclaration)
-//             if (!p) {
-//                 tracker.dump()
-//                 failOnNode(`Failed to get container declaration`, node)
-//             }
-    
-//             return getName(p)
-//         }
-    
-//         if (ts.isObjectLiteralElement(node)) {
-//             if (!node.name) {
-//                 return ''
-//             }
-    
-//             return getName(node.name)
-//         }
-    
-//         if (ts.isVariableDeclaration(node) || ts.isPropertyDeclaration(node)) {
-//             // if (!ts.isIdentifier(node.name)) {
-//             //     failOnNode(`Could not get name of node`, node)
-//             // }
-    
-//             return getName(node.name)
-//         }
-    
-//         if (ts.isGetAccessorDeclaration(node) || ts.isSetAccessorDeclaration(node)) {
-//             return getName(node.name)
-//         }
-    
-//         if (ts.isClassDeclaration(node) || ts.isFunctionDeclaration(node) || ts.isMethodDeclaration(node)) {
-//             if (!node.name || !ts.isIdentifier(node.name)) {
-//                 failOnNode(`Could not get name of declaration node`, node)
-//             }
-    
-//             return getName(node.name)
-//         }
-    
-//         if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
-//             const parts = splitExpression(node.expression)
-//             const names = parts.map(getName).filter(isNonNullable)
-    
-//             return names.join('--')
-//         }
-    
-//         if (ts.isConstructorDeclaration(node)) {
-//             const parent = find(tracker.iterateScopes('classes'), ts.isClassDeclaration)
-//             if (!parent) {
-//                 failOnNode('No class declaration found for constructor', node)
-//             }
-    
-//             return getName(parent)!
-//         }
-    
-//         if (ts.isPropertyAccessExpression(node)) {
-//             return [getName(node.expression), getName(node.name)].join('--')
-//         }
-    
-//         if (ts.isExpressionWithTypeArguments(node)) {
-//             const parent = find(tracker.iterateScopes('classes'), ts.isClassDeclaration)
-//             if (!parent) {
-//                 failOnNode('No class declaration found for extends clause', node)
-//             }
-    
-//             return getName(parent)
-//         }
-    
-//         if (ts.isFunctionExpression(node)) {
-//             if (node.name) {
-//                 return getName(node.name)
-//             }
-    
-//             return '__anonymous'
-//         }
-    
-//         if (node.kind === ts.SyntaxKind.SuperKeyword) {
-//             const parent = find(tracker.iterateScopes('classes'), ts.isClassDeclaration)
-//             const superClass = parent ? getSuperClassExpressions(parent)?.pop() : undefined
-//             if (!superClass) {
-//                 failOnNode('No class declaration found when using `super` keyword', node)
-//             }
-    
-//             return getName(superClass)
-//         }
-
-//         return ''
-//         // failOnNode('No name', node)
-//     }
-    
-
-//     return getName(node)
-// }
-
-
-// const bindFunctions = new Set(['bindModel', 'bindObjectModel', 'bindFunctionModel'])
-// function isInBindFunction(node: ts.Node) {
-//     return !!scopeTracker.getScopes('calls').find(x => 
-//         x.kind === ts.SyntaxKind.CallExpression && 
-//         bindFunctions.has(getCoreImportName(graphCompiler, x.expression) ?? '')
-//     )
-// }
-
 // - jsx(type, props, key)
 // - jsxs(type, props, key)
 // - jsxDEV(type, props, key, __source, __self)
@@ -846,6 +702,34 @@ function isAssignedTo(node: ts.Node) {
     }
 }
 
+function isConstantVariableDecl(sym: Symbol & { variableDeclaration: ts.VariableDeclaration }) {
+    // No initializer implies not constant
+    if (!sym.variableDeclaration.initializer) {
+        return false
+    }
+
+    // Treat other bindings as constant (`var` is largely ignored)
+    if (!(sym.variableDeclaration.parent.flags & ts.NodeFlags.Let)) {
+        return true
+    }
+
+    // `for (let i = ...)`
+    if (sym.variableDeclaration.parent.parent.kind === ts.SyntaxKind.ForStatement) {
+        // `for` loops bind symbols uniquely per-iteration
+        for (const exp of sym.references) {
+            if (isAssignedTo(exp)) {
+                return false
+            }
+        }
+
+        return true
+    }
+
+    // TODO: check if `let` can be converted to `const`
+
+    return false
+}
+
 function getPrivateAccessExpressionSymbol(sym: Symbol): Symbol | undefined {
     if (!sym.parent) {
         return
@@ -927,11 +811,7 @@ function rewriteCapturedSymbols(
                 boundSymbols.add(sym.parent)
                 reduced.set(sym.parent, getReferencesInScope(sym.parent, scope))
             }
-        } else if (
-            sym.variableDeclaration && 
-            !(sym.variableDeclaration.parent.flags & ts.NodeFlags.Const) && // XXX: handles `for (const ...)` decls
-            (!sym.variableDeclaration.initializer || (sym.variableDeclaration.parent.flags & ts.NodeFlags.Let) // Any `let` binding is considered potentially mutable
-        )) {
+        } else if (sym.variableDeclaration && !isConstantVariableDecl(sym as Symbol & { variableDeclaration: ts.VariableDeclaration })) {
             boundSymbols.add(sym)
             reduced.set(sym, nodes)
         } else {
@@ -1259,12 +1139,11 @@ function createExportedDefaultFunction(
 
 export interface CompiledFile {
     readonly sourceNode: ts.Node
-    readonly artifactName: string
     readonly name: string
     readonly source: string
     readonly path: string
     readonly data: string
-    readonly infraData: string // Used only when consuming a module in 
+    readonly infraData: string
     readonly parameters: [Symbol, SymbolMapping][]
     readonly assets?: AssetsMap
     readonly sourcesmaps?: {
@@ -1272,7 +1151,7 @@ export interface CompiledFile {
         readonly infra: SourceMapV3
     }
     // These are the names of all artifacts referenced by the source
-    readonly artifactDependencies: string[]
+    // readonly artifactDependencies: string[]
 }
 
 // const cache = new Map<string, ts.Node>()
@@ -1373,7 +1252,7 @@ export function getModuleType(opt: ts.ModuleKind | undefined): 'cjs' | 'esm' {
         case ts.ModuleKind.ESNext:
             return 'esm'
 
-        case undefined:
+        case undefined: // TODO: default to `esm`
         case ts.ModuleKind.Node16:
         case ts.ModuleKind.NodeNext:
         case ts.ModuleKind.CommonJS:
@@ -1391,8 +1270,9 @@ export function createGraphCompiler(
 ) {
     const rootGraphs = new Map<ts.SourceFile, RootScope>()
     const compiled = new Map<string, Map<string, CompiledFile>>()
+    const emitSourceMap = !!compilerOptions.sourceMap
 
-    const dependencyStack: Set<string>[] = []
+    // const dependencyStack: Set<string>[] = []
 
     function getGraph(node: ts.SourceFile) {
         if (rootGraphs.has(node)) {
@@ -1633,9 +1513,8 @@ export function createGraphCompiler(
 
         const chunks = compiled.get(sourceFile.fileName)!
         if (!chunks.has(name)) {
-            // ~4s for `doCompile`
             // `doCompile` pops the stack
-            dependencyStack.push(new Set())
+            // dependencyStack.push(new Set())
 
             const chunk = doCompile()
             chunks.set(name, chunk)
@@ -1643,24 +1522,19 @@ export function createGraphCompiler(
         }
 
         const res = chunks.get(name)!
-        const artifactName = res.artifactName
-        if (dependencyStack.length > 0) {
-            dependencyStack[dependencyStack.length - 1].add(artifactName)
-        }
+        // if (dependencyStack.length > 0) {
+        //     dependencyStack[dependencyStack.length - 1].add(name)
+        // }
 
         return {
             depth,
             captured: res.parameters,
-            artifactName,
             assets: res.assets,
         }
 
         function doCompile() {
-            // `liftNode` takes ~3300ms total (`solver.ts` is almost 500ms??)
             const { extracted, extractedInfra, parameters, assets } = liftNode(node, factory, runtimeTransformer, infraTransformer, clauseReplacement, jsxRuntime, excluded, depth)
             const outfile = sourceFile.fileName.replace(/\.(t|j)(sx?)$/, `-${name}.$1$2`)
-            // `emitChunk` takes ~1700ms total for both calls
-            const emitSourceMap = !!compilerOptions.sourceMap
             const result = emitChunk(sourceMapHost, sourceFile, extracted as ts.Statement[], { emitSourceMap }) 
             const resultInfra = emitChunk(sourceMapHost, sourceFile, extractedInfra as ts.Statement[], { emitSourceMap }) 
 
@@ -1673,8 +1547,7 @@ export function createGraphCompiler(
                 infraData: resultInfra.text,
                 parameters,
                 assets,
-                artifactName: name,
-                artifactDependencies: Array.from(dependencyStack[dependencyStack.length - 1]),
+                // artifactDependencies: Array.from(dependencyStack[dependencyStack.length - 1]),
                 sourcesmaps: emitSourceMap ? {
                     runtime: result.sourcemap!,
                     infra: resultInfra.sourcemap!,
@@ -1827,7 +1700,6 @@ export function createSerializer(
 
             const withMoveable = ts.visitEachChild(node, transformer.visit, context)
 
-            // `innerTransformer` is 346ms
             return innerTransformer?.(withMoveable) ?? withMoveable
         }
     }
@@ -1969,7 +1841,7 @@ export function createSerializer(
         const nameStack: string[] = namePrefix ? [namePrefix] : []
         function getName(node: ts.Node) {
             if (node.kind === ts.SyntaxKind.SuperKeyword) {
-                return nameStack.length === 0 ? 'super' : nameStack[nameStack.length - 1] + '_' + 'super'
+                return nameStack.length === 0 ? 'super' : `${nameStack[nameStack.length - 1]}::super`
             }
 
             const original = ts.getOriginalNode(node) as ts.ClassDeclaration | ts.FunctionDeclaration | ts.FunctionExpression | ts.ArrowFunction
@@ -1979,7 +1851,15 @@ export function createSerializer(
                 return getUniqueName(original, name)
             }
 
-            return getUniqueName(original, nameStack[nameStack.length - 1] + '_' + name)
+            return getUniqueName(original, `${nameStack[nameStack.length - 1]}::${name}`)
+        }
+
+        function getRelativeName(name: string) {
+            if (!namePrefix) {
+                return name
+            }
+
+            return name.slice(`${namePrefix}::`.length)
         }
 
         const visited = new Map<ts.Node, ts.Node>()
@@ -2046,7 +1926,7 @@ export function createSerializer(
             return addSerializerSymbolToClass(
                 visitedClass,
                 createSerializationData(
-                    r.artifactName,
+                    getRelativeName(name),
                     renderCapturedSymbols(r.captured, r.depth, r.assets),
                     factory,
                     compiler.moduleType,
@@ -2059,7 +1939,7 @@ export function createSerializer(
         function visitMethodDeclaration(node: ts.MethodDeclaration) {
             const name = getName(node)
             const r = compiler.compileNode(name, node, context.factory, runtimeTransformer, createInfraTransformer(name, innerTransformer), undefined, jsxRuntime, undefined, depth)
-            hoistMethodSerializationData(node, r.artifactName, renderCapturedSymbols(r.captured, r.depth, r.assets))
+            hoistMethodSerializationData(node, getRelativeName(name), renderCapturedSymbols(r.captured, r.depth, r.assets))
 
             nameStack.push(name)
             const res = ts.visitEachChild(node, visit, context)
@@ -2083,7 +1963,7 @@ export function createSerializer(
             return addModuleSymbolToFunctionExpression(
                 visitedFn,
                 createSerializationData(
-                    r.artifactName,
+                    getRelativeName(name),
                     renderCapturedSymbols(r.captured, r.depth, r.assets),
                     factory,
                     compiler.moduleType,
@@ -2104,7 +1984,7 @@ export function createSerializer(
 
             const name = getName(node)
             const r = compiler.compileNode(name, node, context.factory, runtimeTransformer, createInfraTransformer(name, innerTransformer), undefined, jsxRuntime, undefined, depth)
-            hoistSerializationData(node, r.artifactName, renderCapturedSymbols(r.captured, r.depth, r.assets))
+            hoistSerializationData(node, getRelativeName(name), renderCapturedSymbols(r.captured, r.depth, r.assets))
 
             nameStack.push(name)
             const res = ts.visitEachChild(node, visit, context)
@@ -2132,7 +2012,7 @@ export function createSerializer(
                 return ts.visitEachChild(node, visit, context)
             }
 
-            const name = getName(ts.factory.createSuper())
+            const name = getName(ts.factory.createSuper()).replaceAll('::', '_')
             const ident = ts.factory.createIdentifier(name)
             const updatedExp = visit(node.types[0].expression)
             if (!ts.isExpression(updatedExp)) {

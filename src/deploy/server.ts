@@ -7,7 +7,7 @@ import { BinaryToTextEncoding, createHash, randomUUID } from 'node:crypto'
 import { bundleClosure, createDataExport, getImportMap, isDeduped, normalizeSymbolIds } from '../closures'
 import { getLogger } from '../logging'
 import { ModuleResolver, createImportMap } from '../runtime/resolver'
-import { AsyncLocalStorage } from 'async_hooks'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { BuildFsFragment, ProcessStore } from '../artifacts'
 import { PackageService } from '../pm/packages'
 import { TerraformPackageManifest } from '../runtime/modules/terraform'
@@ -24,6 +24,7 @@ export interface DeploymentContext {
     readonly dataDir: string
     readonly packageManifest: TerraformPackageManifest
     readonly packageService: PackageService
+    readonly abortSignal?: AbortSignal
     createModuleResolver(): ModuleResolver
     createModuleLoader(): ModuleLoader
     createZip?(files: Record<string, string>, dest: string): Promise<void>
@@ -46,11 +47,14 @@ interface TerraformResourceConfig {
 interface TerraformResourceRequest extends TerraformResourceConfig {
     readonly resource: string
     readonly state: any
-    readonly operation: 'create' | 'update' | 'read' | 'delete'
+    readonly operation: 'create' | 'update' | 'read' | 'delete' | 'import'
     readonly workingDirectory: string
 
     // Only relevant for `update`
     readonly priorConfig?: TerraformResourceConfig
+
+    // Only relevant for `import`
+    readonly importId?: string
 }
 
 interface ResourceDefinition<
@@ -64,6 +68,7 @@ interface ResourceDefinition<
     update?(state: T, ...args: U): T | Promise<T>
     delete?(state: T, ...args: U): void | Promise<void>
     data?(state: I): D | Promise<D>
+    import?(id: string): T | Promise<T>
 }
 
 export async function loadPointer(loader: ModuleLoader, val: any) {
@@ -168,6 +173,57 @@ function createProviderRoutes(ctx: DeploymentContext) {
         }
     }
 
+    // TODO: remove or fix the warning in Node about having too many event listeners
+    let didInitListener = false
+    const abortListeners: ((err?: any) => void)[] = []
+    function addAbortListener(listener: (err?: any) => void) {
+        const signal = ctx.abortSignal
+        if (!signal) {
+            throw new Error('No abort signal available')
+        }
+
+        abortListeners.push(listener)
+
+        if (!didInitListener) {
+            didInitListener = true
+
+            function onAbort() {
+                signal!.removeEventListener('abort', onAbort)
+                for (const l of abortListeners) {
+                    l(signal!.reason)
+                }
+            }
+
+            signal.addEventListener('abort', onAbort)
+        }
+
+        return { dispose: () => void abortListeners.splice(abortListeners.indexOf(listener), 1) }
+    }
+
+    async function runWithCancel(loader: ModuleLoader, context: any, fn: () => Promise<any>) {
+        const signal = ctx.abortSignal
+        if (!signal) {
+            return loader.runWithContext(context, fn)
+        }
+
+        signal.throwIfAborted()
+
+        let listener!: { dispose: () => void }
+        const cancelPromise = new Promise<any>((_, r) => (listener = addAbortListener(() => {
+            // Add a small delay to allow for minimal clean-up
+            setTimeout(() => r(signal!.reason), 100).unref()
+        })))
+
+        try {
+            return await Promise.race([
+                cancelPromise,
+                loader.runWithContext(context, fn),
+            ])
+        } finally {
+            listener.dispose()
+        }
+    }
+
     async function handleProviderRequest(request: TerraformResourceRequest) {
         const loader = ctx.createModuleLoader()
         const resolved = await resolvePayload(loader, request)
@@ -193,6 +249,14 @@ function createProviderRoutes(ctx: DeploymentContext) {
 
         const op = definition[request.operation]
         async function doOp() {
+            if (request.operation === 'import') {
+                if (!op) {
+                    throw new Error(`Resource "${request.resource}" has no import method`)
+                }
+
+                return (op as any)(request.importId)
+            }
+
             if (!op && request.operation === 'update') {
                 await deleteResource()
                 const createOp = definition['create']
@@ -216,7 +280,7 @@ function createProviderRoutes(ctx: DeploymentContext) {
             return newState
         }
 
-        return await loader.runWithContext(context, doOp)
+        return await runWithCancel(loader, context, doOp)
     }
 
     async function handleDataProviderRequest(request: TerraformResourceRequest) {
@@ -239,7 +303,7 @@ function createProviderRoutes(ctx: DeploymentContext) {
             return state
         }
 
-        return await loader.runWithContext(context, doOp)
+        return await runWithCancel(loader, context, doOp)
     }
 
     function serializeValue(val: any, dataTable: Record<string | number, any>): any {
@@ -345,11 +409,17 @@ function createStateRoute(stateDirectory: string) {
     return [stateRoute]
 }
 
-type Operation = 'create' | 'update' | 'read' | 'delete' | 'data'
+type Operation = 'create' | 'update' | 'read' | 'delete' | 'data' | 'import'
 
 export function assertNotData(op: Operation): asserts op is Exclude<Operation, 'data'> {
     if (op === 'data') {
         throw new Error('Data operations are not allowed for resources')
+    }
+}
+
+function assertNotImport(op: Operation, type: string): asserts op is Exclude<Operation, 'import'> {
+    if (op === 'import') {
+        throw new Error(`Data operations are not allowed for type: ${type}`)
     }
 }
 
@@ -458,12 +528,19 @@ interface DeleteRequest extends BaseProviderRequest {
     readonly operation: 'delete'
 }
 
+interface ImportRequest extends BaseProviderRequest {
+    readonly importId: string
+    readonly plannedState: any
+    readonly operation: 'import'
+}
+
 export type ProviderRequest = 
     | CreateRequest
     | DataRequest
     | ReadRequest
     | UpdateRequest
     | DeleteRequest
+    | ImportRequest
 
 function hydratePointers<T extends BaseProviderRequest>(req: T) {
     const inputDeps = new Set<string>()
@@ -544,6 +621,7 @@ function createProviderRoute(ctx: DeploymentContext, handlers: Handlers) {
         switch (payload.type) {
             case 'Asset':
                 assertNotData(payload.operation)
+                assertNotImport(payload.operation, payload.type)
 
                 return handlers.asset.handleAssetRequest({
                     operation: payload.operation,
@@ -555,6 +633,7 @@ function createProviderRoute(ctx: DeploymentContext, handlers: Handlers) {
             
             case 'Closure':
                 assertNotData(payload.operation)
+                assertNotImport(payload.operation, payload.type)
 
                 const location = payload.operation === 'read'
                     ? payload.priorInput.location
@@ -571,8 +650,10 @@ function createProviderRoute(ctx: DeploymentContext, handlers: Handlers) {
 
             case 'Custom':
                 assertNotData(payload.operation)
+                const importId = payload.operation === 'import' ? payload.importId : undefined
 
                 return handlers.provider.handleProviderRequest({
+                    importId,
                     resource: payload.resourceName,
                     operation: payload.operation,
                     ...payload.priorInput,
@@ -583,6 +664,8 @@ function createProviderRoute(ctx: DeploymentContext, handlers: Handlers) {
                 })
 
             case 'CustomData':
+                assertNotImport(payload.operation, payload.type)
+
                 return handlers.provider.handleDataProviderRequest({
                     resource: payload.resourceName,
                     operation: 'read',
@@ -616,6 +699,7 @@ function createProviderRoute(ctx: DeploymentContext, handlers: Handlers) {
             case 'Test':
             case 'TestSuite': {
                 assertNotData(payload.operation)
+                assertNotImport(payload.operation, payload.type)
 
                 switch (payload.operation) {
                     case 'create':
@@ -623,21 +707,6 @@ function createProviderRoute(ctx: DeploymentContext, handlers: Handlers) {
                         const { id, name, handler } = payload.plannedState
 
                         return { id, name, handler }
-                    case 'delete':
-                        return {}
-                    case 'read':
-                        return payload.priorState
-                }
-            }
-
-            case 'GetLogsCallback':{
-                assertNotData(payload.operation)
-
-                switch (payload.operation) {
-                    case 'create':
-                    case 'update':
-                        const { resourceName, handler } = payload.plannedState
-                        return { resourceName, handler }
                     case 'delete':
                         return {}
                     case 'read':

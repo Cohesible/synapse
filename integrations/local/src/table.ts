@@ -39,6 +39,10 @@ export class Table<K, V> implements storage.Table<K, V> {
         const values = await Promise.all(keys.map(k => this.resource.get(k).then(b => JSON.parse(b.toString()))))
         yield values
     }
+
+    async clear() {
+        await this.resource.clear()
+    }
 }
 
 core.addTarget(storage.Table, Table, 'local')

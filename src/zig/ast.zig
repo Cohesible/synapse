@@ -16,6 +16,7 @@ pub const Tag = enum {
     error_union,
     call_exp,
     comptime_block,
+    test_decl,
     parse_error_node,
 };
 
@@ -33,11 +34,13 @@ pub const Node = union(Tag) {
     error_union: ErrorUnion,
     call_exp: CallExp,
     comptime_block: ComptimeBlock,
+    test_decl: TestDeclNode,
     parse_error_node: ParseErrorNode,
 };
 
 pub const LiteralSubtype = enum {
     number,
+    string,
 };
 
 pub const Literal = struct { subtype: LiteralSubtype, value: []const u8 };
@@ -139,6 +142,11 @@ pub const ParseErrorNode = struct {
     tag: zig.Ast.Node.Tag,
 };
 
+pub const TestDeclNode = struct {
+    name: ?*Node, // string literal or identifier
+    body: *Node, // block
+};
+
 const NodeConverter = struct {
     gpa: std.mem.Allocator,
     tree: zig.Ast,
@@ -192,7 +200,7 @@ const NodeConverter = struct {
 
     fn maybe_get_docs(self: @This(), token_index: u32, is_root: bool) !?[]const u8 {
         const tags = self.tree.tokens.items(.tag);
-        var j: usize = token_index;
+        var j: u32 = token_index;
         if (is_root) j += 1 else j -= 1;
         while (j > 0 and j < self.tree.tokens.len) {
             switch (tags[j]) {
@@ -211,7 +219,7 @@ const NodeConverter = struct {
         const lines = try self.gpa.alloc([]const u8, lineCount);
         var size: usize = 0;
         for (0..lineCount) |i| {
-            const l = self.tree.tokenSlice(i + range[0]);
+            const l = self.tree.tokenSlice(@intCast(i + range[0]));
             // lines[i] = l[3..];
             lines[i] = l;
             size += lines[i].len + 1;
@@ -272,13 +280,13 @@ const NodeConverter = struct {
                 return p;
             },
             .global_var_decl, .local_var_decl, .aligned_var_decl, .simple_var_decl => {
-                const x = self.tree.fullVarDecl(index) orelse return null;
+                const varDecl = self.tree.fullVarDecl(index) orelse return null;
                 const p = try self.gpa.create(Node);
                 p.* = Node{ .vardecl = VarDecl{
-                    .name = self.tree.tokenSlice(x.ast.mut_token + 1),
-                    .mutability = self.tree.tokenSlice(x.ast.mut_token),
-                    .visibility = if (x.visib_token) |t| self.tree.tokenSlice(t) else null,
-                    .initializer = try self.convert_node(x.ast.init_node),
+                    .name = self.tree.tokenSlice(varDecl.ast.mut_token + 1),
+                    .mutability = self.tree.tokenSlice(varDecl.ast.mut_token),
+                    .visibility = if (varDecl.visib_token) |t| self.tree.tokenSlice(t) else null,
+                    .initializer = try self.convert_node(varDecl.ast.init_node),
                     .qualifier = null,
                     .thread_local = false,
                     .type_expr = null,
@@ -308,16 +316,18 @@ const NodeConverter = struct {
                 var b: [1]zig.Ast.Node.Index = undefined;
                 const x = self.tree.fullFnProto(&b, index) orelse return null;
                 const p = try self.gpa.create(Node);
-                var params = try self.gpa.alloc(ParamDecl, x.ast.params.len);
+
+                // `anytype` params aren't included in `ast.params.len`
+                var params = try std.ArrayList(ParamDecl).initCapacity(self.gpa, x.ast.params.len);
                 var iter = x.iterate(&self.tree);
                 while (iter.next()) |param| {
-                    params[iter.param_i - 1] = ParamDecl{
+                    try params.append(.{
                         .name = if (param.name_token) |t| self.tree.tokenSlice(t) else null,
                         .type_expr = try self.convert_node(param.type_expr),
                         .is_comptime = false, // TODO
                         .is_noalias = false, // TODO
                         .is_variadic = param.anytype_ellipsis3 != null,
-                    };
+                    });
                 }
 
                 p.* = Node{
@@ -328,7 +338,7 @@ const NodeConverter = struct {
                         .visibility = if (x.visib_token) |t| self.tree.tokenSlice(t) else null,
                         .qualifier = if (x.extern_export_inline_token) |t| self.tree.tokenSlice(t) else null,
                         .return_type = try self.convert_node(x.ast.return_type),
-                        .params = params,
+                        .params = params.items,
                     },
                 };
 
@@ -360,6 +370,15 @@ const NodeConverter = struct {
                 } };
                 return p;
             },
+            .string_literal => {
+                const p = try self.gpa.create(Node);
+                const token = self.tree.tokenSlice(n.main_token);
+                p.* = Node{ .literal = Literal{
+                    .subtype = .string,
+                    .value = token[1..token.len-1], // assumes single/double quotes
+                } };
+                return p;
+            },
             .field_access => {
                 const p = try self.gpa.create(Node);
                 p.* = Node{ .field_access = FieldAccess{
@@ -382,32 +401,47 @@ const NodeConverter = struct {
                     .name = self.tree.tokenSlice(n.main_token),
                 } };
 
+                const args = if (n.data.lhs != 0) try self.convert_array(&[_]u32{ n.data.lhs }) else try self.convert_array(&[_]u32{});
                 const p = try self.gpa.create(Node);
                 p.* = Node{
                     .call_exp = CallExp{
                         .exp = ident,
-                        .args = &[_]*Node{}, // TODO
+                        .args = args,
                     },
                 };
                 return p;
             },
-            .call_one => {
-                var b: [1]zig.Ast.Node.Index = undefined;
-                const x = self.tree.fullCall(&b, index) orelse return null;
+            .call, .call_one, .call_comma, .call_one_comma => {
+                var buf: [1]zig.Ast.Node.Index = undefined;
+                const fullCall = self.tree.fullCall(&buf, index) orelse return null;
+                const args = try self.convert_array(fullCall.ast.params);
+
                 const p = try self.gpa.create(Node);
                 p.* = Node{
                     .call_exp = CallExp{
-                        .exp = try self.convert_node_strict(x.ast.fn_expr),
-                        .args = &[_]*Node{},
+                        .exp = try self.convert_node_strict(fullCall.ast.fn_expr),
+                        .args = args,
                     },
                 };
                 return p;
             },
-            .block, .block_semicolon, .block_two, .block_two_semicolon => {
+            .block, .block_semicolon => {
+                // Statements are in tree.extra_data
+                return null;
+             },
+            .block_two, .block_two_semicolon => {
                 const p = try self.gpa.create(Node);
                 p.* = Node{ .block = BlockNode{
                     .lhs = try self.convert_node(n.data.lhs),
                     .rhs = try self.convert_node(n.data.rhs),
+                } };
+                return p;
+            },
+            .test_decl => {
+                const p = try self.gpa.create(Node);
+                p.* = Node{ .test_decl = TestDeclNode{
+                    .name = try self.convert_node(n.data.lhs),
+                    .body = try self.convert_node_strict(n.data.rhs),
                 } };
                 return p;
             },
@@ -419,34 +453,13 @@ const NodeConverter = struct {
                 return p;
             },
             else => {
-                // return self.create_parse_error(n.tag);
+                return try self.create_parse_error(n.tag);
             },
         }
 
         return null;
     }
 };
-
-// fn writeFnStdout(ctx: u8, bytes: []const u8) std.os.WriteError!usize {
-//     _ = ctx;
-//     return try std.io.getStdOut().write(bytes);
-// }
-//
-// pub fn gen(gpa: std.mem.Allocator, file: [:0]const u8) !void {
-//     const source = try std.fs.createFileAbsolute(file, .{
-//         .truncate = false,
-//         .read = true,
-//     });
-//     const buf = try gpa.alloc(u8, 1024 * 1024 * 1024); // lol
-//     const size = try source.readAll(buf);
-//     buf[size] = 0;
-//     const z: [:0]u8 = buf[0..size :0];
-//     const tree = try zig.Ast.parse(gpa, z, .zig);
-//     const root = try NodeConverter.convert(gpa, tree);
-
-//     const writer = std.io.Writer(u8, std.os.WriteError, writeFnStdout){ .context = 0 };
-//     try std.json.stringify(root, .{ .emit_null_optional_fields = false }, writer);
-// }
 
 const WasmStreamWriter = struct {
     gpa: std.mem.Allocator,
@@ -466,15 +479,6 @@ const WasmStreamWriter = struct {
     }
 
     fn resize(this: *@This(), new_size: usize) ![]u8 {
-        // std.debug.print("resize {d} -> {d}\n", .{ this.buf.len, new_size });
-        // const did_resize = this.gpa.resize(this.buf, new_size);
-        // if (!did_resize) {
-        //     var new_buf = try this.gpa.realloc(this.buf, new_size);
-        //     this.buf = new_buf;
-        //     return new_buf; // Needed on WASM ?
-        // }
-        // return this.buf;
-
         const new_buf = try this.gpa.realloc(this.buf, new_size);
         this.buf = new_buf;
         return new_buf;
@@ -489,7 +493,6 @@ const WasmStreamWriter = struct {
         }
 
         @memcpy(this.buf[this.pos .. this.pos + bytes.len], bytes);
-        //_ = mem.memcpy(buf.ptr + this.pos, bytes.ptr, bytes.len);
         this.pos += bytes.len;
 
         return bytes.len;
@@ -503,16 +506,14 @@ const WasmStreamWriter = struct {
 
     pub fn toString(this: *@This()) ![:0]const u8 {
         const size: usize = this.pos;
-        const buf = if (this.pos == this.buf.len) try this.resize(size + 1) else this.buf;
+        var buf = if (this.pos == this.buf.len) try this.resize(size + 1) else this.buf;
         buf[size] = 0;
 
-        return @ptrCast(buf);
+        return buf[0..size :0];
     }
 };
 
-//   stderr: "t.zig:360:21: error: parameter of type '[:0]const u8' not allowed in function with calling convention 'C'\n" +
-//    't.zig:360:21: note: slices have no guaranteed in-memory representation\n'
-fn parse_ast(source: [:0]const u8) ![*:0]const u8 {
+fn parse_ast(source: [:0]const u8) ![:0]const u8 {
     const gpa = mem.allocator;
     const tree = try zig.Ast.parse(gpa, source, .zig);
     const root = try NodeConverter.convert(gpa, tree);
@@ -524,46 +525,28 @@ fn parse_ast(source: [:0]const u8) ![*:0]const u8 {
     return try writer.toString();
 }
 
-fn strlen(source: [*:0]const u8) usize {
-    var i: usize = 0;
-    while (source[i] != 0) i += 1;
-    return i;
-}
-
 export fn parse(source: [*:0]const u8) [*:0]const u8 {
-    const len = strlen(source);
+    const len = mem.strlen(source);
     return parse_ast(source[0..len :0]) catch @panic("Failed to parse");
 }
 
-// TODO: move to `mem`
 export fn alloc(size: usize) [*]u8 {
     const b = mem.allocator.alloc(u8, size) catch @panic("Failed to allocate");
 
     return b.ptr;
 }
 
-// pub fn main() void {}
+// const js = @import("js");
 
-// pub fn main() !void {
-//     const gpa = getAllocator();
-//     const args = try std.process.argsAlloc(gpa);
-//     if (args.len == 1) {
-//         return error.NoFileProvided;
-//     }
+// pub fn parse(source: js.UTF8String) js.UTF8String {
+//     const data = parse_ast(source.data) catch |e| {
+//         std.debug.print("parse error {?}\n", .{e});
 
-//     const source = try std.fs.createFileAbsolute(args[1], .{
-//         .truncate = false,
-//         .read = true,
-//     });
-//     const buf = try gpa.alloc(u8, 1024 * 1024 * 1024); // lol
-//     const size = try source.readAll(buf);
-//     buf[size] = 0;
-//     const z: [:0]u8 = buf[0..size :0];
-
-//     const res = try parse_ast(z);
-//     const len = strlen(res);
-
-//     _ = try std.io.getStdOut().write(res[0..len]);
+//         return .{ .data = @constCast("{}") };
+//     };
+//     return .{ .data = @constCast(data) };
 // }
 
-//
+// comptime {
+//     js.registerModule(@This());
+// }

@@ -1,6 +1,6 @@
 import ts from 'typescript'
 import * as path from 'node:path'
-import { createObjectLiteral, getInstantiationName, failOnNode, inferName, isExported, splitExpression, isRelativeSpecifier, getNodeLocation, printNodes, createVariableStatement } from '../utils'
+import { createObjectLiteral, getInstantiationName, failOnNode, inferName, isExported, splitExpression, isRelativeSpecifier, getNodeLocation, printNodes, createVariableStatement, isSymbolAssignmentLike } from '../utils'
 import { createGraphCompiler, createImporterExpression, createStaticSolver } from '../static-solver'
 import type { Scope } from '../runtime/modules/core' // must be a type import!
 import { parseDirectives } from '../runtime/sourceMaps'
@@ -258,6 +258,18 @@ export function createTransformer(
         }
 
         if (ts.isNewExpression(node) || ts.isCallExpression(node)) {
+            const original = ts.getOriginalNode(node)
+
+            if (
+                !original.parent ||
+                node.expression.kind === ts.SyntaxKind.SuperKeyword ||
+                node.expression.kind === ts.SyntaxKind.ImportKeyword ||
+                node.expression.kind === ts.SyntaxKind.ParenthesizedExpression || // TODO: enable this
+                getModuleBindingId(original.getSourceFile()) ||
+                isInThrowStatement(node)
+            ) {
+                return ts.visitEachChild(node, visit, context)
+            }
             // if (getLibImportName(graphCompiler, node.expression) === 'Bundle' && node.arguments) {
             //     const sym = graphCompiler.getSymbol(node.arguments[0])
             //     if (sym !== undefined) {
@@ -265,47 +277,38 @@ export function createTransformer(
             //     }
             // }
 
-            const original = ts.getOriginalNode(node)
-            const bindingId = getModuleBindingId(original.getSourceFile())
-            if (bindingId) {
+            const isInBindFunction = ts.findAncestor(original, n => ts.isCallExpression(n) && 
+                ['bindModel', 'bindObjectModel', 'bindFunctionModel'].includes(getCoreImportName(graphCompiler, n.expression) ?? ''))
 
-            } else if (getCoreImportName(graphCompiler, node.expression)) {
+            if (isInBindFunction) {
+                return ts.visitEachChild(node, visit, context)
+            }
 
-            } else if (
-                node.expression.kind !== ts.SyntaxKind.SuperKeyword && 
-                !getCoreImportName(graphCompiler, getRootTarget(original)) && 
-                !isInThrowStatement(node)
-            ) {
-                const p = original.parent
-                const isInBindFunction = ts.findAncestor(original, n => ts.isCallExpression(n) && 
-                    ['bindModel', 'bindObjectModel', 'bindFunctionModel'].includes(getCoreImportName(graphCompiler, n.expression) ?? ''))
-                const isDynamicImport = node.expression.kind === ts.SyntaxKind.ImportKeyword
-
-                if (p && node.expression.kind !== ts.SyntaxKind.ParenthesizedExpression && !isInBindFunction && !isDynamicImport) {
-                    const name = getInstantiationName(node)
-                    if (deltas) {
-                        const { symbol, namespace } = getSymbolForSourceMap(original, scopeSymbolProvider, deltas)
-
-                        return wrapScope(
-                            { name, symbol, namespace },
-                            ts.visitEachChild(node, visit, context),
-                            node.arguments?.some(isAsync) || isAsync(node),
-                            context.factory
-                        )
-                    }
-
-                    const { symbol, namespace } = getSymbolForSourceMap(original, scopeSymbolProvider)
-                    const assignmentSymbol = getAssignmentSymbol(original, scopeSymbolProvider, assignmentCache)
-                    const isNewExpression = node.kind === ts.SyntaxKind.NewExpression ? true : undefined
-                    const ty = resourceTypeChecker.getNodeType((original as ts.CallExpression | ts.NewExpression).expression)
+            const isNotCoreReceiver = !getCoreImportName(graphCompiler, getRootTarget(original))
+            if (isNotCoreReceiver) {
+                const name = getInstantiationName(node)
+                if (deltas) {
+                    const { symbol, namespace } = getSymbolForSourceMap(original, scopeSymbolProvider, deltas)
 
                     return wrapScope(
-                        { name, symbol, assignmentSymbol, namespace, isNewExpression, isStandardResource: ty?.intrinsic },
+                        { name, symbol, namespace },
                         ts.visitEachChild(node, visit, context),
-                        node.arguments?.some(isAsync) || isAsync(node),
+                        isAsync(node),
                         context.factory
                     )
                 }
+
+                const { symbol, namespace } = getSymbolForSourceMap(original, scopeSymbolProvider)
+                const assignmentSymbol = getAssignmentSymbol(original, scopeSymbolProvider, assignmentCache)
+                const isNewExpression = node.kind === ts.SyntaxKind.NewExpression ? true : undefined
+                const ty = resourceTypeChecker.getNodeType((original as ts.CallExpression | ts.NewExpression).expression)
+
+                return wrapScope(
+                    { name, symbol, assignmentSymbol, namespace, isNewExpression, isStandardResource: ty?.intrinsic },
+                    ts.visitEachChild(node, visit, context),
+                    isAsync(node),
+                    context.factory
+                )
             }
         }
 
@@ -401,14 +404,10 @@ function getAssignmentSymbol(node: ts.Node, symbolProvider: ReturnType<typeof cr
 
     const ancestor = ts.findAncestor(node, p => {
         if (!p.parent) {
-            return false
+            return 'quit'
         }
 
-        if (ts.isVariableDeclaration(p.parent) && p.parent.initializer === p) {
-            return true
-        }
-
-        if (ts.isPropertyAssignment(p.parent) && p.parent.initializer === p) {
+        if (isSymbolAssignmentLike(p.parent) && p.parent.initializer === p) {
             return true
         }
 
@@ -419,18 +418,19 @@ function getAssignmentSymbol(node: ts.Node, symbolProvider: ReturnType<typeof cr
         return false
     })
 
-    cache.set(node, undefined)
-
     if (!ancestor) {
+        cache.set(node, undefined)
         return
     }
 
-    const decl = ancestor.parent as ts.VariableDeclaration | ts.PropertyAssignment
+    const decl = ancestor.parent as ts.VariableDeclaration | ts.PropertyAssignment | ts.PropertyDeclaration
     if (ts.isIdentifier(decl.name)) {
         const sym = symbolProvider.getIdentSymbol(decl.name)
         cache.set(node, sym)
 
         return sym
+    } else {
+        cache.set(node, undefined)
     }
 }
 
@@ -482,6 +482,8 @@ function createConfigurationClass(
         [
             ...node.arguments,
             factory.createStringLiteral(fileName + '--' + type + '--' + 'definition'), 
+            // TODO: use this instead
+            // factory.createStringLiteral(type + '--' + 'definition'), 
         ]
     )
 
@@ -489,6 +491,24 @@ function createConfigurationClass(
 }
 
 function isAsync(node: ts.Node): boolean {
+    // Most common case
+    if (node.kind === ts.SyntaxKind.CallExpression || node.kind === ts.SyntaxKind.NewExpression) {
+        const exp = node as ts.CallExpression | ts.NewExpression
+        if (isAsync(exp.expression)) {
+            return true
+        }
+
+        if (exp.arguments) {
+            for (let i = 0; i < exp.arguments.length; i++) {
+                if (isAsync(exp.arguments[i])) {
+                    return true
+                }
+            }
+        }
+
+        return false
+    }
+
     if (ts.isAwaitExpression(node)) {
         return true
     }
@@ -509,7 +529,7 @@ function isAsync(node: ts.Node): boolean {
         return false
     }
 
-    return node.forEachChild(n => isAsync(n)) ?? false
+    return node.forEachChild(isAsync) ?? false
 }
 
 function getRootTarget(node: ts.Node): ts.Node {

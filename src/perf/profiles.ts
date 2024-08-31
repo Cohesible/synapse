@@ -77,7 +77,7 @@ function getSourceMap(sourcemapParser: SourceMapParser, frame: CallFrame) {
         return
     }
     
-    const frameUrl = new URL(frame.url)
+    const frameUrl = tryParseUrl(frame.url)
     if (frameUrl.protocol !== 'file:') {
         return
     }
@@ -87,12 +87,20 @@ function getSourceMap(sourcemapParser: SourceMapParser, frame: CallFrame) {
     return sourcemapParser.tryParseSourcemap(fileName, true)
 }
 
+function tryParseUrl(url: string) {
+    try {
+        return new URL(url)
+    } catch (err) {
+        return new URL(`pointer:${url}`)
+    }
+}
+
 function parseCallFrame(sourcemapParser: SourceMapParser, frame: CallFrame, rootMappings?: Record<string, string>): ParsedCallFrame {
     if (!frame.url) {
         return { ...frame, url: undefined, originalFrame: frame }
     }
-    
-    const frameUrl = new URL(frame.url)
+
+    const frameUrl = tryParseUrl(frame.url)
     const parsed = { ...frame, url: frameUrl, originalFrame: frame }
     if (frameUrl.protocol !== 'file:') {
         return parsed
@@ -190,7 +198,7 @@ function printNode(node: ParsedNode, workingDirectory?: string) {
 export async function loadCpuProfile(fs: Fs & SyncFs, fileName: string, workingDirectory: string, rootMappings?: Record<string, string>) {
     const sourcemapParser = createSourceMapParser(fs, undefined, workingDirectory)
     const data: CpuProfile = JSON.parse(await fs.readFile(path.resolve(workingDirectory, fileName), 'utf-8'))
-
+    const duration = data.endTime - data.startTime // nanoseconds
     const totalSamples = data.samples.reduce((a, b) => a + b, 0)
 
     const nodes = new Map(data.nodes.map(n => [n.id, parseNode(sourcemapParser, n, rootMappings)] as const))
@@ -289,12 +297,21 @@ export async function loadCpuProfile(fs: Fs & SyncFs, fileName: string, workingD
     const sortedBySelf = [...r].sort((a, b) => (b[1] - a[1]))
 
     const toPercentage = (hits: number) => Math.floor((hits / hitsSum) * 10000) / 100
+    const topN = 50
+
+    function printResult(x: (typeof r)[number]) {
+        return `${toPercentage(x[0])}% ${toPercentage(x[1])}% ${printNode(x[2], workingDirectory)}`
+    }
  
     return [
         'Sorted by total',
-        ...sortedByTotal.slice(0, 25).map(x => `${toPercentage(x[0])}% ${toPercentage(x[1])}% ${printNode(x[2], workingDirectory)}`),
+        ...sortedByTotal.slice(0, topN).map(printResult),
         '---------------------',
         'Sorted by self',
-        ...sortedBySelf.slice(0, 25).map(x => `${toPercentage(x[0])}% ${toPercentage(x[1])}% ${printNode(x[2], workingDirectory)}`)
+        ...sortedBySelf.slice(0, topN).map(printResult)
     ]
 }
+
+// This is to get the WS URL for Inspector
+// http://host:port/json/list
+

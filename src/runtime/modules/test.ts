@@ -2,9 +2,9 @@
 //# transform = persist
 
 import * as assert from 'node:assert'
-import { using, defer, getCurrentId, contextType, maybeGetContext, importArtifact } from 'synapse:core'
-import { createSynapseClass } from 'synapse:terraform'
 import { Export } from 'synapse:lib'
+import { createSynapseClass } from 'synapse:terraform'
+import { using, defer, getCurrentId, contextType, maybeGetContext, importArtifact, isDataPointer } from 'synapse:core'
 
 // Starting at one to guard against erroneous falsy checks on the id
 let idCounter = 1
@@ -12,7 +12,7 @@ let idCounter = 1
 export function test(name: string, fn: () => Promise<void> | void): void {
     const suite = maybeGetContext(TestSuite)
     if (suite) {
-        suite.addTest(new Test(idCounter++, name, fn))
+        suite.addTest(new Test(idCounter++, name, fn, suite.hooks))
     } else {
         addDeferredTestItem({ type: 'test', name, fn })
     }
@@ -33,6 +33,26 @@ export function describe(name: string, fn: () => void): void {
     }
 }
 
+export function before(fn: () => Promise<void> | void): void {
+    const suite = maybeGetContext(TestSuite)
+    if (!suite) {
+        throw new Error('Cannot use "before" outside of a test suite')
+    }
+
+    const arr = suite.hooks.before ??= []
+    arr.push(fn)
+}
+
+export function after(fn: () => Promise<void> | void): void {
+    const suite = maybeGetContext(TestSuite)
+    if (!suite) {
+        throw new Error('Cannot use "after" outside of a test suite')
+    }
+
+    const arr = suite.hooks.after ??= []
+    arr.push(fn)
+}
+
 interface TestProps {
     readonly id: number
     readonly name: string
@@ -48,11 +68,21 @@ interface TestOutput {
 class TestResource extends createSynapseClass<TestProps, TestOutput>('Test') {}
 class TestSuiteResource extends createSynapseClass<TestProps, TestOutput>('TestSuite') {}
 
+interface Hooks {
+    before?: (() => Promise<void> | void)[]
+    after?: (() => Promise<void> | void)[]
+}
+
 export class Test {
     private readonly resource: TestResource
 
-    public constructor(public readonly id: number, public readonly name: string, fn: () => Promise<void> | void) {
-        const handler = new Export({ fn })
+    public constructor(
+        public readonly id: number, 
+        public readonly name: string, 
+        fn: () => Promise<void> | void,
+        hooks?: Hooks
+    ) {
+        const handler = new Export({ fn, hooks })
         this.resource = new TestResource({
             id,
             name,
@@ -61,8 +91,23 @@ export class Test {
     }
 
     public async run() {
-        const { fn } = await importArtifact(this.resource.handler)
-        await fn()
+        const { fn, hooks } = await importArtifact(this.resource.handler)
+        for (const h of hooks?.before ?? []) {
+            await h()
+        }
+
+        try {
+            await fn()
+        } finally {
+            // TODO: catch errors here and aggregate them
+            for (const h of hooks?.after ?? []) {
+                await h()
+            }
+        }
+    }
+
+    public get pointer() {
+        return this.resource.handler
     }
 }
 
@@ -70,10 +115,30 @@ export class TestSuite {
     static readonly [contextType] = 'test-suite'
     public readonly tests: Test[] = []
 
+    public readonly hooks: Hooks = {}
+
     public constructor(
         public readonly id: number, // `id` is needed when serializing
         public readonly name: string,
-    ) {}
+    ) {
+        // Add hooks from parent suites
+        defer(() => {
+            const suite = maybeGetContext(TestSuite)
+            if (!suite) {
+                return
+            }
+
+            if (suite.hooks.before) {
+                const arr = this.hooks.before ??= []
+                arr.splice(0, 0, ...suite.hooks.before)
+            }
+
+            if (suite.hooks.after) {
+                const arr = this.hooks.after ??= []
+                arr.splice(0, 0, ...suite.hooks.after)
+            }
+        })
+    }
 
     public addTest(test: Test) {
         this.tests.push(test)
@@ -151,7 +216,7 @@ function addDeferredTestItem(item: DeferredTestItem) {
         using(suite, () => {
             for (const item of arr) {
                 if (item.type === 'test') {
-                    suite.addTest(new Test(idCounter++, item.name, item.fn))
+                    suite.addTest(new Test(idCounter++, item.name, item.fn, suite.hooks))
                 } else {
                     const id = getCurrentId()
                     const child = new TestSuite(idCounter++, item.name)

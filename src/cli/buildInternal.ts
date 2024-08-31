@@ -9,13 +9,13 @@ import { downloadSource } from '../build/sources'
 import { buildGoProgram } from '../build/go'
 import { installModules } from '../pm/packages'
 import { createMergedView } from '../pm/publish'
-import { Snapshot, consolidateBuild, createSnapshot, dumpData, getDataRepository, getModuleMappings, getProgramFs, linkFs, pruneBuild, writeSnapshotFile } from '../artifacts'
+import { Snapshot, consolidateBuild, createSnapshot, dumpData, getDataRepository, getModuleMappings, getProgramFs, getSnapshotPath, linkFs, pruneBuild, writeSnapshotFile } from '../artifacts'
 import { QualifiedBuildTarget, resolveBuildTarget } from '../build/builder'
 import { runCommand } from '../utils/process'
 import { toAbsolute, toDataPointer } from '../build-fs/pointers'
 import { glob } from '../utils/glob'
-import { gzip, memoize, throwIfNotFileNotFoundError } from '../utils'
-import { getLogger } from '..'
+import { gzip, memoize, throwIfNotFileNotFoundError, tryReadJson } from '../utils'
+import { getLogger } from '../logging'
 import { randomUUID } from 'node:crypto'
 import { createZipFromDir } from '../deploy/deployment'
 import { tmpdir } from 'node:os'
@@ -425,7 +425,7 @@ export async function buildBinaryDeps(pkgDir: string, target?: Partial<Qualified
 interface BuildTargetExtras {
     external?: string[]
     sign?: boolean
-    skipPackage?: boolean
+    skipBinaryDeps?: boolean
     stripInternal?: boolean
     buildLicense?: boolean
 
@@ -512,8 +512,10 @@ export async function createPackageForRelease(
         }
     }
 
+    const oldManifest = await tryReadJson<Snapshot>(fs, getSnapshotPath(dest))
+
+    await dumpData(dest, consolidated.index, snapshot.storeHash, true, oldManifest?.storeHash)
     await writeSnapshotFile(fs, dest, snapshot)
-    await dumpData(dest, consolidated.index, snapshot.storeHash, true)
 
     if (useCompiledPkgJson && pruned.files['package.json']) {
         await fs.writeFile(
@@ -527,7 +529,7 @@ export async function createPackageForRelease(
         )
     }
 
-    if (!target?.skipPackage) {
+    if (!target?.skipBinaryDeps) {
         const binaries = await buildBinaryDeps(dest, target)
         if (target?.sign) {
             for (const [k, v] of Object.entries(binaries)) {

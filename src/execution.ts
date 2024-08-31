@@ -74,6 +74,10 @@ export function isCancelled() {
     return !!storage.getStore()?.abortSignal?.aborted
 }
 
+export function getAbortSignal() {
+    return storage.getStore()?.abortSignal
+}
+
 export function isSelfSea() {
     if (defaultContext?.selfBuildType === 'sea') {
         return true

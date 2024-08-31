@@ -405,6 +405,7 @@ export interface BoundTerraformSession {
     getState: () => Promise<TfState | undefined>
     getRefs: (targets: string[]) => Promise<Record<string, TfRef[]>>
     setTemplate: (template: TfJson) => Promise<void> // XXX: this is kind of a hack
+    importResource: (target: string, id: string) => Promise<DeployResult>
     dispose: () => Promise<void>
     readonly templateService: TemplateService
     readonly moduleLoader: ReturnType<DeploymentContext['createModuleLoader']>
@@ -508,13 +509,18 @@ export async function startTerraformSession(
         env,
     })
 
-    c.on('exit', (code, signal) => {
-        server.dispose()
-        stateEmitter.emit('ready', new Error(`Failed to start session (exit code: ${code}): ${buffer}`))
-    })
-
+    let didExit = false
     let isReady = false
     const stateEmitter = new EventEmitter()
+
+    c.on('exit', (code, signal) => {
+        didExit = true
+        server.dispose()
+
+        const err = new Error(`Failed to start session (exit code: ${code})`)
+        stateEmitter.emit('ready', err)
+        stateEmitter.emit('result', undefined, err)
+    })
 
     function waitForReady() {
         if (isReady) {
@@ -558,27 +564,35 @@ export async function startTerraformSession(
                     logger(msg)
                     if (msg.type === 'plan') {
                         stateEmitter.emit('plan', msg.data)
-                    } else if (msg.type === 'diagnostic') {
-                        // if (msg.diagnostic) {
-                        //     const err = new AxonError(msg.diagnostic.summary, msg.diagnostic.detail)
-                        //     stateEmitter.emit('result', undefined, err)
-                        // } else {
-                        //     const agg = new AggregateError(
-                        //         msg.diagnostics!.map(diag => new AxonError(diag.summary, diag.detail)),
-                        //         `Deployment error`
-                        //     )
-                        //     stateEmitter.emit('result', undefined, agg)
-                        // }
                     }
                 }
-            } catch(e) {
-                getLogger().debug('Bad parse', e)
+            } catch (e) {
                 // Failure is due to non-JSON data
+                const err = new Error('Bad parse', { cause: e })
+                getLogger().debug(err)
+
+                // TODO: this should fail early in test builds
+                // stateEmitter.emit('ready', err)
+                // stateEmitter.emit('result', undefined, err)
             }
         }
     }
 
-    // TODO: try to kill process on cancel
+    function onAbort() {
+        getLogger().debug('sending SIGINT to deploy session')
+        c.kill('SIGINT')
+    }
+
+    context.abortSignal?.addEventListener('abort', onAbort)
+
+    function dispose() {
+        context.abortSignal?.removeEventListener('abort', onAbort)
+        if (didExit) {
+            return
+        }
+
+        return write('exit\n')
+    }
 
     c.stdout.on('data', onData)
     c.stderr.on('data', d => getLogger().raw(d))
@@ -686,125 +700,14 @@ export async function startTerraformSession(
 
             return result
         },
-        dispose: () => write('exit\n'),
-    }
-}
-
-export async function startStatelessTerraformSession(
-    template: TfJson,
-    terraformPath: string
-) {
-    // const diags: (Error | TfDiagnostic)[] = []
-    const logger = createTerraformLogger()
-
-    const templateFilePath = path.resolve(getBuildDir(), 'tmp', 'stack.tf.json')
-    await getFs().writeFile(templateFilePath, JSON.stringify(template))
-
-    function checkDiags() {
-        // if (diags.length === 0) {
-        //     return
-        // }
-
-        // if (diags.length === 1) {
-        //     throw new AxonError(diags[0].summary, diags[0].detail)
-        // }
-
-        // throw new AggregateError(
-        //     diags!.map(diag => new AxonError(diag.summary, diag.detail)),
-        //     `Deployment error`
-        // )
-    }
-
-    const c = child_process.spawn(terraformPath, ['start-session', '-json'], {
-        cwd: path.dirname(templateFilePath),
-        stdio: 'pipe',
-    })
-
-    c.on('exit', (code, signal) => {
-        stateEmitter.emit('ready', new Error(`Failed to start session (exit code: ${code}): ${buffer}`))
-    })
-
-    let isReady = false
-    const stateEmitter = new EventEmitter()
-
-    function waitForReady() {
-        if (isReady) {
-            return Promise.resolve()
-        }
-
-        return new Promise<void>((resolve, reject) => {
-            stateEmitter.once('ready', (err?: Error) => err ? reject(err) : resolve())
-        }).finally(checkDiags)
-    }
-
-    function waitForResult<T = undefined>() {
-        return new Promise<T>((resolve, reject) => {
-            stateEmitter.once('result', (data?: any, err?: Error) => err ? reject(err) : resolve(data))
-        }).finally(checkDiags)
-    }
-
-    let buffer = ''
-    function onData(d: Buffer) {
-        const lines = (buffer + d).split('\n')
-        buffer = lines.pop() ?? ''
-
-        for (const l of lines) {
-            try {
-                const msg = JSON.parse(l) as TfJsonOutput | { type: 'ready' } // TODO: remove `ready` and just use `result`
-
-                if (msg.type === 'ready') {
-                    isReady = true
-                    stateEmitter.emit('ready')
-                    stateEmitter.emit('result', undefined, undefined)
-                } else if (msg.type === 'result') {
-                    stateEmitter.emit('result', msg.data)
-                } else {
-                    logger(msg)
-                    if (msg.type === 'plan') {
-                        stateEmitter.emit('plan', msg.data)
-                    } else if (msg.type === 'diagnostic') {
-
-                    }
-                }
-            } catch(e) {
-                getLogger().debug('Bad parse', e)
-                // Failure is due to non-JSON data
-            }
-        }
-    }
-
-    // TODO: try to kill process on cancel
-
-    c.stdout.on('data', onData)
-    c.stderr.on('data', d => getLogger().raw(d))
-
-    function write(chunk: string | Buffer) {
-        return new Promise<void>((resolve, reject) => {
-            c.stdin.write(chunk, err => err ? reject(err) : resolve())
-        })
-    }
-
-    await waitForReady()
-
-    async function setTemplate(template: TfJson) {
-        await getFs().writeFile(templateFilePath, JSON.stringify(template))
-        isReady = false
-        await write(`${['reload-config'].join(' ')}\n`)
-
-        return waitForReady()
-    }
-
-    return {
-        setTemplate,
-        getRefs: async (targets: string[]) => {
+        importResource: async (target: string, id: string) => {
             isReady = false
-            const result = waitForResult<Record<string, TfRef[]>>()
-            await write(`${['get-refs', ...targets].join(' ')}\n`)
-            await waitForReady()
+            await write(`${['import', target, id].join(' ')}\n`)
 
-            return result
+            return waitForReady()
         },
-        dispose: () => write('exit\n'),
+        dispose,
+        isAlive: () => !didExit,
     }
 }
 
@@ -1329,20 +1232,6 @@ export async function getTerraformPath() {
     }
 
     throw new Error(`Missing binary. Corrupted installation?`)
-
-    // const respCache = createTtlCache(createMemento(getFs(), path.resolve(getSynapseDir(), 'memento')))
-    // const cachedPath = await respCache.get<string>('tf-install-path')
-    // if (cachedPath) {
-    //     return cachedPath
-    // }
-
-    // const lockPath = path.resolve(getSynapseDir(), 'tf-installer')
-    // await using _ = await acquireFsLock(lockPath)
-
-    // const installed = await getOrInstallTerraform(getSynapseDir())
-    // await respCache.set('tf-install-path', installed.path, 300)
-
-    // return installed.path as string
 }
 
 // We mutate the state object directly
@@ -1385,6 +1274,7 @@ export function createStatePersister(currentState: TfState | undefined, programH
         await setResourceProgramHashes(procFs, merged as Record<string, string>)
     }
 
+    // FIXME: this should write out to a separate backup file in addition to the normal flow
     async function _saveState() {
         await Promise.all([
             saveHashes(),

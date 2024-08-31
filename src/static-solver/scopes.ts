@@ -1207,8 +1207,7 @@ export function isAssignmentExpression(node: ts.BinaryExpression) {
 // TODO: add annotations to methods so they can be captured
 
 // Transforms a graph into a function declaration that passes in captured symbols by argument
-// Import declarations are left outside of the expression, function/class declarations are placed
-// inside, and stateful declarations are made into arguments
+// Function/class declarations are placed inside, and stateful declarations are made into arguments
 
 export function liftScope(scope: Scope, capturedGlobals?: string[], excluded: Scope[] = []) {
     const capturedSymbols = new Set<Symbol>()

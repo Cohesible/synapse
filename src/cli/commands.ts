@@ -12,6 +12,8 @@ import { downloadNodeLib } from './buildInternal'
 import { runInternalTestFile } from '../testing/internal'
 import { getAuth } from '../auth'
 import { tryUpgrade } from './updater'
+import { getLogger, runTask } from '../logging'
+import { passthroughZig } from '../zig/compile'
 
 
 interface TypeMap {
@@ -414,7 +416,11 @@ registerTypedCommand(
     'compile',
     {
         args: [varargsFiles],
-        options: [...compileOptions, { name: 'force-infra', type: 'string', allowMultiple: true, hidden: true }],
+        options: [
+            ...compileOptions, 
+            { name: 'log-symEval', type: 'boolean', hidden: true },
+            { name: 'force-infra', type: 'string', allowMultiple: true, hidden: true },
+        ],
         requirements: { program: true },
         inferBuildTarget: true,
         description: 'Converts program source code into deployable artifacts'
@@ -426,6 +432,7 @@ registerTypedCommand(
             deployTarget: opt['target'],
             noInfra: opt['no-infra'],
             noSynth: opt['no-synth'],
+            logSymEval: opt['log-symEval'],
             incremental: !opt['no-incremental'],
             skipInstall: opt['skip-install'],
             hostTarget: opt['host-target'],
@@ -531,7 +538,12 @@ registerTypedCommand(
     {
         isImportantCommand: true,
         args: [varargsFiles],
-        options: [...deployOptions, { name: 'deploymentId', type: 'string', hidden: true }, { name: 'tests-only', type: 'boolean', hidden: true }],
+        options: [
+            ...deployOptions, 
+            { name: 'deploymentId', type: 'string', hidden: true },
+            { name: 'tests-only', type: 'boolean', hidden: true },
+            { name: 'yes', type: 'boolean', hidden: true }
+        ],
         requirements: { program: true, process: true },
         inferBuildTarget: true,
         description: 'Deletes resources in a deployment'
@@ -545,6 +557,7 @@ registerTypedCommand(
             forceRefresh: opt['refresh'],
             deploymentId: opt.deploymentId,
             useTests: opt['tests-only'],
+            yes: opt['yes'],
         })
     }
 )
@@ -573,7 +586,10 @@ registerTypedCommand(
         options: [
             ...buildTargetOptions, 
             { name: 'destroy-after', type: 'boolean', hidden: true },
-            { name: 'rollback-if-failed', type: 'boolean', hidden: true }
+            { name: 'rollback-if-failed', type: 'boolean', hidden: true },
+            { name: 'filter', type: 'string', hidden: true },
+            { name: 'no-cache', type: 'boolean', description: 'Runs tests without caching results or using cached results' },
+            { name: 'show-logs', type: 'boolean', description: 'Shows all test logs regardless of the outcome' },
         ],
         requirements: { program: true, process: true },
         inferBuildTarget: true,
@@ -585,6 +601,9 @@ registerTypedCommand(
         await synapse.runTests(files, { 
             destroyAfter: opt['destroy-after'],
             rollbackIfFailed: opt['rollback-if-failed'],
+            filter: opt['filter'],
+            noCache: opt['no-cache'],
+            showLogs: opt['show-logs'],
         })
     }
 )
@@ -607,7 +626,8 @@ registerTypedCommand(
         internal: true,
         args: [objectHashArg],
         options: [
-            { name: 'captured', type: 'boolean' }
+            { name: 'captured', type: 'boolean' },
+            { name: 'infra', type: 'boolean' }
         ],
     },
     (obj, opt) => synapse.showRemoteArtifact(obj, opt)
@@ -626,6 +646,7 @@ registerTypedCommand(
             { name: 'new-format', type: 'boolean', hidden: true },
             { name: 'overwrite', type: 'boolean', hidden: true },
             { name: 'visibility', type: createEnumType('public', 'private'), hidden: true },
+            { name: 'ref', type: 'string', hidden: true },
             ...buildTargetOptions,
         ],
     },
@@ -713,7 +734,7 @@ registerTypedCommand(
 registerTypedCommand(
     'migrate',  
     {
-        internal: true,
+        description: 'Finds resources that may have been renamed and moves them for the next deployment.',
         args: [varargsFiles],
         options: [
             { name: 'reset', type: 'boolean' }, 
@@ -835,7 +856,7 @@ registerTypedCommand(
     'dump-fs',  
     {
         internal: true,
-        args: [{ name: 'fs', optional: true, type: createUnionType(createEnumType('program', 'deployment', 'package'), objectHashType) }],
+        args: [{ name: 'fs', optional: true, type: createUnionType(createEnumType('program', 'deployment', 'package', 'test'), objectHashType) }],
         options: [...buildTargetOptions, { name: 'block', type: 'boolean', hidden: true }, { name: 'debug', type: 'boolean', hidden: true, defaultValue: true }]
     },
     async (fs, opt) => {
@@ -909,7 +930,10 @@ registerTypedCommand(
     'clean',  
     {
         args: [],
-        options: [{ name: 'packages', type: 'boolean', description: 'Clears the packages cache' }],
+        options: [
+            { name: 'packages', type: 'boolean', description: 'Clears the packages cache' },
+            { name: 'tests', type: 'boolean', description: 'Cleans the tests cache' }
+        ],
         requirements: { program: true },
     },
     (opt) => synapse.clean(opt),
@@ -1151,7 +1175,8 @@ registerTypedCommand(
     'query-logs',  
     {
         args: [{ name: 'ref', type: 'string', allowMultiple: true }],
-        options: [{ name: 'system', type: 'boolean', description: 'Shows system log messages' }]
+        options: [{ name: 'system', type: 'boolean', description: 'Shows system log messages' }],
+        description: 'Grabs logs from resources. Names can be provided to filter logs to those resources.'
     },
     (...args) => {
         const [refs, opt] = unpackArgs(args)
@@ -1258,6 +1283,60 @@ registerTypedCommand(
         ]
     },
     (opt) => synapse.init(opt)
+)
+
+registerTypedCommand(
+    'process-prof',
+    { 
+        internal: true,
+        args: [{ name: 'cpu-profile', type: 'string', optional: true }],
+    },
+    (arg) => synapse.processProf(arg)
+)
+
+registerTypedCommand(
+    'import-resource',
+    {
+        hidden: true,
+        args: [
+            { name: 'resource', type: 'string' }, 
+            { name: 'id', type: 'string' }
+        ],
+    },
+    (...args) => {
+        const [[resource, id], opt] = unpackArgs(args)
+
+        return synapse.importResource(resource, id)
+    }
+)
+
+registerTypedCommand(
+    'move-resource',
+    {
+        hidden: true,
+        args: [
+            { name: 'from', type: 'string' }, 
+            { name: 'to', type: 'string' }
+        ],
+    },
+    (...args) => {
+        const [[from, to], opt] = unpackArgs(args)
+
+        return synapse.moveResource(from, to)
+    }
+)
+
+registerTypedCommand(
+    'zig',
+    {
+        internal: true,
+        options: [passthroughSwitch],
+    },
+    (...args) => {
+        const [rest, opt] = unpackArgs(args)
+
+        return passthroughZig(opt.targetArgs ?? [])
+    }
 )
 
 export function isEnumType(type: ArgType): type is EnumType {
@@ -1517,7 +1596,7 @@ async function getBuildTarget(cmd: CommandDescriptor, params: string[]) {
         return resolveProgramBuildTarget(cwd, { program: programFiles[0], environmentName })
     }
 
-    synapse.getLogger().debug(`getBuildTarget() took ${Math.floor((performance.now() - start) * 1000) / 1000}ms`)
+    getLogger().debug(`getBuildTarget() took ${Math.floor((performance.now() - start) * 1000) / 1000}ms`)
 
     return res
 }
@@ -1536,10 +1615,10 @@ export async function executeCommand(cmd: string, params: string[]) {
     }
 
     if (command.descriptor.requirements?.program === false) {
-        const parsed = await synapse.runTask('parse', cmd, () => parseArgs(params, command.descriptor), 1)
+        const parsed = await runTask('parse', cmd, () => parseArgs(params, command.descriptor), 1)
         const args = [...parsed.args, parsed.options]
 
-        return synapse.runTask('run', cmd, () => command.fn(...args), 1)
+        return runTask('run', cmd, () => command.fn(...args), 1)
     }
 
     const buildTarget = await getBuildTarget(command.descriptor, params)
@@ -1549,15 +1628,15 @@ export async function executeCommand(cmd: string, params: string[]) {
                 printLine(colorize('brightRed', 'No build target found'))
             })
         }
-        synapse.getLogger().debug(`No build target found`)
+        getLogger().debug(`No build target found`)
     } else {
-        synapse.getLogger().debug(`Using resolved build target`, buildTarget)
+        getLogger().debug(`Using resolved build target`, buildTarget)
     }
 
     await runWithContext({ buildTarget }, async () => {
-        const parsed = await synapse.runTask('parse', cmd, () => parseArgs(params, command.descriptor), 1)
+        const parsed = await runTask('parse', cmd, () => parseArgs(params, command.descriptor), 1)
         const args = [...parsed.args, parsed.options]
-        await synapse.runTask('run', cmd, () => command.fn(...args), 1)
+        await runTask('run', cmd, () => command.fn(...args), 1)
     })
 }
 

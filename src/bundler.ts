@@ -311,7 +311,7 @@ export const seaAssetPrefix = `sea-asset:`
 export const rawSeaAssetPrefix = `raw-sea-asset:`
 export const backendBundlePrefix = `file:./_assets/`
 
-export type Optimizer = (table: Record<string | number, ExternalValue>, captured: any) => { table: Record<string | number, ExternalValue>, captured: any }
+export type Optimizer = (table: Record<string | number, ExternalValue | any[]>, captured: any) => { table: Record<string | number, ExternalValue | any[]>, captured: any }
 
 export function createSerializerHost(fs: { writeDataSync: (data: Uint8Array) => DataPointer }, packagingMode: 'sea' | 'backend-bundle' = 'sea', optimizer?: Optimizer) {
     const assets = new Map<DataPointer, string>()
@@ -486,6 +486,10 @@ function createFsPlugin(fs: Fs & SyncFs, resolver: ModuleResolver, opt: BundleOp
                     const filePath = resolver.resolveVirtual(args.path, importer, mode)
                     if (filePath.match(/\.(js|ts|tsx)$/)) {
                         return resolveJsFile({ ...args, path: filePath })
+                    }
+
+                    if (filePath.endsWith('.wasm')) {
+                        return { external: true }
                     }
 
                     return { path: resolver.resolve(filePath) }
@@ -856,45 +860,61 @@ function generateLazyModule(spec: string, obfuscate = true, allowDynamicLink = f
     return printNodes(statements)
 }
 
-export function getNpmDeps(table: Record<string | number, ExternalValue>, manfiest: TerraformPackageManifest) {
+export function getModuleDeps(table: Record<string | number, ExternalValue>) {
     const keys = new Set<string>()
     for (const v of Object.values(table)) {
         if (v.valueType === 'reflection' && v.operations) {
-            const op = resolveVal(table, v.operations[0])
+            const op = resolveVal(table, v.operations, 0)
             if (op.type !== 'import') continue
 
             keys.add(op.module)
         }
     }
 
-    return pruneManifest(manfiest, keys)
+    return keys
 }
 
-function resolveVal<T extends object>(table: Record<string | number, ExternalValue>, val: T): T {
-    if (moveableStr in val) {
-        const id = (val as any)[moveableStr].id
-        const obj = table[id]
-        if (obj.valueType !== 'object') {
-            throw new Error(`Invalid value type: ${obj.valueType}. Expected type "object".`)
-        }
+export function getNpmDeps(table: Record<string | number, ExternalValue>, manfiest: TerraformPackageManifest) {
+    return pruneManifest(manfiest, getModuleDeps(table))
+}
 
-        const res: Record<string, any> = {}
-        for (const [k, v] of Object.entries((obj as any).properties)) {
-            if (typeof v === 'object' && !!v) {
-                res[k] = resolveVal(table, v as any)
-            } else {
-                res[k] = v
-            }
+function resolveVal<T extends object>(table: Record<string | number, ExternalValue | any[]>, val: T): T
+function resolveVal<T extends object>(table: Record<string | number, ExternalValue | any[]>, val: T[], index: number): T
+function resolveVal<T extends object>(table: Record<string | number, ExternalValue | any[]>, val: T, index?: number): T {
+    if (!(moveableStr in val)) {
+        if (index !== undefined && Array.isArray(val)) {
+            return resolveVal(table, val[index])
         }
-        return res as T
+        return val
     }
 
-    return val
+    const id = (val as any)[moveableStr].id
+    const obj = table[id]
+    if (Array.isArray(obj)) {
+        if (index !== undefined) {
+            return resolveVal(table, obj[index])
+        }
+        return obj.map(el => resolveVal(table, el)) as T
+    }
+
+    if (obj.valueType !== 'object') {
+        throw new Error(`Invalid value type: ${obj.valueType}. Expected type "object".`)
+    }
+
+    const res: Record<string, any> = {}
+    for (const [k, v] of Object.entries((obj as any).properties)) {
+        if (typeof v === 'object' && !!v) {
+            res[k] = resolveVal(table, v as any)
+        } else {
+            res[k] = v
+        }
+    }
+    return res as T
 }
 
 // FIXME: `esm` not implemented
 function createLoader(
-    table: Record<string | number, ExternalValue>,
+    table: Record<string | number, ExternalValue | any[]>,
     isBundled: boolean,
     type: 'cjs' | 'esm' = 'cjs',
     platform: 'node' | 'browser' = 'node',
@@ -944,6 +964,8 @@ function createLoader(
     const defaultCases: Record<string, ts.CaseClause> = {}
     const originCases: Record<string, { clauses: ts.CaseClause[] }> = {}
     for (const entry of Object.values(table)) {
+        if (Array.isArray(entry)) continue
+
         switch (entry?.valueType) {
             case 'function': {
                 const spec = isDataPointer(entry.module) 
@@ -1123,7 +1145,7 @@ interface SerializerHost {
 }
 
 export function renderFile(
-    data: { table: Record<string | number, ExternalValue>; captured: any },
+    data: { table: Record<string | number, ExternalValue | any[]>; captured: any },
     platform: 'node' | 'browser' = 'node', 
     isBundled = true,
     immediatelyInvoke = false,
@@ -1243,7 +1265,7 @@ function tryOptimization(ops: ReflectionOperation[]) {
 }
 
 function renderSerializedData(
-    table: Record<string | number, ExternalValue>, 
+    table: Record<string | number, ExternalValue | any[]>, 
     captured: any, 
     platform: 'node' | 'browser' | 'synapse',
     immediatelyInvoke?: boolean,
@@ -1308,6 +1330,10 @@ function renderSerializedData(
     }
 
     function renderReflection(operations: ReflectionOperation[], id?: number | string) {
+        if (moveableStr in operations) {
+            operations = table[(operations as any)[moveableStr].id] as any
+        }
+
         // Need to expand ops (this is a sign of brittleness)
         operations = operations.map(o => {
             if (moveableStr in o) {
@@ -1492,6 +1518,14 @@ function renderSerializedData(
         return ident
     }
 
+    function renderArray(id: number | string, value: any[]) {
+        const ident = createIdent(id)
+        const exp = ts.factory.createArrayLiteralExpression(value.map(render))
+        statements.set(id, createVariableStatement(ident, exp))
+
+        return ident
+    }
+
     function renderResource(id: number | string, value: any) {
         const normalized = normalizeTerraform(value)
         const ident = createIdent(id)
@@ -1588,17 +1622,25 @@ function renderSerializedData(
 
         if (moveableStr in val.symbols) {
             const resolved = table[val.symbols[moveableStr].id]
-            if (resolved?.valueType === 'object') {
-                return (resolved as any).properties[name]
+            if (Array.isArray(resolved) || resolved?.valueType !== 'object') {
+                return
             }
 
-            return
+            return (resolved as any).properties[name]
         }
 
         return val.symbols[name]
     }
 
-    for (const obj of Object.values(table)) {
+    for (const [id, obj] of Object.entries(table)) {
+        if (Array.isArray(obj)) {
+            frame = []
+            dependencies.set(id, frame)
+            renderArray(id, obj)
+
+            continue
+        }
+
         if (obj === null || obj === undefined) continue // Not needed anymore??
 
         const browserImpl = platform === 'browser' ? getSymbol(obj, 'synapse.browserImpl') : undefined
@@ -1677,7 +1719,7 @@ function renderSerializedData(
                 const id = obj[moveableStr].id
                 if (id !== undefined) {
                     const val = table[id]
-                    if (val.valueType !== 'object') {
+                    if (Array.isArray(val) || val.valueType !== 'object') {
                         return ts.factory.createExportDefault(render(obj))
                     }
 

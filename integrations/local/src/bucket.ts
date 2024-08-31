@@ -21,6 +21,10 @@ function getStoreFilePath(id: string) {
     return path.resolve(kvPath, id)
 }
 
+async function clearStore(id: string) {
+    await fs.rm(getStoreFilePath(id), { force: true, recursive: true }).catch(throwIfNotFileNotFoundError)
+}
+
 export class LocalKVStore extends core.defineResource({
     create: async () => {
         const id = randomUUID()
@@ -30,10 +34,10 @@ export class LocalKVStore extends core.defineResource({
     },
     update: state => state,
     delete: async (state) => {
-        await fs.rm(getStoreFilePath(state.id), { force: true, recursive: true }).catch(throwIfNotFileNotFoundError)
+        await clearStore(state.id)
     },
 }) {
-    async put(key: string, value: Uint8Array) {
+    async put(key: string, value: string | Uint8Array | ReadableStream<Uint8Array>) {
         const p = path.resolve(getStoreFilePath(this.id), key)
         await fs.mkdir(path.dirname(p), { recursive: true })
         await fs.writeFile(p, value)
@@ -55,11 +59,15 @@ export class LocalKVStore extends core.defineResource({
     }
 
     async stat(key: string) {        
-        const stats = await fs.stat(path.resolve(getStoreFilePath(this.id), key))
+        try {
+            const stats = await fs.stat(path.resolve(getStoreFilePath(this.id), key))
 
-        return {
-            size: stats.size,
-            contentType: getContentType(key),
+            return {
+                size: stats.size,
+                contentType: getContentType(key),
+            }
+        } catch (e) {
+            throwIfNotFileNotFoundError(e)
         }
     }
 
@@ -92,8 +100,18 @@ export class LocalKVStore extends core.defineResource({
         return keys
     }
 
-    async delete(key: string) {        
-        await fs.rm(path.resolve(getStoreFilePath(this.id), key)).catch(throwIfNotFileNotFoundError)
+    async delete(key: string) {
+        try {
+            await fs.rm(path.resolve(getStoreFilePath(this.id), key))
+            return true
+        } catch (e) {
+            throwIfNotFileNotFoundError(e)
+            return false
+        }
+    }
+
+    async clear() {
+        await clearStore(this.id)
     }
 }
 
@@ -116,11 +134,11 @@ export class Bucket implements storage.Bucket {
         return this.resource.get(key, encoding)
     }
 
-    public async put(key: string, blob: string | Uint8Array): Promise<void> {
-        await this.resource.put(key, typeof blob === 'string' ? Buffer.from(blob) : blob)
+    public async put(key: string, blob: string | Uint8Array | ReadableStream<Uint8Array>): Promise<void> {
+        await this.resource.put(key, blob)
     }
 
-    public async stat(key: string): Promise<{ size: number; contentType?: string }> {
+    public async stat(key: string): Promise<{ size: number; contentType?: string } | undefined> {
         return this.resource.stat(key)
     }
 

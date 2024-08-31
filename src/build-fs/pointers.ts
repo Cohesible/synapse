@@ -16,16 +16,17 @@ export function isDataPointer(h: string): h is DataPointer {
     return typeof h === 'object' && !!h && pointerSymbol in h
 }
 
-// This version only beats `startsWith` after millions of calls
+// This version only beats `startsWith` after ~100k calls
 function hasPointerPrefix(s: string) {
-    if (s.charCodeAt(0) !== 112) return false   // p
-    if (s.charCodeAt(1) !== 111) return false   // o
-    if (s.charCodeAt(2) !== 105) return false   // i
-    if (s.charCodeAt(3) !== 110) return false   // n
-    if (s.charCodeAt(4) !== 116) return false   // t
-    if (s.charCodeAt(5) !== 101) return false   // e
-    if (s.charCodeAt(6) !== 114) return false   // r
-    if (s.charCodeAt(7) !== 58) return false    // :
+    if (s.length < 8) return false
+    if (s[0] !== 'p') return false
+    if (s[1] !== 'o') return false
+    if (s[2] !== 'i') return false
+    if (s[3] !== 'n') return false
+    if (s[4] !== 't') return false
+    if (s[5] !== 'e') return false
+    if (s[6] !== 'r') return false
+    if (s[7] !== ':') return false
 
     return true
 }

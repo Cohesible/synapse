@@ -1,5 +1,5 @@
 import * as path from 'node:path'
-import { getLogger } from '../..'
+import { getLogger } from '../../logging'
 import { ParsedPlan, getChangeType, mapResource } from '../../deploy/deployment'
 import { DeployEvent, DeploySummaryEvent, FailedDeployEvent } from '../../logging'
 import { SymbolNode, SymbolGraph, renderSymbol, MergedGraph, renderSymbolLocation } from '../../refactoring'
@@ -97,16 +97,26 @@ export function printSymbolTable(symbols: Iterable<[sym: SymbolNode, state: Symb
     }
 }
 
-function renderSym(sym: Symbol, showType = true, showLocation = true) {
+export function renderSym(sym: Symbol, showType = true, showLocation = true) {
     const parts = getBetterName(sym)
-    const symType = parts.type && showType ? ` <${parts.type}> ` : ''
+    const words = [parts.name]
 
-    const loc = showLocation ? renderSymbolLocation(sym, true) : ''
-    const details = colorize('gray', `${symType}${loc}`)
+    if (parts.type && showType) {
+        words.push(colorize('gray', `<${parts.type}>`))
+    }
 
-    return `${parts.name}${details}`
+    if (showLocation) {
+        words.push(colorize('gray', renderSymbolLocation(sym, true)))
+    }
+
+    return words.join(' ')
 }
 
+// TODO: the file location for the `from` symbol may appear to be
+// incorrect because we can't easily link to the actual source code
+//
+// The location is correct, but if the user clicks it in an IDE they'll
+// be taken to the file in its current state.
 export function renderMove(
     from: Symbol,
     to: Symbol,
@@ -156,11 +166,10 @@ interface DeploySummary {
         
 }
 
-export async function createDeployView(graph: MergedGraph, isDestroy?: boolean) {
+export async function createDeployView(graph: MergedGraph, mode: 'deploy' | 'destroy' | 'import' = 'deploy') {
     const view = getDisplay().getOverlayedView()
-    const headerLength = Math.min(process.stdout.columns, 80)
-    const opName = isDestroy ? 'destroy' : 'deploy'
-    const header = view.createRow(`Planning ${opName}...`)
+    const isDestroy = mode === 'destroy'
+    const header = view.createRow(mode === 'import' ? 'Importing...' : `Planning ${mode}...`)
     const errors: [resource: string, reason: (string | Error)][] = []
     const skipped = new Set<string>()
 
@@ -361,8 +370,8 @@ export async function createDeployView(graph: MergedGraph, isDestroy?: boolean) 
         arr.push(require('node:util').format(...ev.args))
     })
 
-    function dispose() {
-        header.release()
+    function dispose(headerText?: string) {
+        header.release(headerText)
         for (const [id] of getRow.keys()) {
             getRow(id).release()
         }

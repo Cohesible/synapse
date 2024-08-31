@@ -1,12 +1,12 @@
 import * as path from 'node:path'
 import { StdioOptions } from 'node:child_process'
-import { mergeBuilds, pruneBuild, consolidateBuild, commitPackages, getInstallation, writeSnapshotFile, getProgramFs, getDataRepository, getModuleMappings, loadSnapshot, dumpData, getProgramFsIndex, getDeploymentFsIndex, toFsFromIndex, copyFs, createSnapshot, getOverlayedFs, Snapshot, ReadonlyBuildFs } from '../artifacts'
+import { mergeBuilds, pruneBuild, consolidateBuild, commitPackages, getInstallation, writeSnapshotFile, getProgramFs, getDataRepository, getModuleMappings, loadSnapshot, dumpData, getProgramFsIndex, getDeploymentFsIndex, toFsFromIndex, copyFs, createSnapshot, getOverlayedFs, Snapshot, ReadonlyBuildFs, getSnapshotPath } from '../artifacts'
 import {  NpmPackageInfo, getDefaultPackageInstaller, installFromSnapshot, testResolveDeps } from './packages'
 import { getBinDirectory, getSynapseDir, getLinkedPackagesDirectory, getToolsDirectory, getUserEnvFileName, getWorkingDir, listPackages, resolveProgramBuildTarget, SynapseConfiguration, getUserSynapseDirectory, setPackage, BuildTarget, findDeployment, getOrCreateRemotePackage } from '../workspaces'
 import { gunzip, gzip, isNonNullable, keyedMemoize, linkBin, makeExecutable, memoize, throwIfNotFileNotFoundError, tryReadJson } from '../utils'
 import { Fs, ensureDir } from '../system'
 import { glob } from '../utils/glob'
-import { getLogger, runTask } from '..'
+import { getLogger, runTask } from '../logging'
 import { homedir } from 'node:os'
 import { getBuildTargetOrThrow, getFs, getSelfPathOrThrow, isSelfSea } from '../execution'
 import { ImportMap, expandImportMap, hoistImportMap } from '../runtime/importMaps'
@@ -92,22 +92,26 @@ function getLinkedPkgPath(name: string, deploymentId?: string) {
     return path.resolve(packagesDir, deploymentId ? `${name}-${deploymentId}` : name)
 }
 
-async function publishTarball(tarball: Buffer, pkgJson: PackageJson, allowOverwrite?: boolean, visibility?: 'public' | 'private') {
-    if (!pkgJson.version) {
-        throw new Error('Package is missing a version')
+async function publishTarball(tarball: Buffer, pkgJson: PackageJson, opt?: PublishToRemoteOptions) {
+    const remotePkgId = await getOrCreateRemotePackage(!!opt?.ref)
+    getLogger().log(`Using package: ${remotePkgId}`)
+
+    const client = registry.createClient()
+    const { hash } = await client.uploadPackage(remotePkgId, tarball)
+    if (opt?.ref) {
+        getLogger().log(`Setting package ref: ${opt.ref} --> ${hash}`)
+
+        return client.setRef(remotePkgId, opt.ref, hash)
     }
 
-    const remotePkgId = await getOrCreateRemotePackage()
-    const client = registry.createClient()
-    const { hash } = await client.uploadPackage(tarball)
     await client.publishPackage({
         packageId: remotePkgId,
         packageHash: hash,
         packageJson: pkgJson,
-        allowOverwrite,
+        allowOverwrite: opt?.allowOverwrite,
     })
 
-    if (visibility === 'public') {
+    if (opt?.visibility === 'public') {
         await client.updatePackageMetadata({
             packageId: remotePkgId,
             public: true,
@@ -115,7 +119,14 @@ async function publishTarball(tarball: Buffer, pkgJson: PackageJson, allowOverwr
     }
 }
 
-async function publishTarballToRemote(tarballPath: string, allowOverwrite?: boolean, visibility?: 'public' | 'private') {
+interface PublishToRemoteOptions {
+    tarballPath?: string
+    allowOverwrite?: boolean
+    visibility?: 'public' | 'private'
+    ref?: string
+}
+
+async function publishTarballToRemote(tarballPath: string, opt?: PublishToRemoteOptions) {
     const tarball = Buffer.from(await getFs().readFile(tarballPath))
     const files = extractTarball(await gunzip(tarball))
     const pkgJsonFile = files.find(f => f.path === 'package.json')
@@ -125,12 +136,12 @@ async function publishTarballToRemote(tarballPath: string, allowOverwrite?: bool
 
     const pkgJson = JSON.parse(pkgJsonFile.contents.toString('utf-8'))
 
-    await publishTarball(tarball, pkgJson, allowOverwrite, visibility)
+    await publishTarball(tarball, pkgJson, opt)
 }
 
-export async function publishToRemote(tarballPath?: string, allowOverwrite?: boolean, visibility?: 'public' | 'private') {
-    if (tarballPath) {
-        return publishTarballToRemote(tarballPath, allowOverwrite, visibility)
+export async function publishToRemote(opt?: PublishToRemoteOptions) {
+    if (opt?.tarballPath) {
+        return publishTarballToRemote(opt.tarballPath, opt)
     }
 
     const bt = getBuildTargetOrThrow()
@@ -145,7 +156,7 @@ export async function publishToRemote(tarballPath?: string, allowOverwrite?: boo
     try {
         await createPackageForRelease(packageDir, tmpDest, { environmentName: bt.environmentName }, true, true, true)
         const tarball = await createSynapseTarball(tmpDest)
-        await publishTarball(tarball, pkgJson.data, allowOverwrite, visibility)
+        await publishTarball(tarball, pkgJson.data, opt)
     } finally {
         await getFs().deleteFile(tmpDest).catch(throwIfNotFileNotFoundError)
     }
@@ -172,17 +183,20 @@ export async function linkPackage(opt?: PublishOptions & { globalInstall?: boole
     const pkgName = pkg.data.name ?? path.basename(pkg.directory)
     const resolvedDir = getLinkedPkgPath(pkgName, bt.deploymentId)
     if (opt?.useNewFormat) {
-        return createPackageForRelease(packageDir, resolvedDir, undefined, true, true, true)
+        return createPackageForRelease(packageDir, resolvedDir, { skipBinaryDeps: true }, true, true, true)
     }
 
     const pruned = await createMergedView(bt.programId, bt.deploymentId)
-    await copyFs(pruned, resolvedDir)
+    const oldManifest = await tryReadJson<Snapshot>(fs, getSnapshotPath(resolvedDir))
+    const oldStoreHash = oldManifest?.storeHash
+
+    await runTask('copyFs', 'linkPackage', () => copyFs(pruned, resolvedDir), 100)
     await patchSourceRoots(bt.workingDirectory, resolvedDir)
     const { snapshot, committed } = await createSnapshot(pruned,  bt.programId, bt.deploymentId)
-    await writeSnapshotFile(fs, resolvedDir, snapshot) 
-    await dumpData(resolvedDir, pruned, snapshot.storeHash)
-    await dumpData(resolvedDir, pruned, snapshot.storeHash, true) // Write a block too
- 
+    // TODO: exclusively use data blocks instead of 'both'
+    await dumpData(resolvedDir, pruned, snapshot.storeHash, 'both', oldStoreHash)
+    await writeSnapshotFile(fs, resolvedDir, snapshot)
+
     if (!pruned.files['package.json']) {
         await fs.writeFile(
             path.resolve(resolvedDir, 'package.json'), 
@@ -928,10 +942,15 @@ function findBinPathsSync(pkgDir: string, fs = getFs()) {
     return paths
 }
 
-export function createNpmLikeCommandRunner(pkgDir: string, env?: Record<string, string>, stdio?: StdioOptions) {
+export function createNpmLikeCommandRunner(pkgDir: string, env?: Record<string, string>, stdio?: StdioOptions, shell?: string) {
     const paths = findBinPathsSync(pkgDir)
     env = patchPath(paths.join(':'), env)
 
-    return createCommandRunner({ cwd: pkgDir, env, stdio })
+    return createCommandRunner({ 
+        cwd: pkgDir, 
+        env, 
+        stdio,
+        shell,
+    })
 }
 

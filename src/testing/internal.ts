@@ -10,6 +10,7 @@ import { isNonNullable } from '../utils'
 // Commands are treated like scripts in `package.json`
 const commandsDirective = '!commands'
 const finallyCommand = '@finally'
+const expectFailCommand = '@expectFail'
 
 function parseCommands(text: string) {
     const lines = text.split('\n')
@@ -51,16 +52,24 @@ export async function runInternalTestFile(fileName: string, opt?: RunTestOptions
     return runTest(fileName, commands, opt)
 }
 
-function renderCommands(commands: string[], synapseCmd?: string) {
+function renderCommands(commands: string[], synapseCmd = process.env.SYNAPSE_CMD) {
     if (synapseCmd) {
         commands = commands.map(cmd => cmd.replaceAll('synapse', synapseCmd))
     }
 
     const inner: string[] = []
     const statements: string[] = []
-    for (const c of commands) {
+    for (let i = 0; i < commands.length; i++) {
+        const c = commands[i]
         if (c.startsWith(finallyCommand)) {
             statements.push(c.slice(finallyCommand.length).trim())
+            continue
+        }
+
+        const index = c.indexOf(expectFailCommand)
+        if (index !== -1) {
+            const command = `${c.slice(0, index)}; if [[ $? -eq 0 ]]; then echo "Expected command ${i} to fail"; exit 1; fi`
+            inner.push(command)
         } else {
             inner.push(c)
         }
@@ -78,14 +87,17 @@ function renderCommands(commands: string[], synapseCmd?: string) {
 }
 
 async function runTest(fileName: string, commands: string[], opt?: RunTestOptions) {
+    // Force `bash` on windows
+    const shell = process.platform === 'win32' ? 'bash' : undefined
+
     if (opt?.snapshot) {
-        const runner = createNpmLikeCommandRunner(path.dirname(fileName), undefined, ['inherit', 'pipe', 'inherit'])
+        const runner = createNpmLikeCommandRunner(path.dirname(fileName), undefined, ['inherit', 'pipe', 'inherit'], shell)
         const cmd = renderCommands(commands, opt?.synapseCmd)
         const result = await runner(cmd)
         return
     }
 
-    const runner = createNpmLikeCommandRunner(path.dirname(fileName), undefined, 'inherit')
+    const runner = createNpmLikeCommandRunner(path.dirname(fileName), undefined, 'inherit', shell)
     const cmd = renderCommands(commands, opt?.synapseCmd)
 
     await runner(cmd)

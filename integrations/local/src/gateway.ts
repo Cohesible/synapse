@@ -1,5 +1,6 @@
 import * as fs from 'node:fs/promises'
 import * as core from 'synapse:core'
+import { addIndirectRefs } from 'synapse:terraform'
 import * as lib from 'synapse:lib'
 import * as path from 'node:path'
 import * as stream from 'node:stream'
@@ -356,9 +357,13 @@ export class Gateway implements compute.HttpService {
         path: P,
         handler: RequestHandler<`${string} ${P}`, R> | RequestHandlerWithBody<`${string} ${P}`, U, R>
     ): HttpRoute<PathArgsWithBody<P, U>, R> {
-        this.requestRouter.addRoute(method, path, wrapRequestHandler(handler, this.authHandler))
+        const wrapped = wrapRequestHandler(handler, this.authHandler)
+        this.requestRouter.addRoute(method, path, wrapped)
 
-        return this.toRoute(method, path)
+        const route = this.toRoute(method, path)
+        addIndirectRefs(route, wrapped)
+
+        return route
     }
 
     constructor(opt?: compute.HttpServiceOptions) {
@@ -431,8 +436,8 @@ function sendResponse(response: http.ServerResponse, data?: any, headers?: Heade
         })
     }
 
-    if (data instanceof ReadableStream) {
-        return new Promise((resolve, reject) => {
+    async function sendStream(data: ReadableStream) {
+        return new Promise<void>((resolve, reject) => {
             response.on('error', reject)
             response.on('end', resolve)
             response.writeHead(status, { 
@@ -443,6 +448,14 @@ function sendResponse(response: http.ServerResponse, data?: any, headers?: Heade
             piped.on('error', reject)
             piped.on('close', () => response.end())
         })
+    }
+
+    if (data instanceof Blob) {
+        return sendStream(data.stream())
+    }
+
+    if (data instanceof ReadableStream) {
+        return sendStream(data)
     }
 
     const isTypedArray = typeof data === 'object' && !!data && data instanceof TypedArray
@@ -480,7 +493,7 @@ function wrapRequestHandler(
             ? JSON.parse(await receiveData(req)) 
             : undefined
 
-        const reqBody = method === 'GET' || method === 'HEAD' ? undefined : (body ?? stream.Readable.toWeb(req))
+        const reqBody = method === 'GET' || method === 'HEAD' ? undefined : (body === undefined ? stream.Readable.toWeb(req) : undefined)
         const newReq = new Request(url, {
             headers,
             method,
@@ -490,14 +503,15 @@ function wrapRequestHandler(
 
         ;(newReq as any).pathParameters = pathParameters
 
+        const bodyWithFallback = body !== undefined ? body : newReq.body
         if (authHandler) {
-            const resp = await authHandler(newReq as any, body)
+            const resp = await authHandler(newReq as any, bodyWithFallback)
             if (resp !== undefined) {
                 return resp
             }
         }
 
-        return handler(newReq as any, body)
+        return handler(newReq as any, bodyWithFallback)
     }
 
     return handleRequest

@@ -1,30 +1,30 @@
 import * as path from 'node:path'
 import * as builder from '../build/builder'
 import { runCommand } from "../utils/process"
-import { getLogger } from '..'
-import { getGlobalCacheDirectory, getRootDir } from '../workspaces'
+import { getLogger } from '../logging'
+import { getGlobalCacheDirectory, getTempZigBuildDir, getWorkingDir } from '../workspaces'
 import { getFs } from '../execution'
-import { ensureDir, throwIfNotFileNotFoundError } from '../utils'
+import { ensureDir, keyedMemoize, memoize, throwIfNotFileNotFoundError } from '../utils'
 import { ResolvedProgramConfig, getOutputFilename } from '../compiler/config'
 import { getProgramFs } from '../artifacts'
-import { ExportedFn, generateTsZigBindings } from './ast'
+import { ExportedFn, generateTsZigBindings, getImportedModulesFromFile } from './ast'
 import { getFileHasher } from '../compiler/incremental'
-import { getZigPath, registerZigProvider } from './installer'
+import { getJsLibPath, getZigPath, registerZigProvider } from './installer'
 import { downloadNodeLib } from '../cli/buildInternal'
+import { getZigImports } from '../compiler/entrypoints'
 
 // FIXME: ReferenceError: Cannot access 'synDirName' before initialization
 const getZigCacheDir = () => path.resolve(getGlobalCacheDirectory(), 'zig')
 
 function getOutFile(target: string, outDir?: string, suffix = '') {
+    const workingDir = getWorkingDir()
     const fileName = target.replace(/\.zig$/, suffix)
-    if (!outDir) {
-        return fileName
+    const rel = path.relative(workingDir, fileName)
+
+    return {
+        absolute: path.resolve(outDir ?? getTempZigBuildDir(), rel),
+        relative: rel,
     }
-
-    const rootDir = getRootDir()
-    const rel = path.relative(rootDir, fileName)
-
-    return path.resolve(outDir, rel)
 }
 
 function renderStub(binaryPath: string) {
@@ -65,7 +65,7 @@ module.exports.main = function main(...args) {
 }
 
 interface CompileCache {
-    files: Record<string, { hash: string }>
+    files: Record<string, { hash: string; deps?: string[] }>
 }
 
 const cacheName = `[#compile-zig]__zig-cache__.json`
@@ -82,7 +82,110 @@ async function setCache(data: CompileCache): Promise<void> {
     await getProgramFs().writeJson(cacheName, data)
 }
 
-type CompileTarget = 'wasm' | 'exe' | 'dylib' | 'wasm-obj'
+async function clearCacheEntry(fileName: string) {
+    const p = path.relative(getWorkingDir(), path.resolve(getWorkingDir(), fileName))
+
+    const cache = await getCache()
+    if (!cache.files[p]) {
+        return
+    }
+
+    delete cache.files[p]
+    await setCache(cache)
+}
+
+async function _getZigCompilationGraph(roots: string[], workingDir: string) {
+    const zigFiles = new Set<string>()
+    const zigImportingFiles = new Set<string>()
+
+    async function addZigImports(f: string) {
+        const imports = await getZigImports(path.relative(workingDir, f))
+        if (!imports || imports.length === 0) {
+            return
+        }
+
+        const dir = path.dirname(f)
+        for (const p of imports) {
+            zigFiles.add(path.resolve(dir, p))
+        }
+
+        zigImportingFiles.add(f)
+    }
+
+    await Promise.all(roots.map(addZigImports))
+
+    if (zigFiles.size === 0) {
+        return
+    }
+
+    const hasher = getFileHasher()
+    const cache = await getCache()
+
+    async function _visit(f: string) {
+        const absPath = path.resolve(workingDir, f)
+        const relPath = path.relative(workingDir, absPath)
+
+        const hash = await hasher.getHash(absPath)
+        if (cache.files[relPath]?.hash === hash) {
+            let didChange = false
+            for (const d of cache.files[relPath].deps ?? []) {    
+                if (await visit(d)) {
+                    didChange = true
+                }
+            }    
+
+            return didChange
+        }
+
+        const deps = await getImportedModulesFromFile(absPath)
+        for (const d of deps) {
+            await visit(d)
+        }
+
+        if (!cache.files[relPath]) {
+            cache.files[relPath] = { hash }
+        } else {
+            cache.files[relPath].hash = hash
+        }
+
+        cache.files[relPath].deps = deps.size > 0 ? [...deps] : undefined
+
+        return true
+    }
+
+    const visit = keyedMemoize(_visit)
+
+    const changed = new Set<string>()
+    for (const f of zigFiles) {
+        if (await visit(f)) {
+            changed.add(f)
+        }
+    }
+
+    if (changed.size > 0) {
+        await setCache(cache)
+    }
+
+    return {
+        changed,
+        zigImportingFiles,
+    }
+}
+
+const graphs = new Map<ReturnType<typeof getProgramFs>, ReturnType<typeof _getZigCompilationGraph>>()
+export function getZigCompilationGraph(roots: string[], workingDir: string) {
+    const fs = getProgramFs()
+    if (graphs.has(fs)) {
+        return graphs.get(fs)!
+    }
+
+    const res = _getZigCompilationGraph(roots, workingDir)
+    graphs.set(fs, res)
+    
+    return res
+}
+
+type CompileTarget = 'wasm' | 'exe' | 'dylib'
 
 function renderWasmStub(relPath: string, bindings: ExportedFn[]) {
     return `
@@ -93,20 +196,13 @@ function getInst() {
     if (inst) {
         return inst
     }
-    
-    if (isSea) {
-        const source = require('raw-sea-asset:./${relPath}');
-        const typedArray = new Uint8Array(source.buffer);
-        const wasmModule = new WebAssembly.Module(typedArray);
 
-        return inst = new WebAssembly.Instance(wasmModule, { env: {} })
+    if (!isSea) {
+        return inst = { exports: require('./${relPath}') };
     }
-
-    const fs = require('node:fs');
-    const path = require('node:path');
-    const source = fs.readFileSync(path.resolve(__dirname, '${relPath}'));
-    const typedArray = new Uint8Array(source);
     
+    const source = require('raw-sea-asset:./${relPath}');
+    const typedArray = new Uint8Array(source.buffer);
     const wasmModule = new WebAssembly.Module(typedArray);
 
     return inst = new WebAssembly.Instance(wasmModule, { env: {} });
@@ -158,6 +254,14 @@ module.exports['${b.name}'] = function (${b.params.map(p => p.name).join(', ')})
 `
 }
 
+function mapParamName(p: { name: string }) {
+    if (p.name === 'this') {
+        return '_this'
+    }
+
+    return p.name
+}
+
 // This makes things a bit more flexible (but slower)
 function renderDylibStub(relPath: string, bindings: ExportedFn[]) {
     return `
@@ -170,34 +274,44 @@ function init() {
     }
 
     const path = require('node:path');
-    if (isSea) {
-        const source = require('raw-sea-asset:./${relPath}');
-        const synapseInstall = process.env.SYNAPSE_INSTALL ?? path.resolve(require('node:os').homedir(), '.synapse');
-        const name = process.platform === 'win32' ? source.hash + '.synapse' : source.hash
-        const dest = path.resolve(synapseInstall, 'cache', 'dlls', name);
-        const fs = require('node:fs');
-        if (!fs.existsSync(dest)) {
-            fs.mkdirSync(path.dirname(dest), { recursive: true });
-            fs.writeFileSync(dest, new Uint8Array(source.buffer));
-        }
-
-        process.dlopen(module, dest);
+    if (!isSea) {
+        const p = path.resolve(__dirname, '${relPath}');
+        process.dlopen(module, p);
         didInit = true;
+        bind();
 
         return;
     }
 
-    const p = require('node:path').resolve(__dirname, '${relPath}');
-    process.dlopen(module, p);
+    const source = require('raw-sea-asset:./${relPath}');
+    const synapseInstall = process.env.SYNAPSE_INSTALL ?? path.resolve(require('node:os').homedir(), '.synapse');
+    const name = process.platform === 'win32' ? source.hash + '.synapse' : source.hash
+    const dest = path.resolve(synapseInstall, 'cache', 'dlls', name);
+    const fs = require('node:fs');
+    if (!fs.existsSync(dest)) {
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        fs.writeFileSync(dest, new Uint8Array(source.buffer));
+    }
+
+    process.dlopen(module, dest);
     didInit = true;
+    bind();
 }
+
+function bind() {
+    ${bindings.map(b => `module.exports['${b.name}'] = module.exports['${b.name}'].bind(module.exports);`).join('\n')}
+}
+
+module.exports['__esModule'] = true;
 
 ${bindings.map(b => {
     return `
-module.exports['${b.name}'] = function (${b.params.map(p => p.name).join(', ')}) {
+module.exports['${b.name}'] = function (${b.params.map(mapParamName).join(', ')}) {
+    if (didInit) throw new Error('${b.name} did not initialize');
+
     init();
 
-    return module.exports['${b.name}'](${b.params.map(p => p.name).join(', ')})
+    return module.exports['${b.name}'](${b.params.map(mapParamName).join(', ')})
 }
 `
 }).join('\n')}
@@ -253,7 +367,7 @@ export async function buildWindowsShim() {
     return outfile
 }
 
-function getHostTarget(opt: ResolvedProgramConfig) {
+function getHostTarget(opt: Pick<ResolvedProgramConfig, 'csc'>) {
     const parts = opt.csc.hostTarget?.split('-')
     const os = parts?.[0]
     const arch = parts?.[1]
@@ -281,9 +395,11 @@ function toZigTarget(target: builder.QualifiedBuildTarget) {
     }
 
     switch (target.os) {
-        case 'darwin':
-            parts.push('macos')
+        case 'darwin': {
+            const target = process.env.MACOSX_DEPLOYMENT_TARGET
+            parts.push(`macos${target ? `.${target}` : ''}`)
             break
+        }
 
         case 'linux':
         case 'windows':
@@ -294,30 +410,45 @@ function toZigTarget(target: builder.QualifiedBuildTarget) {
             throw new Error(`OS not implemented: ${target.os}`)
     }
 
+    if (target.os === 'linux') {
+        // Zig normally defaults to 'musl'
+        const libc = target.libc ?? 'native'
+        parts.join(libc)
+    }
+
     return parts.join('-')
 }
 
-export async function compileZig(file: string, opt: ResolvedProgramConfig, target: CompileTarget = 'wasm') {    
-    const c = await getCache()
-    const hash = await getFileHasher().getHash(file)
-    if (c.files[file]?.hash === hash) {
-        return
+const getJsLibPathCached = memoize(getJsLibPath)
+
+// TODO: compile test binaries using `--test-no-exec`
+
+export async function passthroughZig(args: string[]) {
+    const hostTargetIndex = args.indexOf('--use-host-target')
+    if (hostTargetIndex !== -1) {
+        const hostTarget = getHostTarget({ csc: {} })
+        args.splice(hostTargetIndex, 1, '-target', toZigTarget(hostTarget))
     }
 
+    const zigPath = await getZigPath()
+    await runCommand(zigPath, args, { stdio: 'inherit' })
+}
+
+async function compileZig(file: string, opt: ResolvedProgramConfig, target: CompileTarget = 'wasm') {    
     const bindings = await generateTsZigBindings(file)
     if (bindings.isModule) {
         target = 'dylib'
     }
 
-    const exports = bindings.exportedFunctions.map(fn => `--export=${fn.name}`)
+    const exported = bindings.exportedFunctions.map(fn => `--export=${fn.name}`)
+    const hasJsModule = bindings.importedModules.find(m => m.specifier === 'js')
+    const jsLibPath = hasJsModule ? await getJsLibPathCached() : undefined
+    const shouldUseJsLib = !!jsLibPath
 
     let cmd: string
     switch (target) {
         case 'dylib':
             cmd = 'build-lib'
-            break
-        case 'wasm-obj':
-            cmd = 'build-obj'
             break
         case 'wasm':
         case 'exe':
@@ -327,9 +458,6 @@ export async function compileZig(file: string, opt: ResolvedProgramConfig, targe
 
     let extname: string | undefined
     switch (target) {
-        case 'wasm-obj':
-            extname = '.o'
-            break
         case 'dylib':
             extname = '.node'
             break
@@ -338,62 +466,72 @@ export async function compileZig(file: string, opt: ResolvedProgramConfig, targe
             break
     }
 
-    // Can be `const` for non-wasm builds
-    let outfile = getOutFile(file, opt.tsc.cmd.options.outDir, extname)
+    const outfile = getOutFile(file, opt.tsc.cmd.options.outDir, extname)
 
-    const args = [cmd, file]
+    const args = [cmd]
     const hostTarget = getHostTarget(opt)
 
-    if (target === 'wasm' || target === 'wasm-obj') {
-        args.push('-target', 'wasm32-freestanding-musl')
-        args.push('-O', 'ReleaseFast')
-    }
-
-    if (target === 'dylib') {
-        args.push('-dynamic', '-fallow-shlib-undefined')
-        args.push('-O', 'ReleaseFast')
-
-        args.push('-target', toZigTarget(hostTarget))
-        if (hostTarget.os === 'windows') {
-            // need to link against a `.lib` file for Windows
-            const libPath = await downloadNodeLib()
-            if (libPath) {
-                args.push(libPath, '-lc')
+    async function getPerModuleArgs(canAddNodeLib = true) {
+        const args: string[] = []
+        if (target === 'wasm') {
+            args.push('-target', 'wasm32-freestanding-musl')
+            if (!opt.csc.debug) {
+                args.push('-O', 'ReleaseFast')
             }
-
-            // TODO: using the hook requires the `delayload` MSVC feature e.g. `/delayload node.exe`
-            // const hookPath = await buildLoadHook()
-            // args.push(hookPath)
         }
+    
+        if (target === 'dylib') {
+            args.push('-dynamic', '-fallow-shlib-undefined')
+            if (!opt.csc.debug) {
+                args.push('-O', 'ReleaseFast')
+            }
+    
+            args.push('-target', toZigTarget(hostTarget))
+            if (hostTarget.os === 'windows' && canAddNodeLib) {
+                // need to link against a `.lib` file for Windows
+                const libPath = await downloadNodeLib()
+                if (libPath) {
+                    args.push(libPath, '-lc')
+                }
+    
+                // TODO: using the hook requires the `delayload` MSVC feature e.g. `/delayload node.exe`
+                // const hookPath = await buildLoadHook()
+                // args.push(hookPath)
+            }
+        }
+    
+        if (target === 'wasm') {
+            args.push('-fno-entry', ...exported)
+        }
+
+        return args
     }
 
-    if (target === 'wasm') {
-        args.push('-fno-entry', ...exports)
+    if (!shouldUseJsLib) {
+        args.push(file, ...await getPerModuleArgs())
+    } else {
+        args.push(...await getPerModuleArgs(false))
+        args.push('--dep', 'js')
+        args.push(`-Mmain=${file}`)
+
+        args.push(...await getPerModuleArgs())
+
+        args.push(`-Mjs=${jsLibPath}`)
     }
 
-    await runZig(file, outfile, args)
+    await runZig(file, outfile.absolute, args)
 
     if (bindings.exportedFunctions.length > 0 || bindings.isModule) {
-        const wasmOutfile = outfile.replace(/\.o$/, '.wasm')
-        const stubText = target === 'wasm' || target === 'wasm-obj'
-            ? renderWasmStub(path.basename(wasmOutfile), bindings.exportedFunctions) 
-            : target === 'exe' ? renderStub(outfile) : renderDylibStub(path.basename(outfile), bindings.exportedFunctions)
+        const stubText = target === 'wasm'
+            ? renderWasmStub(path.basename(outfile.relative.replace(/\.o$/, '.wasm')), bindings.exportedFunctions) 
+            : target === 'exe' 
+                ? renderStub(outfile.relative) 
+                : renderDylibStub(path.basename(outfile.relative), bindings.exportedFunctions)
     
-        if (target === 'wasm-obj') {
-            await runCommand('wasm-ld', ['-S', '--no-entry', ...exports, '-o', wasmOutfile, outfile, '--initial-memory=7340032'])
-    
-            if (!opt.csc.noInfra) {
-                const b = await getFs().readFile(wasmOutfile)
-                await getProgramFs().writeFile(`[#compile]${wasmOutfile}`, b)
-            }
-    
-            outfile = wasmOutfile
-        }
-
         if (target === 'dylib' || target === 'wasm') {
             if (!opt.csc.noInfra) {
-                const b = await getFs().readFile(outfile)
-                await getProgramFs().writeFile(`[#compile]${outfile}`, b)
+                const b = await getFs().readFile(outfile.absolute)
+                await getProgramFs().writeFile(`[#compile]${outfile.relative}`, b)
             }
         }
     
@@ -408,12 +546,19 @@ export async function compileZig(file: string, opt: ResolvedProgramConfig, targe
         await getFs().writeFile(bindings.typeDefinition.name, bindings.typeDefinition.text)
     }
 
-    c.files[file] = {
-        ...c.files[file],
-        hash,
-    }
-
-    await setCache(c)
-
     return outfile
+}
+
+export async function compileAllZig(files: string[], config: ResolvedProgramConfig) {
+    for (const f of files) {
+        const res = await compileZig(f, config).catch(async err => {
+            await clearCacheEntry(f)
+
+            throw err
+        })
+
+        if (res) {
+            getLogger().log('Compiled zig file', res)
+        }
+    }
 }

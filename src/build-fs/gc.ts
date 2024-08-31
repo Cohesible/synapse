@@ -5,7 +5,7 @@ import { ensureDirSync, watchForFile } from '../system'
 import { acquireFsLock, getCiType, throwIfNotFileNotFoundError } from '../utils'
 import { BuildFsStats, collectStats, diffSets, getEventLogger, mergeRepoStats, printStats } from './stats'
 import { colorize, getDisplay, printLine } from '../cli/ui'
-import { getLogger } from '..'
+import { getLogger } from '../logging'
 import { startGcProcess } from './gcWorker'
 import { getBuildDir, getUserSynapseDirectory } from '../workspaces'
 import { readKeySync } from '../cli/config'
@@ -104,7 +104,7 @@ export function startGarbageCollection(buildDir?: string) {
         }
 
         try {
-            await cleanArtifacts(repo)
+            await cleanDataRepo(repo)
             getLogger().log('GC complete')
 
             return true
@@ -260,13 +260,21 @@ async function collectGarbage(repo: DataRepository, exclude: Set<string>, pruneA
         }
     }
 
+    // Cleans up unused blocks
+    const blocksDir = repo.getBlocksDir()
+    for (const f of await fs.readDirectory(blocksDir)) {
+        if (!exclude.has(f.name) && f.type === 'file' && f.name.length === 64) {
+            toDelete.add(f.name)
+        }
+    }
+
     return {
         toDelete,
         emptyDirs,
     }
 }
 
-export async function cleanArtifacts(repo = getDataRepository(getFs()), dryRun = false, deleteStubs = true, pruneAge?: number) {
+export async function cleanDataRepo(repo = getDataRepository(getFs()), dryRun = false, deleteStubs = true, pruneAge?: number) {
     if (process.stdout.isTTY) {
         createGcView()
     }

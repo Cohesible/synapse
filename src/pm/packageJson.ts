@@ -1,7 +1,7 @@
 import * as path from 'node:path'
 import { unzipSync } from 'node:zlib'
 import { homedir } from 'node:os'
-import { getLogger } from '..'
+import { getLogger } from '../logging'
 import { getPreviousProgramFs, getProgramFs } from '../artifacts'
 import { Fs, readDirectorySync } from '../system'
 import { getHash, throwIfNotFileNotFoundError, tryReadJson } from '../utils'
@@ -351,33 +351,48 @@ export function parsePackageInstallRequests(requests: string[]): Record<string, 
 }
 
 // https://github.com/oven-sh/bun/issues/3107
-function detectIndentLevel(jsonText: string) {
+function detectIndent(jsonText: string) {
     const firstNewLine = jsonText.indexOf('\n')
     if (firstNewLine === -1) {
         return 0
     }
 
-    const secondNewLine = jsonText.indexOf('\n', firstNewLine)
-    const secondLine = jsonText.slice(firstNewLine+1, secondNewLine === -1 ? jsonText.length : secondNewLine)
-
-    // meh
-    let indent = 0
-    loop: for (let i = 0; i < secondLine.length; i++) {
-        switch (secondLine[i]) {
-            case '\t':
-                indent += 4
-                continue
+    let indent = ''
+    loop: for (let i = firstNewLine+1; i < jsonText.length; i++) {
+        switch (jsonText[i]) {
             case ' ':
-                indent += 1
+            case '\t':
+                indent += jsonText[i]
                 continue
-            
+
             default:
                 break loop
         }
     }
 
+    if (indent.replace(' ', '').length === 0) {
+        return indent.length
+    }
+
     return indent
 }
+
+// describe('detectIndentLevel', () => {
+//     const testPkg: PackageJson = { name: 'foo', dependencies: { fizz: 'buzz' } }
+
+//     const tests: [title: string, text: string, expected: number | string][] = [
+//         ['no indent', JSON.stringify(testPkg), 0],
+//         ['indent 2', JSON.stringify(testPkg, undefined, 2), 2],
+//         ['indent 4', JSON.stringify(testPkg, undefined, 2), 4],
+//         ['indent tab', JSON.stringify(testPkg, undefined, '\t'), '\t'],
+//     ]
+
+//     for (const [title, text, expected] of tests) {
+//         test(title, () => {
+//             expectEqual(detectIndent(text), expected)
+//         })
+//     }
+// })
 
 export function createSynapseProviderRequirement(name: string, constraint: string) {
     const base = name.split('/').pop()!

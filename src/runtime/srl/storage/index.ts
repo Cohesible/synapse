@@ -120,10 +120,14 @@ export type Encoding = 'utf-8' | 'base64' | 'base64url' | 'hex'
 export declare class Bucket {
     get(key: string): Promise<Blob | undefined>
     get(key: string, encoding: Encoding): Promise<string | undefined>
-    put(key: string, blob: string | Uint8Array): Promise<void>
+    put(key: string, blob: string | Uint8Array | AsyncIterable<Uint8Array>): Promise<void>
     list(prefix?: string): Promise<string[]>
     /** @internal */
-    stat(key: string): Promise<{ size: number; contentType?: string }>
+    stat(key: string): Promise<{ size: number; contentType?: string } | undefined>
+
+    // Ideally we'd return true/false here depending on whether
+    // or not the key existed prior to deletion. But not every
+    // API makes this easy (like AWS S3)
     delete(key: string): Promise<void>
 
     //# resource = true

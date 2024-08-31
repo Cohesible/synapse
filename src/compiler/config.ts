@@ -3,12 +3,12 @@ import * as path from 'node:path'
 import { Fs, JsonFs } from '../system'
 import { CompilerOptions } from './host'
 import { glob } from '../utils/glob'
-import { getLogger, runTask } from '..'
+import { getLogger, runTask } from '../logging'
 import { getBuildTargetOrThrow, getFs, getSelfPathOrThrow, isSelfSea } from '../execution'
 import { PackageJson, getPreviousPkg } from '../pm/packageJson'
 import { getProgramFs } from '../artifacts'
 import { getWorkingDir } from '../workspaces'
-import { getHash, makeRelative, memoize, resolveRelative, throwIfNotFileNotFoundError } from '../utils'
+import { getHash, isWindows, makeRelative, memoize, resolveRelative, throwIfNotFileNotFoundError } from '../utils'
 import { readKeySync } from '../cli/config'
 
 interface ParsedConfig {
@@ -158,8 +158,7 @@ async function getTsConfig(
         : parse()
 
     // TODO: fail early if a file is outside of the root directory
-    const exclude = cmd.raw?.exclude ?? ['node_modules']
-    const files = await runTask('glob', 'tsc-files', () => glob(fs, workingDirectory, cmd.raw?.include ?? ['*'], exclude), 1)
+    const files = await runTask('glob', 'tsc-files', () => globTsFiles(fs, workingDirectory, cmd), 1)
     if (isCached) {
         cmd.fileNames = files
     }
@@ -174,6 +173,19 @@ async function getTsConfig(
         exclude: cmd.raw?.exclude,
         previousOptions: previousConfig?.options,
     }
+}
+
+async function globTsFiles(fs: Fs, workingDir: string, cmd: ParsedConfig['cmd']) {
+    const exclude = cmd.raw?.exclude ?? ['node_modules']
+    const include = cmd.raw?.include ?? ['*']
+    const files = await glob(fs, workingDir, include, exclude)
+    const filtered = files.filter(f => !!f.match(/\.tsx?$/))
+
+    if (isWindows()) {
+        return filtered.map(f => f.replaceAll('\\', '/'))
+    }
+
+    return filtered
 }
 
 function replaceFileExtension(opt: ts.CompilerOptions, fileName: string) {
@@ -430,7 +442,7 @@ export async function resolveProgramConfig(opt?: CompilerOptions, targetFiles?: 
         deployTarget: resolvedPkg?.pkg.synapse?.config?.target,
     }
 
-    const cscOpt: CompilerOptions = {
+    const synapseOpt: CompilerOptions = {
         includeJs: true,
         generateExports: true,
         excludeProviderTypes: true,
@@ -438,7 +450,7 @@ export async function resolveProgramConfig(opt?: CompilerOptions, targetFiles?: 
         ...mergeConfigs(pkgConfig, opt), 
     }
 
-    if (cscOpt.stripInternal) {
+    if (synapseOpt.stripInternal) {
         parsed.cmd.options.stripInternal = true
     }
 
@@ -456,8 +468,8 @@ export async function resolveProgramConfig(opt?: CompilerOptions, targetFiles?: 
         }    
     }
     
-    parsed.cmd.options.types ??= cscOpt.excludeProviderTypes ? await getTypeDirs() : undefined
-    parsed.cmd.options.declaration ??= !!cscOpt.sharedLib ? true : undefined
+    parsed.cmd.options.types ??= synapseOpt.excludeProviderTypes ? await getTypeDirs() : undefined
+    parsed.cmd.options.declaration ??= !!synapseOpt.sharedLib ? true : undefined
 
     // By default, we'll only include the bare minimum libs to speed-up program init time
     // Normally `tsc` would include `lib.dom.d.ts` but that file is pretty big
@@ -473,7 +485,7 @@ export async function resolveProgramConfig(opt?: CompilerOptions, targetFiles?: 
 
     const config: ResolvedProgramConfig = {
         tsc: parsed,
-        csc: cscOpt,
+        csc: synapseOpt,
         pkg: resolvedPkg.pkg,
         compiledEntrypoints: resolvedPkg.compiledEntrypoints,
     }

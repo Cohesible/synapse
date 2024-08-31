@@ -1,7 +1,7 @@
 import * as path from 'node:path'
 import { Fs } from '../system'
 import { keyedMemoize } from '../utils'
-import { getLogger } from '..'
+import { getLogger } from '../logging'
 
 interface Wildcard {
     readonly type: 'wildcard'

@@ -163,11 +163,12 @@ if (Symbol.asyncDispose) {
 const permissions = Symbol.for('synapse.permissions')
 const browserImpl = Symbol.for('synapse.browserImpl')
 const objectId = Symbol.for('synapse.objectId')
+const indirectRefs = Symbol.for('synapse.indirectRefs')
 export const stubWhenBundled = Symbol.for('synapse.stubWhenBundled')
 
 const unproxy = Symbol.for('unproxy')
 const symbolId = Symbol.for('symbolId') // Used to track references when capturing
-const serializeableSymbols = new Set([permissions, browserImpl, objectId, stubWhenBundled, ...knownSymbols])
+const serializeableSymbols = new Set([permissions, browserImpl, objectId, stubWhenBundled, indirectRefs, ...knownSymbols])
 const reflectionType = Symbol.for('reflectionType')
 
 function getSymbols(o: any) {
@@ -380,6 +381,10 @@ export function createSerializer(
             }
 
             if (!isMoveable) {
+                // This is an itsy bitsy hack to force multiple references to an array to be shared
+                if (Array.isArray(obj.val)) {
+                    return renderLiteral({ [`@@${moveable.description!}`]: { id: idOverride ?? id } })
+                }
                 return `local.${name}`
             }
 
@@ -401,12 +406,12 @@ export function createSerializer(
 
     class DataClass {
         static [terraformClassKey] = 'local'
-        constructor(obj: any, data: { encoded: any, isMoveable: boolean, deps: string[], idOverride?: string }) {
-            if (!objectTable.get(obj)) {
+        constructor(public readonly val: any, data: { encoded: any, isMoveable: boolean, deps: string[], idOverride?: string }) {
+            if (!objectTable.get(val)) {
                 throw new Error(`Object was never registered: ${data}`)
             }
 
-            const { id, name, ctx } = objectTable.get(obj)!
+            const { id, name, ctx } = objectTable.get(val)!
 
             if (serialized.has(id)) {
                 throw new Error(`Object was created more than once`)
@@ -1067,16 +1072,6 @@ export function createProxy<T = unknown>(
         return inner
     }
 
-    // Remove this entity from the test context if referenced outside of the context
-    function checkContext() {
-        if (state?.testContext) {
-            const refCtx = getTestContext()
-            if (!refCtx) {
-                delete state['testContext']
-            }
-        }
-    }
-
     const target = original ? original : createTfExpression()
 
     return new Proxy(target, {
@@ -1098,8 +1093,6 @@ export function createProxy<T = unknown>(
             }
 
             if (prop === 'toString') {
-                checkContext()
-
                 return () => `\${${render(expression, serializer)}}`
             }
 
@@ -1337,6 +1330,7 @@ interface Extensions {
     secrets?: Record<string, string> // TODO: make secrets into a proper data source
     sourceMap?: TerraformSourceMap
     moveCommands?: { scope: string; name: string }[]
+    synapseVersion?: string
 }
 
 function initTfJson(): TfJson {
@@ -1680,25 +1674,57 @@ function updateResourceConfigurationWorker(obj: any, fn: (obj: any) => void, vis
     }
 }
 
-export function getAllResources(obj: any, keepExpressions = false, visited = new Set<any>()): any[] {
+export function getAllResources(obj: any, keepExpressions = false, exclude?: Set<any>, visited = new Set<any>()): any[] {
     if ((typeof obj !== 'function' && typeof obj !== 'object') || !obj || visited.has(obj)) {
         return []
     }
 
     visited.add(obj)
     if (Array.isArray(obj)) {
-        return obj.map(x => getAllResources(x, keepExpressions, visited)).reduce((a, b) => a.concat(b), [])
+        return obj.map(x => getAllResources(x, keepExpressions, exclude, visited)).reduce((a, b) => a.concat(b), [])
     }
 
     if (internalState in obj && typeof (obj as any)[internalState] === 'object') {
-        if (!keepExpressions && !(obj as any)[originalSym]) {
+        if ((!keepExpressions && !(obj as any)[originalSym]) || exclude?.has(obj)) {
             return []
         }
 
         return [obj]
     }
 
-    return getAllResources(Array.from(Object.values(obj)), keepExpressions, visited)
+    return getAllResources(Array.from(Object.values(obj)), keepExpressions, exclude, visited)
+}
+
+function getExcludeSet(exclude: Iterable<any>) {
+    const resources = [...exclude].flatMap(r => getAllResources(r, true))
+
+    return new Set(resources)
+}
+
+export function addIndirectRefs<T extends Record<PropertyKey, any> | Function>(dst: T, src: any, exclude?: Iterable<any>) {
+    const arr = (dst as any)[indirectRefs] ??= []
+
+    if (typeof src === 'function' && src[moveable]) {
+        arr.push(src)
+        return dst
+    }
+
+    const excludeSet = exclude ? getExcludeSet(exclude) : undefined
+    const resources = getAllResources(src, true, excludeSet)
+    for (const r of resources) {
+        const exp = r[expressionSym] as Expression
+        switch (exp.kind) {
+            case ExpressionKind.Reference:
+            case ExpressionKind.ElementAccess:
+            case ExpressionKind.PropertyAccess:
+                const ref = render(exp)
+                if (!arr.includes(ref)) {
+                    arr.push(ref)
+                }
+        }
+    }
+
+    return dst
 }
 
 const moveCommands: { scope: string; name: string }[] = []
@@ -1938,7 +1964,8 @@ export interface State {
     secrets: Map<string, string>
 }
 
-const terraformClassKey = Symbol('terraformClassKey')
+// Currently placed in the registry for `permissions.ts`
+const terraformClassKey = Symbol.for('synapse.terraformClassKey')
 export function isProviderClass(o: any) {
     if (typeof o !== 'function') {
         return false

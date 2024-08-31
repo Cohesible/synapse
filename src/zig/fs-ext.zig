@@ -3,34 +3,30 @@ const builtin = @import("builtin");
 const js = @import("./lib/js.zig");
 const fs = std.fs;
 
-const FsPromise = js.Promise(void, anyerror);
-
 const NodeErrors = error{EEXIST, ENOENT, EINVAL};
 
-pub fn cloneDir(src: js.UTF8String, srcName: js.UTF8String, dst: js.UTF8String, dstName: js.UTF8String) FsPromise {
-    _cloneDir(src.data, srcName.data, dst.data, dstName.data) catch |e| {
-        return FsPromise.reject(e);
-    };
+pub fn cloneDir(src: js.UTF8String, srcName: js.UTF8String, dst: js.UTF8String, dstName: js.UTF8String) !js.Promise(void) {
+    try _cloneDir(src.data, srcName.data, dst.data, dstName.data);
 
-    return FsPromise.resolve({});
+    return .{};
 }
 
-pub fn copyDir(src: js.UTF8String, dst: js.UTF8String) FsPromise {
-    var srcDir = fs.openDirAbsoluteZ(src.data, .{ .iterate = true }) catch |e| return FsPromise.reject(e);
+pub fn copyDir(src: js.UTF8String, dst: js.UTF8String) !js.Promise(void) {
+    var srcDir = try fs.openDirAbsoluteZ(src.data, .{ .iterate = true });
     defer srcDir.close();
 
-    var dstDir = ensureDirAbs(dst.data) catch |e| return FsPromise.reject(e);
+    var dstDir = try ensureDirAbs(dst.data);
     defer dstDir.close();
 
-    _copyDir(srcDir, dstDir) catch |e| return FsPromise.reject(e);
+    try _copyDir(srcDir, dstDir);
 
-    return FsPromise.resolve({});
+    return .{};
 }
 
-pub fn symLinkBin(src: js.UTF8String, dst: js.UTF8String) FsPromise {
-    _symLinkBin(src.data, dst.data) catch |e| return FsPromise.reject(e);
+pub fn symLinkBin(src: js.UTF8String, dst: js.UTF8String) !js.Promise(void) {
+    try _symLinkBin(src.data, dst.data);
 
-    return FsPromise.resolve({});
+    return .{};
 }
 
 fn _symLinkBin(src: [:0]const u8, dst: [:0]const u8) !void {
@@ -47,10 +43,10 @@ fn _symLinkBin(src: [:0]const u8, dst: [:0]const u8) !void {
     };
 }
 
-pub fn removeDir(parent: js.UTF8String, name: js.UTF8String) FsPromise {
-    _removeDir(parent.data, name.data) catch |e| return FsPromise.reject(e);
+pub fn removeDir(parent: js.UTF8String, name: js.UTF8String) !js.Promise(void) {
+    try _removeDir(parent.data, name.data);
 
-    return FsPromise.resolve({});
+    return .{};
 }
 
 fn ensureDirAbs(path: [:0]const u8) !fs.Dir {

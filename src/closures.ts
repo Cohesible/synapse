@@ -1,6 +1,6 @@
 import ts from 'typescript'
 import * as path from 'node:path'
-import { Optimizer, createPointerMapper, createSerializerHost, createTranspiler, getNpmDeps, renderFile } from './bundler'
+import { Optimizer, createPointerMapper, createSerializerHost, createTranspiler, getModuleDeps, getNpmDeps, renderFile } from './bundler'
 
 import type { ExternalValue } from './runtime/modules/serdes'
 import { getLogger } from './logging'
@@ -151,6 +151,26 @@ function createDataTable(captured: any) {
     }
 }
 
+function stripIndirectRefs(obj: ReturnType<typeof createDataTable>) {
+    const table: Record<string | number, ExternalValue> = {}
+    for (const [k, v] of Object.entries(obj.table)) {
+        if (!v.symbols?.['synapse.indirectRefs']) {
+            table[k] = v
+            continue
+        }
+
+        table[k] = {
+            ...v,
+            symbols: {
+                ...v.symbols,
+                'synapse.indirectRefs': undefined,
+            }
+        }
+    }
+
+    return table
+}
+
 export function normalizeSymbolIds(obj: ReturnType<typeof createDataTable>) {
     if (!isDeduped(obj)) {
         return obj
@@ -250,12 +270,22 @@ export async function getImportMap(ctx: Pick<DeploymentContext, 'packageManifest
     }
 }
 
-async function getPackageDependencies(ctx: DeploymentContext, table: Record<string | number, ExternalValue>) {
+function getPackageDependencies(ctx: DeploymentContext, table: Record<string | number, ExternalValue>) {
     const manifest = ctx.packageManifest
     const npmDeps = getNpmDeps(table, manifest)
     if (Object.keys(npmDeps.roots).length > 0) {
         return npmDeps
     }
+}
+
+function getAmbientDependencies(ctx: DeploymentContext, table: Record<string | number, ExternalValue>) {
+    const result = new Set<string>()
+    for (const k of getModuleDeps(table)) {
+        if (!ctx.packageManifest.roots[k]) {
+            result.add(k)
+        }
+    }
+    return result.size > 0 ? Array.from(result) : undefined
 }
 
 const findRuntimeExecutable = memoize(async () => {
@@ -408,6 +438,9 @@ export async function bundleClosure(
     //
     // For custom resource handlers it should be ok to map the symbols without storing anything
     const data = createDataExport(captured)
+    if (opt?.isModule) {
+        data.table = stripIndirectRefs(data)
+    }
 
     // We have to do this before we render because rendering currently mutates to serialize
     const artifacts = Object.values(data.table)
@@ -422,10 +455,12 @@ export async function bundleClosure(
         })
 
     const dependencies = Array.from(new Set(artifacts))
-    const packageDependencies = !bundled ? await getPackageDependencies(ctx, data.table) : undefined
+    const packageDependencies = !bundled ? getPackageDependencies(ctx, data.table) : undefined
     if (packageDependencies) {
         getLogger().debug(`Found package dependencies for target "${target}"`, Object.values(packageDependencies.packages).map(p => `${p.name}@${p.version}`))
     }
+
+    const ambientDependencies = getAmbientDependencies(ctx, data.table)
 
     if (opt?.isModule) {
         if (!opt.publishName) {
@@ -433,14 +468,13 @@ export async function bundleClosure(
         }
 
         const data3 = extractPointers(normalizeSymbolIds(data))
-        // const data2 = serializePointers(data)
         const datafile = {
             kind: 'deployed' as const,
             table: data3[0].table,
             captured: data3[0].captured,
         }
 
-        const p = await buildFs.writeData2(datafile, { source: target, dependencies, packageDependencies, pointers: data3[1] })
+        const p = await buildFs.writeData2(datafile, { source: target, dependencies, packageDependencies, pointers: data3[1], ambientDependencies })
         const text = `module.exports = require('${p}');`
 
         return {
@@ -452,7 +486,7 @@ export async function bundleClosure(
     // TODO: implement hash tree for integrity checks against the 'data' files 
 
     async function saveArtifact(data: Uint8Array, name: string, source: string, pointers?: any) {
-        const p = await buildFs.writeData(data, { name, source, dependencies, packageDependencies, pointers })
+        const p = await buildFs.writeData(data, { name, source, dependencies, packageDependencies, pointers, ambientDependencies })
         if (opt?.publishName) {
             if (!isArtifact) {
                 return buildFs.writeFile(opt.publishName, data)
@@ -480,7 +514,7 @@ export async function bundleClosure(
         if (!opt?.publishName) {
             return {
                 extname,
-                location: await buildFs.writeData2(datafile, { source: target, dependencies, packageDependencies, pointers: data3[1] })
+                location: await buildFs.writeData2(datafile, { source: target, dependencies, packageDependencies, pointers: data3[1], ambientDependencies })
             }
         }
 

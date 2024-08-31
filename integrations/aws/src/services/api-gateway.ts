@@ -1,4 +1,5 @@
 import * as core from 'synapse:core'
+import { addIndirectRefs } from 'synapse:terraform'
 import * as aws from 'synapse-provider:aws'
 import * as smithyHttp from '@smithy/protocol-http'
 import { URL } from 'node:url'
@@ -6,12 +7,10 @@ import { LambdaFunction } from './lambda'
 import { signRequest } from '../sigv4'
 import { NodeHttpHandler } from '@smithy/node-http-handler'
 import { HostedZone } from './route53'
-import { HttpHandler, Middleware, RouteRegexp, buildRouteRegexp, matchRoutes, HttpResponse, HttpError, HttpRoute, PathArgs, createPathBindings, applyRoute, compareRoutes, HttpRequest, RequestHandler, RequestHandlerWithBody, PathArgsWithBody } from 'synapse:http'
+import { Middleware, RouteRegexp, buildRouteRegexp, matchRoutes, HttpResponse, HttpError, HttpRoute, PathArgs, createPathBindings, applyRoute, compareRoutes, HttpRequest, RequestHandler, RequestHandlerWithBody, PathArgsWithBody } from 'synapse:http'
 import { createSerializedPolicy } from './iam'
 import { generateIdentifier } from 'synapse:lib'
-import * as net from 'synapse:srl/net'
 import * as compute from 'synapse:srl/compute'
-import * as storage from 'synapse:srl/storage'
 import { Provider } from '..'
 import { addResourceStatement, getPermissionsLater } from '../permissions'
 
@@ -52,6 +51,8 @@ export class Gateway {
             name: stageName, 
         })
 
+        const mergeHandlers = this.props?.mergeHandlers ?? true
+
         if (domain !== undefined) {
             this.invokeUrl = `https://${addDomain(stage, domain)}`
             this.hostname = domain.name
@@ -66,7 +67,6 @@ export class Gateway {
         this.id = apig.arn // TODO: use this form arn:aws:execute-api:${region}:${account}:${api-id}/${stage}/*
         this.region = region.name
 
-        const mergeHandlers = this.props?.mergeHandlers ?? true
         if (mergeHandlers) {
             const router = createRequestRouter()
             this.requestRouter = {
@@ -75,6 +75,31 @@ export class Gateway {
             }
 
             core.move('this.route')
+
+            // if (!domain && typeof this.props?.auth !== 'function') {
+            //     const healthCheck = this._addRoute('HEAD', '/__checkEndpoint__', () => {})
+            //     // `{ callOperation: this.callOperation.bind(this) }` fails to serialize
+            //     // TODO: add way to serialize methods, particularly bound methods
+            //     const actualInvokeUrl = this.invokeUrl
+            //     const region = this.region
+            //     const client = this.client
+            //     const sign = this.props?.auth === 'native'
+            //     this.invokeUrl = checkEndpoint(healthCheck, {
+            //         invokeUrl: actualInvokeUrl,
+            //         callOperation: (route, ...args) => {
+            //             const { request, body } = applyRoute(route, args)
+            //             const url = new URL(`https://${request.host}${request.path}`)
+
+            //             return sendRequest(client, {
+            //                 url,
+            //                 body,
+            //                 sign,
+            //                 region,
+            //                 method: request.method,
+            //             }) as any
+            //         },
+            //     })
+            // }
         }
     }
 
@@ -98,8 +123,7 @@ export class Gateway {
         }
 
         const pathBindings = createPathBindings(path)
-
-        return {
+        const routeBinding: HttpRoute = {
             host: this.hostname,
             method,
             path: `${this.defaultPath ?? ''}${path}`,
@@ -111,6 +135,10 @@ export class Gateway {
                 response: [] 
             },
         }
+
+        addIndirectRefs(routeBinding, wrapped)
+
+        return routeBinding
     }
 
     public route<P extends string = string, U = unknown, R = unknown>(
@@ -157,7 +185,7 @@ export class Gateway {
         const { request, body } = applyRoute(route, args)
 
         const resp = await this.request(
-            `https://${this.hostname}${request.path}`, 
+            `https://${request.host}${request.path}`, 
             request.method ?? 'GET', 
             body
         )
@@ -195,61 +223,14 @@ export class Gateway {
 
     private async request(path: string, method: string, body?: string | Uint8Array, headers?: HttpRequest['headers']) {
         const url = new URL(path, this.invokeUrl)
-        const query = url.searchParams.size === 0 ? undefined : (function () {
-            const params: Record<string, string | string[]> = {}
-            for (const key of url.searchParams.keys()) {
-                const values = url.searchParams.getAll(key)
-                params[key] = values.length === 1 ? values[0] : values
-            }
-            return params
-        })()
 
-        const builtRequest = new smithyHttp.HttpRequest({
-            body,
-            query,
+        return sendRequest(this.client, {
+            url,
             method,
-            path: url.pathname,
-            protocol: url.protocol,
-            hostname: url.hostname,
-            port: url.port ? Number(url.port) : undefined,
-            headers: {
-                'host': url.host,
-                'content-type': 'application/json',
-            }
-        })
-
-        const ctx = { region: this.region, service: 'execute-api' }
-        const signed = this.props?.auth === 'native' 
-            ? await signRequest(ctx, builtRequest)
-            : builtRequest
-
-        signed.headers = headers ? {
-            ...Object.fromEntries(headers.entries()),
-            ...signed.headers,
-        } : signed.headers
-
-        const { response } = await this.client.handle(signed as any)
-
-        return new Promise<{ body: string; headers: HttpResponse['headers']; statusCode: number }>((resolve, reject) => {
-            const buffer: any[] = []
-            response.body.on('data', (chunk: any) => buffer.push(chunk))
-            response.body.on('error', reject)
-
-            response.body.on('end', () => {
-                const result = buffer.join('')
-
-                if (response.statusCode >= 400) {
-                    const e = JSON.parse(result)
-
-                    reject(Object.assign(new Error(e.message ?? ''), e))
-                } else {
-                    resolve({
-                        body: result,
-                        headers: response.headers,
-                        statusCode: response.statusCode,
-                    })
-                }
-            })
+            body,
+            headers,
+            region: this.region,
+            sign: this.props?.auth === 'native',
         })
     }
 }
@@ -325,10 +306,12 @@ async function runHandler<T>(fn: () => Promise<T> | T): Promise<T | HttpResponse
             return { statusCode: 204 }
         }
 
-        if (resp instanceof TypedArray) {
+        if (resp instanceof TypedArray || resp instanceof Blob) {
+            const data = resp instanceof Blob ? await resp.arrayBuffer() : resp as any
+
             return {
                 statusCode: 200,
-                body: Buffer.from(resp as any).toString('base64'),
+                body: Buffer.from(data).toString('base64'),
                 isBase64Encoded: true,
                 headers: {
                     'content-type': 'application/octet-stream',
@@ -379,6 +362,7 @@ function wrapRequestHandler(
         const decoded = (request.body !== undefined && request.isBase64Encoded) 
             ? Buffer.from(request.body, 'base64').toString('utf-8') 
             : request.body
+
         const body = (decoded && isJsonRequest(request.headers)) ? JSON.parse(decoded) : decoded
         const stage = request.requestContext.stage
         const trimmedPath = request.rawPath.replace(`/${stage}`, '')
@@ -399,14 +383,15 @@ function wrapRequestHandler(
         ;(newReq as any).context = request.requestContext
         ;(newReq as any).pathParameters = request.pathParameters
 
+        const bodyWithFallback = isJsonRequest(request.headers) ? body : newReq.body
         if (authHandler) {
-            const resp = await authHandler(newReq as any, body)
+            const resp = await authHandler(newReq as any, bodyWithFallback)
             if (resp !== undefined) {
                 return resp
             }
         }
 
-        return handler(newReq as any, body)
+        return handler(newReq as any, bodyWithFallback)
     }
 
     return handleRequest
@@ -695,6 +680,73 @@ export class WebsocketGateway {
     }
 }
 
+interface NodeHttpRequest {
+    url: URL
+    method: string
+    body?: any
+    sign?: boolean
+    region?: string
+    headers?: Headers
+}
+
+async function sendRequest(client: NodeHttpHandler, req: NodeHttpRequest) {
+    const query = req.url.searchParams.size === 0 ? undefined : (function () {
+        const params: Record<string, string | string[]> = {}
+        for (const key of req.url.searchParams.keys()) {
+            const values = req.url.searchParams.getAll(key)
+            params[key] = values.length === 1 ? values[0] : values
+        }
+        return params
+    })()
+
+    const builtRequest = new smithyHttp.HttpRequest({
+        body: req.body,
+        query,
+        method: req.method,
+        path: req.url.pathname,
+        protocol: req.url.protocol,
+        hostname: req.url.hostname,
+        port: req.url.port ? Number(req.url.port) : undefined,
+        headers: {
+            'host': req.url.host,
+            'content-type': 'application/json',
+        }
+    })
+
+    const ctx = { region: req.region, service: 'execute-api' }
+    const signed = req.sign 
+        ? await signRequest(ctx, builtRequest)
+        : builtRequest
+
+    signed.headers = req.headers ? {
+        ...Object.fromEntries(req.headers),
+        ...signed.headers,
+    } : signed.headers
+
+    const { response } = await client.handle(signed as any)
+
+    return new Promise<{ body: string; headers: HttpResponse['headers']; statusCode: number }>((resolve, reject) => {
+        const buffer: any[] = []
+        response.body.on('data', (chunk: any) => buffer.push(chunk))
+        response.body.on('error', reject)
+
+        response.body.on('end', () => {
+            const result = buffer.join('')
+
+            if (response.statusCode >= 400) {
+                const e = JSON.parse(result)
+
+                reject(Object.assign(new Error(e.message ?? ''), e))
+            } else {
+                resolve({
+                    body: result,
+                    headers: response.headers,
+                    statusCode: response.statusCode,
+                })
+            }
+        })
+    })
+}
 
 // auth sigv4
 // GET - get status
@@ -716,44 +768,11 @@ async function sendCommand(client: NodeHttpHandler, req: CommandRequest) {
 
     const pathname = `${req.stage ? `${req.stage}/` : ''}@connections/${req.connectionId}`
     const url = new URL(`https://${req.apiId}.execute-api.${req.region}.amazonaws.com/${pathname}`)
-    const builtRequest = new smithyHttp.HttpRequest({
+
+    return sendRequest(client, {
+        url,
         body,
-        method: req.method,
-        path: url.pathname,
-        protocol: url.protocol,
-        hostname: url.hostname,
-        port: url.port ? Number(url.port) : undefined,
-        headers: {
-            'host': url.host,
-            'content-type': 'application/json',
-        }
-    })
-
-    const ctx = { region: req.region, service: 'execute-api' }
-    const signed = await signRequest(ctx, builtRequest)
-
-    const { response } = await client.handle(signed as any)
-
-    return new Promise<{ body: string; headers: HttpResponse['headers']; statusCode: number }>((resolve, reject) => {
-        const buffer: any[] = []
-        response.body.on('data', (chunk: any) => buffer.push(chunk))
-        response.body.on('error', reject)
-
-        response.body.on('end', () => {
-            const result = buffer.join('')
-
-            if (response.statusCode >= 400) {
-                const e = result ? JSON.parse(result) : {}
-
-                reject(Object.assign(new Error(e.message ?? ''), e, { statusCode: response.statusCode }))
-            } else {
-                resolve({
-                    body: result,
-                    headers: response.headers,
-                    statusCode: response.statusCode,
-                })
-            }
-        })
+        ...req,
     })
 }
 
@@ -786,8 +805,8 @@ interface WebsocketListeners {
     readonly disconnect?: (code: number, socket: { id: string }) => Promise<void> | void
 }
 
-export function sendWebsocketMessage(socket: { id: string }, message: any) {
-    return sendCommand(new NodeHttpHandler(), {
+export function sendWebsocketMessage(socket: { id: string }, message: any, client = new NodeHttpHandler()) {
+    return sendCommand(client, {
         ...(socket as any),
         method: 'POST',
         connectionId: socket.id,
@@ -843,4 +862,66 @@ function websocketRouter(
         addListener,
         handleRequest,
     }
+}
+
+interface EndpointCheckProps {
+    readonly endpoint: string
+    readonly checkFn: (endpoint: string) => Promise<boolean>
+    readonly interval: number
+    readonly timeoutMs: number
+}
+
+async function waitForEndpoint(props: EndpointCheckProps) {
+    const start = Date.now()
+    const end = start + props.timeoutMs
+    let sleepTime = props.interval
+
+    while (Date.now() < end) {
+        if (await props.checkFn(props.endpoint)) {
+            return { endpoint: props.endpoint }
+        }
+
+        await new Promise<void>(r => setTimeout(r, sleepTime))
+        sleepTime = Math.min(sleepTime * 1.5, 1000)
+    }
+
+    throw new Error(`Timed-out waiting for endpoint: ${props.endpoint}`)
+}
+
+class EndpointCheck extends core.defineResource({
+    create: (props: EndpointCheckProps) => {
+        return waitForEndpoint(props)
+    },
+    update: async (state, props) => {
+        if (props.endpoint === state.endpoint) {
+            return state
+        }
+
+        return waitForEndpoint(props)
+    },
+}) {}
+
+function checkEndpoint(route: HttpRoute<[]>, service: Pick<compute.HttpService, 'invokeUrl' | 'callOperation'>) {
+    async function checkFn(endpoint: string) {
+        try {
+            await service.callOperation(route)
+
+            return true
+        } catch (e) {
+            if ((e as any).statusCode !== 404) {
+                throw e
+            }
+
+            return false
+        }
+    }
+
+    const check = new EndpointCheck({
+        endpoint: service.invokeUrl,
+        checkFn,
+        interval: 50,
+        timeoutMs: 15000,
+    })
+
+    return check.endpoint
 }

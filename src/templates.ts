@@ -3,7 +3,7 @@ import { TfJson } from './runtime/modules/terraform'
 import * as utils from './utils'
 import { getLogger } from './logging'
 import { getDeploymentBuildDirectory, getRootDir } from './workspaces'
-import { getFsFromHash, getDeploymentFs, getProgramFs, getTemplate } from './artifacts'
+import { getFsFromHash, getDeploymentFs, getProgramFs, getTemplate, readState } from './artifacts'
 import { getBuildTargetOrThrow, getFs } from './execution'
 import { getSecret } from './services/secrets'
 
@@ -95,6 +95,30 @@ export function createTemplateService(
 ) {
     let templateHash: string | undefined
 
+    async function getMovedIfRollback() {
+        if (!programFsHash) {
+            return
+        }
+
+        const state = await readState()
+        // TODO: this should _technically_ use all templates between the rollback commit and the current commit
+        const template = await getTemplate(getProgramFs())
+        const moved = template?.moved
+        if (!moved || !state) {
+            return
+        }
+
+        const resources = new Set(state.resources.map(r => `${r.type}.${r.name}`))
+        const reversed: { from: string; to: string }[] = []
+        for (const m of moved) {
+            if (resources.has(m.to) && !resources.has(m.from)) {
+                reversed.push({ from: m.to, to: m.from })
+            }
+        }
+
+        return reversed.length > 0 ? reversed : undefined
+    }
+
     async function _getTemplateFilePath() {
         const bt = getBuildTargetOrThrow()
         const dest = path.resolve(getDeploymentBuildDirectory(bt), 'stack.tf.json')
@@ -102,6 +126,12 @@ export function createTemplateService(
         const template = await getTemplate(programFs)
         if (!template) {
             throw new Error(`No template found`)
+        }
+
+        const moved = await getMovedIfRollback()
+        if (moved) {
+            getLogger().debug('Using reversed moved for rollback')
+            Object.assign(template, { moved })
         }
 
         templateHash = getHash(template)

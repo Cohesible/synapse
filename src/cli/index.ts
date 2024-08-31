@@ -2,6 +2,7 @@
 
 import * as synapse from '..'
 import * as path from 'node:path'
+import * as inspector from 'node:inspector'
 import { getLogger } from '../logging'
 import { LogLevel, logToFile, logToStderr, purgeOldLogs, validateLogLevel } from './logger'
 import { CancelError, getCurrentVersion, runWithContext, setContext, setCurrentVersion } from '../execution'
@@ -10,7 +11,7 @@ import { showUsage, executeCommand, runWithAnalytics, removeInternalCommands } f
 import { getCiType } from '../utils'
 import { resolveProgramBuildTarget } from '../workspaces'
 import { devLoader } from '../runtime/nodeLoader'
-import { readFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 
 async function _main(argv: string[]) {
     if (argv.length === 0) {
@@ -145,7 +146,10 @@ export function main(...args: string[]) {
     if (isSea && arg0 && arg0.startsWith('sea-asset:')) {
         process.argv.splice(isSea ? 1 : 2, 1)
 
-        return runWithContext({ selfPath, selfBuildType }, () => synapse.runUserScript(arg0))
+        return runWithContext(
+            { selfPath, selfBuildType }, 
+            () => synapse.runUserScript(arg0, process.argv.slice(2))
+        )
     }
 
     // `pointer:<sha256 hash hex>` has a length of 72
@@ -154,7 +158,10 @@ export function main(...args: string[]) {
         process.argv.splice(isSea ? 1 : 2, 1)
 
         return resolveProgramBuildTarget(process.cwd()).then(buildTarget => {
-            return runWithContext({ selfPath, selfBuildType, buildTarget }, () => synapse.runUserScript(arg0))
+            return runWithContext(
+                { selfPath, selfBuildType, buildTarget }, 
+                () => synapse.runUserScript(arg0, process.argv.slice(2))
+            )
         })
     }
 
@@ -166,12 +173,12 @@ export function main(...args: string[]) {
         const resolved = fs.realpathSync(path.resolve(arg0))
         setContext({ selfPath, selfBuildType })
 
-        return synapse.runUserScript(resolved)
+        return synapse.runUserScript(resolved, process.argv.slice(2))
     }
 
     Error.stackTraceLimit = 100
-    process.on('uncaughtException', e => getLogger().error(e))
-    process.on('unhandledRejection', e => getLogger().error(e))
+    process.on('uncaughtException', e => getLogger().error('Uncaught exception', e))
+    process.on('unhandledRejection', e => getLogger().error('Unhandled rejection', e))
 
     // if (args.includes('--inspect')) {
     //     const inspector = require('node:inspector') as typeof import('node:inspector')
@@ -183,7 +190,7 @@ export function main(...args: string[]) {
         let loops = 0
 
         function loop() {
-            const activeResources = (process as any).getActiveResourcesInfo().filter((x: string) => x !== 'TTYWrap')
+            const activeResources = process.getActiveResourcesInfo().filter(x => x !== 'TTYWrap' && x !== 'Timeout')
             if (activeResources.length === 0) {
                 process.exit(exitCode)
             } else {
@@ -192,6 +199,46 @@ export function main(...args: string[]) {
         }
 
         loop()
+    }
+
+    async function createProfiler(): Promise<AsyncDisposable> {
+        const session = new inspector.Session()
+        session.connect()
+
+        await new Promise<void>((resolve, reject) => {
+            session.post('Profiler.enable', err => err ? reject(err) : resolve())
+        })
+
+        await new Promise<void>((resolve, reject) => {
+            session.post('Profiler.setSamplingInterval', { interval: 100 }, err => err ? reject(err) : resolve())
+        })
+
+        await new Promise<void>((resolve, reject) => {
+            session.post('Profiler.start', err => err ? reject(err) : resolve())
+        })
+
+        function dispose() {
+            return new Promise<void>((resolve, reject) => {
+                session.post('Profiler.stop', (err, res) => {
+                    if (!err) {
+                        writeFileSync('./profile.cpuprofile', JSON.stringify(res.profile))
+                        resolve()
+                    } else {
+                        reject(err)
+                    }
+                })
+            })
+        }
+
+        return { [Symbol.asyncDispose]: dispose }
+    }
+
+    function getProfiler() {
+        if (!process.env['CPU_PROF']) {
+            return
+        }
+
+        return createProfiler()
     }
 
     async function runWithLogger() {
@@ -220,6 +267,7 @@ export function main(...args: string[]) {
         }
 
         try {
+            await using profiler = await getProfiler()
             await _main(args)
         } catch (e) {
             if (e instanceof CancelError) {
@@ -249,16 +297,17 @@ export function main(...args: string[]) {
                     process.stderr.write(`Active resources: ${(process as any).getActiveResourcesInfo()}\n`, () => {
                         process.exit(didThrow ? 1 : undefined)
                     })
+                } else {
+                    process.exit(didThrow ? 1 : undefined)
                 }
             }, 5000).unref()
 
             if (process.stdout.isTTY) {
                 tryGracefulExit(didThrow ? 1 : undefined)
             } else {
-                // These unrefs are maybe not needed anymore
-                process.stdin.unref()
+                process.stdin.unref?.()
                 process.stdout.unref?.()
-                process.stderr.unref()
+                process.stderr.unref?.()    
                 process.exitCode = process.exitCode || (didThrow ? 1 : 0)
             }
         }

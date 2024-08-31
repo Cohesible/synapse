@@ -5,7 +5,7 @@ import { getGlobalCacheDirectory } from '../workspaces'
 import { createMemento } from '../utils/memento'
 import { getFs } from '../execution'
 import { createRequester } from '../utils/http'
-import { getLogger } from '..'
+import { getLogger } from '../logging'
 import { NpmConfig, resolveNpmConfigs } from './compat'
 
 type NpmKeyId = `SHA256:${string}`

@@ -1,9 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const isWasm = builtin.target.isWasm();
-const Allocator = if (isWasm) std.heap.WasmPageAllocator else std.heap.GeneralPurposeAllocator(.{});
 
-pub const allocator = if (isWasm) toAllocator(&Allocator{}) else (Allocator{}).allocator();
+pub const allocator = if (isWasm) toAllocator(&std.heap.WasmPageAllocator{}) else std.heap.c_allocator;
 
 pub fn strlen(source: [*:0]const u8) usize {
     var i: usize = 0;

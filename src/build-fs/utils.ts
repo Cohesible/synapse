@@ -45,7 +45,6 @@ export function getObjectByPrefix(prefix: string, repo = getDataRepository()) {
     return getArtifactByPrefix(repo, prefix.replace(/\//g, ''))
 }
 
-
 export async function getMetadata(repo: DataRepository, target: string) {
     const [source, hash] = target.split(':')
 

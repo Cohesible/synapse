@@ -188,6 +188,7 @@ export interface CompileEvent extends BaseOutputMessage {
 export interface SynthLogEvent extends BaseOutputMessage {
     readonly type: 'synth-log'
     readonly level: 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'raw'
+    readonly source?: 'symEval'
     readonly args: any[]
 }
 
@@ -219,7 +220,16 @@ export interface FailedTestEvent extends BaseTestEvent {
     readonly reason: Error
 }
 
-export type TestEvent = PendingTestEvent | RunningTestEvent | PassedTestEvent | FailedTestEvent
+export interface CachedTestEvent extends BaseTestEvent {
+    readonly status: 'cached'
+}
+
+export type TestEvent = 
+    | PendingTestEvent 
+    | RunningTestEvent 
+    | PassedTestEvent
+    | FailedTestEvent
+    | CachedTestEvent
 
 export interface TestLogEvent extends BaseOutputMessage {
     readonly type: 'test-log'

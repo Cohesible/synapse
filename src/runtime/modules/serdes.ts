@@ -288,6 +288,14 @@ export function resolveValue(
     const lateBindings = new Map<number | string, { key: string; value: string | number | { [moveableStr]: { id: number | string } } }>()
 
     function resolve(o: any): any {
+        if (typeof o !== 'object' || o === null) {
+            return o
+        }
+
+        if (objectCache.has(o)) {
+            return objectCache.get(o)!
+        }
+
         if (Array.isArray(o)) {
             let isPromise = false
             const a = o.map(x => {
@@ -297,19 +305,14 @@ export function resolveValue(
                 return e
             })
 
-            return isPromise ? Promise.all(a) : a
-        }
+            const p = isPromise ? Promise.all(a) : a
+            objectCache.set(o, p)
 
-        if (o === null || typeof o !== 'object') {
-            return o
+            return p
         }
 
         if (o[pointerSymbol]) {
             return o
-        }
-
-        if (objectCache.has(o)) {
-            return objectCache.get(o)!
         }
 
         const payload = o[moveableStr] as ExternalValue | undefined
@@ -447,23 +450,6 @@ export function resolveValue(
     }
 
     return resolved
-}
-
-let util: typeof import('node:util') | null
-function isModule(obj: unknown) {
-    if (util !== undefined) {
-        if (util === null) {
-            return undefined
-        }
-
-        return util.types.isModuleNamespaceObject(obj)
-    }
-
-    try {
-        return util = require('node:util')
-    } catch {
-        return util = null
-    }
 }
 
 export const objectId = Symbol.for('synapse.objectId')

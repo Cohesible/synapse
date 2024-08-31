@@ -25,7 +25,7 @@ export function createGitHubPackageRepo(): PackageRepository {
         const parsed = github.parseDependencyRef(name)
         const pkg = await _getPackageJson(parsed.owner, parsed.repository) // TODO: commitish
 
-        return [pkg.version ?? '0.0.1']
+        return [pkg.version ?? '0.0.0']
         // const releases = await github.listReleases(parsed.owner, parsed.repository)
 
         // return releases.map(r => r.tag_name.replace(/^v/, '')) // TODO: check semver compliance

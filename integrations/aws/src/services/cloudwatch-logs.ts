@@ -8,6 +8,7 @@ export async function listLogStreams(group: string, limit?: number, region?: str
         logGroupName: group,
         orderBy: 'LastEventTime',
         limit,
+        descending: true,
     })
 
     return resp.logStreams ?? []

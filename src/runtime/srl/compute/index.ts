@@ -141,6 +141,10 @@ export declare class Container {
     static fromDockerfile(network: Network, dockerfile: string): Container
 }
 
+interface AsyncDisposable {
+    [Symbol.asyncDispose](): PromiseLike<void>
+}
+
 /** @internal */
 export interface AcquiredLock extends AsyncDisposable {
     readonly id: string

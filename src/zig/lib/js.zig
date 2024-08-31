@@ -53,12 +53,49 @@ const Object = opaque {
     }
 };
 
+const Class = opaque {
+    extern fn napi_define_class(
+        env: *Env,
+        utf8name: [*]const u8,
+        name_length: usize,
+        constructor: *const NativeFn,
+        data: ?*anyopaque,
+        property_count: usize,
+        descriptors: [*]PropertyDescriptor,
+        result: **Value
+    ) Status;
+};
+
 const Ref = opaque {
     extern fn napi_create_reference(env: *Env, value: *Value, initial_refcount: u32, result: **Ref) Status;
+
+    extern fn napi_add_finalizer(env: *Env, obj: *Object, data: ?*anyopaque, cb: *const FinalizeFn, hint: ?*anyopaque, result: **Ref) Status;
 
     pub fn init(env: *Env, value: *Value, count: u32) !*Ref {
         var result: *Ref = undefined;
         const status = napi_create_reference(env, value, count, &result);
+        if (status != .napi_ok) {
+            return error.NotOk;
+        }
+
+        return result;
+    }
+
+    fn Finalizer(comptime T: type) FinalizeFn {
+        return struct {
+            pub fn cb(env: *Env, data: ?*anyopaque, hint: ?*anyopaque) void {
+                _ = env;
+                _ = hint;
+                var this: *T = @alignCast(@ptrCast(data orelse unreachable));
+                this.deinit();
+            }
+        }.cb;
+    }
+
+    pub fn addFinalizer(env: *Env, obj: *Object, comptime T: type, instance: *T) !*Ref {
+        const finalizer = Finalizer(T);
+        var result: *Ref = undefined;
+        const status = napi_add_finalizer(env, obj, instance, &finalizer, null, &result);
         if (status != .napi_ok) {
             return error.NotOk;
         }
@@ -159,11 +196,23 @@ const Number = opaque {
     //                                                      napi_value* result);
 
     extern fn napi_get_value_uint32(env: *Env, value: *Number, result: *u32) Status;
+    extern fn napi_get_value_int32(env: *Env, value: *Number, result: *i32) Status;
+
     extern fn napi_create_uint32(env: *Env, value: u32, result: **Number) Status;
+    extern fn napi_create_int32(env: *Env, value: i32, result: **Number) Status;
 
     pub fn createU32(env: *Env, val: u32) !*Number {
         var result: *Number = undefined;
         const status = napi_create_uint32(env, val, &result);
+        if (status != .napi_ok) {
+            return error.NotOk;
+        }
+        return result;
+    }
+
+    pub fn createI32(env: *Env, val: i32) !*Number {
+        var result: *Number = undefined;
+        const status = napi_create_int32(env, val, &result);
         if (status != .napi_ok) {
             return error.NotOk;
         }
@@ -177,6 +226,28 @@ const Number = opaque {
             return error.NotOk;
         }
         return val;
+    }
+
+    pub fn toI32(this: *Number, env: *Env) !i32 {
+        var val: i32 = undefined;
+        const status = napi_get_value_int32(env, this, &val);
+        if (status != .napi_ok) {
+            return error.NotOk;
+        }
+        return val;
+    }
+};
+
+const Boolean = opaque {
+    extern fn napi_get_boolean(env: *Env, val: bool, result: **Boolean) Status;
+
+    pub fn getBoolean(env: *Env, val: bool) !*Boolean {
+        var result: *Boolean = undefined;
+        const status = napi_get_boolean(env, val, &result);
+        if (status != .napi_ok) {
+            return error.NotOk;
+        }
+        return result;
     }
 };
 
@@ -256,10 +327,25 @@ const CFunction = opaque {
         any,
     };
 
+    const CSeqType = enum(u32) {
+        scalar,
+        seq,
+        typed_array,
+        array_buffer,
+    };
+
+    const TypeFlag = enum(u32) {
+        none = 0,
+        allow_shared = 1 << 0,      // Must be an ArrayBuffer or TypedArray
+        enforce_range = 1 << 1,     // T must be integral
+        clamp = 1 << 2,             // T must be integral
+        restricted = 1 << 3,        // T must be float or double
+    };
+
     const CTypeDef = extern struct {
         ty: CType,
-        sequence_type: c_uint = 0,
-        flags: c_uint = 0,
+        sequence_type: CSeqType = .scalar,
+        flags: TypeFlag = .none,
     };
 
     const CFunctionDef = extern struct {
@@ -300,7 +386,8 @@ const ArrayPointer = opaque {
 
     const IterateCb = fn (index: u32, element: *Value, data: *anyopaque) IterateResult;
 
-    extern fn napi_iterate(env: *Env, object: *ArrayPointer, cb: *const IterateCb, data: *anyopaque) Status;
+    // cb -> *const IterateCb
+    extern fn napi_iterate(env: *Env, object: *ArrayPointer, cb: *const anyopaque, data: *anyopaque) Status;
 
     pub fn set(this: *ArrayPointer, env: *Env, index: u32, val: *Value) !void {
         const status = napi_set_element(env, this, index, val);
@@ -330,7 +417,7 @@ const ArrayPointer = opaque {
     }
 
     fn copyTo(index: u32, element: *Value, data: *anyopaque) IterateResult {
-        var buf: []*Value = @ptrCast(data);
+        var buf: [*]*Value = @alignCast(@ptrCast(data));
         buf[index] = element;
         return ._continue;
     }
@@ -341,11 +428,13 @@ const ArrayPointer = opaque {
             return &[_]*Value{};
         }
 
-        var buf = try allocator.alloc(*Value, len);
+        const buf = try allocator.alloc(*Value, len);
         for (0..len) |i| {
             buf[i] = try this.get(env, @intCast(i));
         }
-        // const status = napi_iterate(env, this, &ArrayPointer.copyTo, buf);
+
+        // Doesn't work currently
+        // const status = napi_iterate(env, this, &ArrayPointer.copyTo, @ptrCast(buf.ptr));
         // if (status != .napi_ok) {
         //     return error.NotOk;
         // }
@@ -363,7 +452,153 @@ const External = opaque {
     extern fn napi_get_value_external(env: *Env, value: *External, result: **anyopaque) Status;
 };
 
-const ArrayBuffer = opaque {};
+pub const ArrayBuffer = struct {
+    buf: []u8,
+    value: *ArrayBufferRaw = undefined,
+    hasValue: bool = false,
+    isOwned: bool = false,
+
+    pub fn init(len: usize) !ArrayBuffer {
+        const wrap = try EnvWrap.getWrap(currentEnv);
+        const buf = try wrap.allocator.alloc(u8, len);
+
+        return .{ .buf = buf, .isOwned = true };
+    }
+
+    pub fn initJs(len: usize) !ArrayBuffer {
+        return ArrayBufferRaw.initJs(currentEnv, len);
+    }
+
+    pub fn from(buf: []u8) !ArrayBuffer {
+        return .{ .buf = buf, .isOwned = true };
+    }
+
+    pub fn resize(this: *ArrayBuffer, len: usize) !void {
+        if (this.buf.len >= len) {
+            this.buf.len = len;
+        } else {
+            // TODO
+            unreachable;
+        }
+    }
+
+    pub fn toValue(this: *ArrayBuffer) !*Value {
+        if (!this.hasValue) {
+            const val = try ArrayBufferRaw.initExternal(currentEnv, this.buf);
+            this.value = val;
+            this.hasValue = true;
+        }
+
+        return @ptrCast(this.value);
+    }
+};
+
+pub const ArrayBufferRaw = opaque {
+    extern fn napi_is_arraybuffer(env: *Env, value: *Value, result: *bool) Status;
+
+    // `data` is an output
+    extern fn napi_create_arraybuffer(env: *Env, len: usize, data: **anyopaque, result: **ArrayBufferRaw) Status;
+    extern fn napi_create_external_arraybuffer(env: *Env, data: *anyopaque, len: usize, cb: *const anyopaque, hint: ?*anyopaque, result: **ArrayBufferRaw) Status;
+    extern fn napi_create_external_arraybuffer2(env: *Env, data: *anyopaque, len: usize, cb: *const anyopaque, hint: ?*anyopaque, result: **ArrayBufferRaw) Status;
+
+
+    pub fn initJs(env: *Env, len: usize) !ArrayBuffer {
+        var data: *anyopaque = undefined;
+        var value: *ArrayBufferRaw = undefined;
+        const status = napi_create_arraybuffer(env, len, &data, &value);
+        if (status != .napi_ok) {
+            return error.NotOk;
+        }
+
+        var buf: [*]u8 = @ptrCast(data);
+
+        return .{
+            .buf = buf[0..len],
+            .value = value,
+            .hasValue = true,
+        };
+    }
+
+    fn finalize(data: ?*anyopaque, len: usize, _: ?*anyopaque) void {
+        const wrap = EnvWrap.getWrap(currentEnv) catch return;
+        var d: [*]u8 = @ptrCast(data);
+        wrap.allocator.free(d[0..len]);
+    }
+
+
+    fn finalize_old(env: *Env, data: *anyopaque, hint: ?*anyopaque) void {
+        const wrap = EnvWrap.getWrap(env) catch return;
+        var d: [*]u8 = @ptrCast(data);
+        wrap.allocator.free(d[0..@intFromPtr(hint)]);
+    }
+
+    pub fn initExternal(env: *Env, buf: []u8) !*ArrayBufferRaw {
+        var value: *ArrayBufferRaw = undefined;
+        // const status = napi_create_external_arraybuffer2(env, buf.ptr, buf.len, finalize, null, &value);
+        const status = napi_create_external_arraybuffer(env, buf.ptr, buf.len, finalize_old, @ptrFromInt(buf.len), &value);
+        if (status != .napi_ok) {
+            return error.NotOk;
+        }
+
+        return value;
+    }
+
+    pub fn initCopy(env: *Env, buf: []u8) !*ArrayBufferRaw {
+        var data: *anyopaque = undefined;
+        var value: *ArrayBufferRaw = undefined;
+        const status = napi_create_arraybuffer(env, buf.len, &data, &value);
+        if (status != .napi_ok) {
+            return error.NotOk;
+        }
+
+        const d: [*]u8 = @ptrCast(data);
+        @memcpy(d, buf);
+
+        return value;
+    }
+};
+
+const TypedArray = opaque {
+    const ArrayType = enum(u32) {
+        int8,
+        uint8,
+        uint8_clamped,
+        uint16,
+        int32,
+        uint32,
+        float32,
+        float64,
+        bigint64,
+        biguint64,
+    };
+
+    extern fn napi_get_typedarray_info(env: *Env, value: *TypedArray, ty: *ArrayType, length: *usize, data: **anyopaque, arraybuffer: **ArrayBufferRaw, byte_offset: *usize) Status;
+
+    const Info = struct {
+        ty: ArrayType,
+        len: usize,
+        data: *anyopaque,
+        array_buffer: *ArrayBufferRaw,
+        byte_offset: usize,
+    };
+
+    pub fn get_info(self: *TypedArray, env: *Env) !Info {
+        var info: Info = .{
+            .ty = undefined,
+            .len = undefined,
+            .data = undefined,
+            .array_buffer = undefined,
+            .byte_offset = undefined,
+        };
+
+        const status = napi_get_typedarray_info(env, self, &info.ty, &info.len, &info.data, &info.array_buffer, &info.byte_offset);
+        if (status != .napi_ok) {
+            return error.NotOk;
+        }
+
+        return info;
+    }
+};
 
 const ModuleInit = fn (env: *Env, exports: *Object) void;
 
@@ -417,13 +652,58 @@ fn MakeTuple(comptime t: Type.Fn) type {
     return @Type(z);
 }
 
+pub const FastOneByteString = extern struct {
+    data: [*]const u8,
+    length: u32,
+};
+
+pub const FastU32Array = extern struct {
+    data: [*]u32,
+    length: usize,
+};
+
 fn toCTypeDef(comptime T: type) ?CFunction.CTypeDef {
     return switch (T) {
         void => CFunction.CTypeDef{ .ty = .void },
+
+        i8 => CFunction.CTypeDef{ .ty = .int32 },
+        i16 => CFunction.CTypeDef{ .ty = .int32 },
+        i32 => CFunction.CTypeDef{ .ty = .int32 },
+        i64 => CFunction.CTypeDef{ .ty = .int64 },
+
+        u8 => CFunction.CTypeDef{ .ty = .uint8 },
+        u16 => CFunction.CTypeDef{ .ty = .uint32 }, // There's no uint16
         u32 => CFunction.CTypeDef{ .ty = .uint32 },
+        u64 => CFunction.CTypeDef{ .ty = .uint64 },
+
+        f32 => CFunction.CTypeDef{ .ty = .float32 },
+        f64 => CFunction.CTypeDef{ .ty = .float64 },
+
+        // []u8 => CFunction.CTypeDef{ .ty = .uint8, .sequence_type = .typed_array },
+        FastU32Array => CFunction.CTypeDef{ .ty = .uint32, .sequence_type = .typed_array },
+        FastOneByteString => CFunction.CTypeDef{ .ty = .seq_one_byte_string },
+        *anyopaque => CFunction.CTypeDef{ .ty = .pointer },
+
         *Value => CFunction.CTypeDef{ .ty = .v8_value },
         *Receiver => CFunction.CTypeDef{ .ty = .v8_value },
         else => null,
+    };
+}
+
+const Uint8Array = opaque {
+
+};
+
+const CTypedArrayRaw = extern struct {
+    length: usize,
+     // only guaranteed to be 4-byte aligned, 8-byte alignment needs to be handled separately
+    data: *anyopaque,
+};
+
+fn CTypedArray(comptime T: type) type {
+    return extern struct {
+        length: usize,
+        data: [*]T,
     };
 }
 
@@ -446,9 +726,10 @@ fn makeFastcallFnDef(comptime t: Type.Fn) ?CFunction.CFunctionDef {
 fn makeFn(comptime t: Type.Fn, comptime v: anytype) NativeFn {
     const Args = MakeTuple(t);
     const ReturnType = t.return_type orelse unreachable;
-    const FnAsyncTypes = getAsyncTypes(ReturnType);
+    const FnErrorTypes = getErrorTypes(ReturnType);
+    const PromiseType = getPromiseType(if (FnErrorTypes) |z| z.payload else ReturnType);
 
-    if (FnAsyncTypes != null) {
+    if (PromiseType != null) {
         return struct {
             fn cb(env: *Env, info: *CallFrame) ?*Value {
                 return @ptrCast(runAsyncFn(v, env, info) catch return null);
@@ -475,13 +756,19 @@ fn makeFn(comptime t: Type.Fn, comptime v: anytype) NativeFn {
                 }
             }
 
+            if (FnErrorTypes) |types| {
+                const ret = @call(.always_inline, v, args) catch |e| {
+                    const err = toValue(anyerror, wrap, e) orelse return null;
+                    wrap.throw(err) catch @panic("Failed to throw error");
+                    return null;
+                };
+
+                return toValue(types.payload, wrap, ret);
+            }
+
             const ret = @call(.always_inline, v, args);
 
-            return switch (t.return_type orelse unreachable) {
-                *Value => ret,
-                u32 => @ptrCast(Number.createU32(env, ret) catch return null),
-                else => null,
-            };
+            return toValue(ReturnType, wrap, ret);
         }
     };
 
@@ -560,6 +847,8 @@ pub fn registerModule(comptime T: type) void {
                         const d = FnDecl{
                             .name = decl.name,
                             .cb = &makeFn(f, val),
+                            // TODO: the fast call cb needs to use a modified preamble for certain value types
+                            // currently typed arrays (e.g. []u8) result in a bus error
                             .fast_call_def = if (S.fn_def) |d| .{ .cb = &val, .def = &d } else null,
                         };
                         decls[numDecls] = d;
@@ -610,7 +899,6 @@ const EscapableHandleScope = opaque {
     }
 };
 
-var _task_name: ?*String = null;
 const task_name = "task";
 
 const AsyncTask = opaque {
@@ -631,24 +919,11 @@ const AsyncTask = opaque {
     extern fn napi_cancel_async_work(env: *Env, task: *AsyncTask) Status;
     extern fn napi_delete_async_work(env: *Env, task: *AsyncTask) Status;
 
-    fn get_name(env: *Env) !*String {
-        if (_task_name) |n| {
-            return n;
-        }
-
-        const scope = try EscapableHandleScope.open(env);
-        var name = try String.fromLatin1External(env, task_name);
-        name = @ptrCast(try scope.escape(env, @ptrCast(name)));
-        try scope.close(env);
-        const ref = try Ref.init(env, @ptrCast(name), 1);
-        _ = ref;
-        _task_name = name;
-        return name;
-    }
+    extern fn napi_schedule_async_work(env: *Env, exec: *const anyopaque, complete: *const anyopaque, data: ?*anyopaque) Status;
 
     pub fn init(env: *Env, exec: Execute, complete: Complete, data: ?*anyopaque) !*AsyncTask {
         var result: *AsyncTask = undefined;
-        const name = try String.fromLatin1External(env, task_name);
+        const name = try String.fromUtf8(env, task_name);
         const status = napi_create_async_work(env, null, @ptrCast(name), exec, complete, data, &result);
         if (status != .napi_ok) {
             return error.NotOk;
@@ -677,87 +952,55 @@ const AsyncTask = opaque {
             return error.NotOk;
         }
     }
+
+    pub fn schedule(env: *Env, exec: Execute, complete: Complete, data: ?*anyopaque) !void {
+        const status = napi_schedule_async_work(env, exec, complete, data);
+        if (status != .napi_ok) {
+            return error.NotOk;
+        }
+    }
 };
 
 inline fn fatal(src: std.builtin.SourceLocation, msg: [:0]const u8) noreturn {
-    var buf: [256]u8 = undefined;
+    var buf: [1024]u8 = undefined;
     const location = std.fmt.bufPrintZ(&buf, "{s}:{d}:{d}", .{src.file, src.line, src.column}) catch unreachable;
     napi_fatal_error(location.ptr, location.len, msg.ptr, msg.len);
 }
 
-fn toValue(comptime T: type, env: *Env, val: T) ?*Value {
+fn toValue(comptime T: type, envWrap: *EnvWrap, val: T) ?*Value {
     return switch (T) {
         void => null,
+        bool => envWrap.getBool(val) catch fatal(@src(), "Failed to create bool"),
         anyerror => {
-            // const n = @intFromError(val);
-            // return @ptrCast(Number.createU32(env, n) catch unreachable);
-            return @ptrCast(env.createError(val, "Native error") catch fatal(@src(), "Failed to create error"));
+            const err = envWrap.env.createError(val, "Native error") catch fatal(@src(), "Failed to create error");
+            return @ptrCast(err);
         },
-        u32 => @ptrCast(Number.createU32(env, val) catch fatal(@src(), "Failed to create number")),
+        i32 => @ptrCast(Number.createI32(envWrap.env, val) catch fatal(@src(), "Failed to create number")),
+        u32 => @ptrCast(Number.createU32(envWrap.env, val) catch fatal(@src(), "Failed to create number")),
         *PromiseValue => @ptrCast(val),
+        UTF8String => {
+            const v = String.fromUtf8(envWrap.env, val.data) catch fatal(@src(), "Failed to create string");
+            return @ptrCast(v);
+        },
+        ArrayBuffer => {
+            var ab = val;
+            return ArrayBuffer.toValue(&ab) catch fatal(@src(), "Failed to create buffer");
+        },
+        *ArrayBuffer => val.toValue() catch fatal(@src(), "Failed to create buffer"),
         *Value => val,
         else => fatal(@src(), "Invalid type"),
     };
 }
-
-// const TaskQueue = struct {
-//     pending: []*AsyncTask = &[_]*AsyncTask{},
-//     pendingCount: u32 = 0,
-//     didInit: bool = false,
-
-//     pub fn init() TaskQueue {
-//         return TaskQueue{};
-//     }
-
-//     fn grow(this: *TaskQueue) !void {
-//         if (!this.didInit) {
-//             this.didInit = true;
-//             const buf = try std.heap.c_allocator.alloc(*AsyncTask, 4);
-//             this.pending = buf;
-//             return;
-//         }
-
-//         const buf = try std.heap.c_allocator.alloc(*AsyncTask, this.pending.len * 2);
-//         @memcpy(buf, this.pending[0..this.pendingCount]);
-//         std.heap.c_allocator.free(this.pending);
-//         this.pending = buf;
-//     }
-
-//     pub fn push(this: *TaskQueue, item: *AsyncTask) !void {
-//         if (this.pendingCount + 1 >= this.pending.len) {
-//             try this.grow();
-//         }
-//         this.pending[this.pendingCount] = item;
-//         this.pendingCount += 1;
-//     }
-
-//     pub fn pop(this: *TaskQueue) ?*AsyncTask {
-//         if (this.pendingCount == 0) {
-//             return null;
-//         }
-
-//         const val = this.pending[this.pendingCount - 1];
-//         this.pendingCount -= 1;
-
-//         return val;
-//     }
-// };
-
-// var tasks = TaskQueue.init();
-// var runningCount: u32 = 0;
 
 fn runAsyncFn(comptime func: anytype, env: *Env, info: *CallFrame) !*PromiseValue {
     const Func = AsyncFn(func);
     const frame = try Func.init(env, info);
     const task = try AsyncTask.init(env, &Func.run, &Func.complete, frame);
     frame.task = task;
-    // if (runningCount >= 8) {
-    //     try tasks.push(task);
-    //     return frame.wrap.promise;
-    // }
 
     try task.start(env);
-    // runningCount += 1;
+
+    // try AsyncTask.schedule(env, &Func.run, &Func.complete, frame);
 
     return frame.wrap.promise;
 }
@@ -769,40 +1012,71 @@ fn getFnType(comptime val: anytype) Type.Fn {
     };
 }
 
-/// Functions that return a Promise will appear asychronous to
-/// JavaScript callers by running the function in a separate thread.
-pub fn Promise(comptime T: type, comptime E: type) type {
-    return union(enum) {
-        resolved: T,
-        rejected: E,
-
-        pub fn resolve(val: T) @This() {
-            return .{ .resolved = val };
-        }
-
-        pub fn reject(err: E) @This() {
-            return .{ .rejected = err };
-        }
+fn getOptionalType(comptime val: anytype) Type.Optional {
+    return switch (@typeInfo(@TypeOf(val))) {
+        .Optional => |o| o,
+        else => unreachable,
     };
 }
 
-const AsyncTypes = struct {
-    resolved: type,
-    rejected: type,
-};
+const PromiseMarker = struct {};
 
-fn getAsyncTypes(comptime t: type) ?AsyncTypes {
+fn getPromiseType(comptime t: type) ?type {
     const info = @typeInfo(t);
-    const u = switch (info) {
-        .Union => |s| s,
+    const s = switch (info) {
+        .Struct => |s| s,
         else => return null,
     };
 
-    if (!@hasField(t, "resolved") and !@hasField(t, "rejected")) return null;
+    if (!s.is_tuple or s.fields.len > 2) {
+        return null;
+    }
 
-    return .{
-        .resolved = u.fields[0].type,
-        .rejected = u.fields[1].type,
+    if (s.fields[0].type == PromiseMarker) {
+        return void;
+    }
+
+    if (s.fields.len != 2 or s.fields[1].type != PromiseMarker) {
+        return null;
+    }
+
+    return s.fields[0].type;
+}
+
+/// Functions that return a Promise will appear asynchronous to
+/// JavaScript callers by running the function in a separate thread.
+pub fn Promise(comptime T: type) type {
+    if (T == void) {
+        return struct {
+            void = undefined,
+            PromiseMarker = undefined,
+        };
+    }
+
+    return struct {
+        T,
+        PromiseMarker = undefined,
+    };
+}
+
+comptime {
+    if (@sizeOf(Promise(void)) != 0) {
+        @compileError("Expected Promise(void) to be 0 bytes");
+    }
+
+    if (@sizeOf(Promise(u8)) != 1) {
+        @compileError("Expected Promise(u8) to be 1 byte");
+    }
+
+    if (getPromiseType(struct{u8, struct{}}) != null) {
+        @compileError("Expected `getPromiseType` to only work with PromiseMarker");
+    }
+}
+
+fn getErrorTypes(comptime t: type) ?Type.ErrorUnion {
+    return switch (@typeInfo(t)) {
+        .ErrorUnion => |s| s,
+        else => return null,
     };
 }
 
@@ -821,16 +1095,27 @@ fn getArrayElementType(comptime T: type) ?type {
     };
 }
 
-// Current overhead (on my machine): ~2500ns (possibly ~1900ns)
+// Current overhead (on my machine): ~2000ns
 fn AsyncFn(comptime func: anytype) type {
     const funcType = getFnType(func);
     const Args = MakeTuple(funcType);
     const ReturnType = funcType.return_type orelse unreachable;
+    const FnErrorTypes = getErrorTypes(ReturnType);
+
+    const PromiseType = getPromiseType(if (FnErrorTypes) |t| t.payload else ReturnType) orelse unreachable;
+
+    const RetSlot = if (FnErrorTypes) |t| blk: {
+        break :blk union(enum) {
+            val: PromiseType,
+            err: t.error_set,
+        };
+    } else PromiseType;
+
     const Frame = struct {
         args: Args,
-        ret: ReturnType,
+        ret: RetSlot,
         wrap: PromiseWrap,
-        task: *AsyncTask, // Assigned by the caller
+        task: ?*AsyncTask, // Assigned by the caller
         converter: ValueConverter,
 
         pub fn init(env: *Env, info: *CallFrame) !*@This() {
@@ -846,39 +1131,42 @@ fn AsyncFn(comptime func: anytype) type {
             this.args = args;
             this.wrap = wrap;
             this.converter = converter;
+            this.task = null;
 
             return this;
         }
 
         pub fn run(_: *Env, data: ?*anyopaque) void {
             var this: *@This() = @alignCast(@ptrCast(data orelse unreachable));
-            this.ret = @call(.auto, func, this.args);
+            if (FnErrorTypes != null) {
+                const r = @call(.auto, func, this.args) catch |e| {
+                    this.ret = .{ .err = e };
+                    return;
+                };
+                this.ret = .{ .val = r[0] };
+            } else {
+                this.ret = @call(.auto, func, this.args)[0];
+            }
         }
 
         pub fn complete(env: *Env, _: Status, data: ?*anyopaque) void {
             const this: *@This() = @alignCast(@ptrCast(data orelse unreachable));
             defer {
-                // runningCount -= 1;
-                // if (runningCount < 8) {
-                //     if (tasks.pop()) |t| {
-                //         t.start(env) catch {};
-                //         runningCount += 1;
-                //     }
-                // }
+                if (this.task) |task| {
+                    task.deinit(env) catch {};
+                }
 
-                this.task.deinit(env) catch {};
                 var conv = this.converter;
                 conv.deinit();
             }
 
-            const promiseTypes = getAsyncTypes(ReturnType);
-            if (promiseTypes) |x| {
+            if (FnErrorTypes != null) {
                 switch (this.ret) {
-                    .resolved => |r| this.wrap.resolve(toValue(x.resolved, env, r)) catch {},
-                    .rejected => |e| this.wrap.reject(toValue(x.rejected, env, e)) catch {},
+                    .val => |r| this.wrap.resolve(toValue(PromiseType, this.wrap.envWrap, r)) catch {},
+                    .err => |e| this.wrap.reject(toValue(anyerror, this.wrap.envWrap, e)) catch {},
                 }
             } else {
-                this.wrap.resolve(toValue(ReturnType, env, this.ret)) catch {};
+                this.wrap.resolve(toValue(PromiseType, this.wrap.envWrap, this.ret)) catch {};
             }
         }
     };
@@ -887,10 +1175,6 @@ fn AsyncFn(comptime func: anytype) type {
 }
 
 pub const UTF8String = struct { data: [:0]u8 };
-
-const FunctionWrap = struct {
-    env: *Env,
-};
 
 const Env = opaque {
     extern fn napi_create_error(env: *Env, code: *String, msg: *String, result: **Object) Status;
@@ -967,6 +1251,8 @@ const Status = enum(u16) {
 };
 
 const NativeFn = fn (env: *Env, info: *CallFrame) ?*Value;
+const FinalizeFn = fn (env: *Env, data: ?*anyopaque, hint: ?*anyopaque) void;
+const FinalizeFn2 = fn (data: ?*anyopaque, len: usize, hint: ?*anyopaque) void;
 
 const PromiseValue = opaque {};
 const Deferred = opaque {
@@ -1008,14 +1294,45 @@ const ValueConverter = struct {
             const arr: *ArrayPointer = @ptrCast(val);
             const tmp = try arr.copy(this.env, this.arena.allocator());
             var tmp2: []U = try this.arena.allocator().alloc(U, tmp.len);
-            for (tmp, 0..tmp.len) |x, i| {
-                tmp2[i] = try this.fromJs(U, x);
+            for (0..tmp.len) |i| {
+                tmp2[i] = try this.fromJs(U, tmp[i]);
             }
 
             return T{ .elements = tmp2 };
         }
 
+        if (T == []u8) {
+            const arr: *TypedArray = @ptrCast(val);
+            const info = try arr.get_info(this.env);
+            // TODO: validate type
+            const d: [*]u8 = @ptrCast(info.data);
+
+            return d[0..info.len];
+        }
+
+        if (T == FastOneByteString) {
+            const s: *String = @ptrCast(val);
+            const data: [:0]u8 = try s.toUtf8(this.env, this.arena.allocator());
+
+            return FastOneByteString{
+                .data = data.ptr,
+                .length = @intCast(data.len),
+            };
+        }
+
+        if (T == FastU32Array) {
+            const arr: *TypedArray = @ptrCast(val);
+            const info = try arr.get_info(this.env);
+            const d: [*]u32 = @alignCast(@ptrCast(info.data));
+
+            return .{
+                .data = d,
+                .length = info.len,
+            };
+        }
+
         return switch (T) {
+            *anyopaque => val,
             *Value => val,
             *Receiver => @ptrCast(val),
             *String => @ptrCast(val),
@@ -1024,7 +1341,11 @@ const ValueConverter = struct {
                 const n: *Number = @ptrCast(val);
                 return try n.toU32(this.env);
             },
-            else => unreachable,
+            i32 => {
+                const n: *Number = @ptrCast(val);
+                return try n.toI32(this.env);
+            },
+            else => fatal(@src(), "Failed to convert to JS value"),
         };
     }
 };
@@ -1072,49 +1393,16 @@ const EnvWrap = struct {
     env: *Env,
     allocator: std.mem.Allocator,
 
-    _null: ?*Value = null,
-    _true: ?*Value = null,
-    _false: ?*Value = null,
-    _undefined: ?*Value = null,
-
     pub fn getNull(this: *EnvWrap) !*Value {
-        if (this._null) |v| {
-            return v;
-        }
-
-        const result = try this.env.getNull();
-        this._null = result;
-        return result;
+        return try this.env.getNull();
     }
 
     pub fn getUndefined(this: *EnvWrap) !*Value {
-        if (this._undefined) |v| {
-            return v;
-        }
-
-        const result = try this.env.getUndefined();
-        this._undefined = result;
-        return result;
+        return try this.env.getUndefined();
     }
 
-    pub fn getTrue(this: *EnvWrap) !*Value {
-        if (this._true) |v| {
-            return v;
-        }
-
-        const result = try this.env.getBool(true);
-        this._true = result;
-        return result;
-    }
-
-    pub fn getFalse(this: *EnvWrap) !*Value {
-        if (this._false) |v| {
-            return v;
-        }
-
-        const result = try this.env.getBool(false);
-        this._false = result;
-        return result;
+    pub fn getBool(this: *EnvWrap, val: bool) !*Value {
+        return try this.env.getBool(val);
     }
 
     pub fn initConverter(this: *EnvWrap) ValueConverter {
@@ -1122,6 +1410,15 @@ const EnvWrap = struct {
             .env = this.env,
             .arena = std.heap.ArenaAllocator.init(this.allocator),
         };
+    }
+
+    extern fn napi_throw(env: *Env, err: *Value) Status;
+
+    pub fn throw(this: *EnvWrap, err: *Value) !void {
+        const status = napi_throw(this.env, err);
+        if (status != .napi_ok) {
+            return error.NotOk;
+        }
     }
 };
 
@@ -1163,35 +1460,5 @@ pub fn Array(comptime T: type) type {
     };
 }
 
-const Receiver = opaque {};
+pub const Receiver = opaque {};
 
-const TestModule = struct {
-    // pub fn addSync(this: *Receiver, a: u32, b: u32) u32 {
-    //     // std.debug.print("{}", .{this});
-    //     _ = this;
-    //     return a + b;
-    // }
-
-    // pub fn add(a: u32, b: u32) Promise(u32, void) {
-    //     return Promise(u32, void).resolve(a + b);
-    // }
-
-    pub fn add2(a: u32, b: Array(u32)) Promise(void, void) {
-        std.debug.print("{}, {}", .{ a, b });
-        return Promise(void, void).resolve({});
-    }
-};
-
-// comptime {
-//     registerModule(TestModule);
-// }
-
-// --allow-natives-syntax
-// %CompileOptimized
-// %PrepareFunctionForOptimization
-// %OptimizeFunctionOnNextCall
-// const status = %GetOptimizationStatus(doAdd)
-// console.log('maybe deopt', (status >> 3) & 1)
-// console.log('optimized', (status >> 4) & 1)
-// console.log('magleved', (status >> 5) & 1)
-// console.log('turbofanned', (status >> 6) & 1)

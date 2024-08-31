@@ -185,6 +185,50 @@ export async function openHandle(fileName: string): Promise<FileHandle> {
     return createFileHandle(writeFile, closeFile)
 }
 
+function toEntityStats(stats: fs.Stats): FsEntityStats {
+    return { 
+        type: mapType(stats),
+        size: stats.size, 
+        mtimeMs: stats.mtimeMs, 
+        ctimeMs: stats.ctimeMs,
+    }
+}
+
+export async function readFileWithStats(fileName: string): Promise<{ data: Uint8Array, stats: FsEntityStats }>
+export async function readFileWithStats(fileName: string, encoding: BufferEncoding): Promise<{ data: string, stats: FsEntityStats }>
+export async function readFileWithStats(fileName: string, encoding?: BufferEncoding): Promise<{ data: string | Uint8Array, stats: FsEntityStats }>
+export async function readFileWithStats(fileName: string, encoding?: BufferEncoding): Promise<{ data: string | Uint8Array, stats: FsEntityStats }> {
+    const fd = await new Promise<number>((resolve, reject) => {
+        fs.open(fileName, 'r', (err, fd) => err ? reject(err) : resolve(fd))
+    })
+
+    const stats = fs.fstatSync(fd)
+    let buf = Buffer.allocUnsafe(stats.size)
+    let total = 0
+
+    while (total < buf.byteLength) {
+        const amountRead = await new Promise<number>((resolve, reject) => {
+            fs.read(fd, buf, total, buf.byteLength, -1, (err, read) => err ? reject(err) : resolve(read))
+        })
+
+        if (amountRead === 0) break
+        total += amountRead
+    }
+
+    if (total < buf.byteLength) {
+        buf = buf.subarray(0, total)
+    }
+
+    await new Promise<void>((resolve, reject) => {
+        fs.close(fd, err => err ? reject(err) : resolve())
+    })
+
+    return {
+        stats: toEntityStats(stats),
+        data: encoding ? buf.toString(encoding) : buf,
+    }
+}
+
 class FsError extends Error {
     constructor(message: string, public readonly code: string) {
         super(message)
@@ -229,6 +273,10 @@ export async function readDirRecursive(fs: Fs, dir: string) {
     await readDir(dir)
 
     return files
+}
+
+export async function rename(from: string, to: string) {
+    await fs.promises.rename(from, to)
 }
 
 function isTooManyFilesError(err: unknown): err is Error & { code: 'EMFILE' } {
@@ -337,7 +385,10 @@ export function createLocalFs(): Fs & SyncFs {
         try {
             return fs.promises.readFile(fileName, encoding).catch(e => {
                 const err = new Error((e as any).message)
-                throw Object.assign(e, { get stack() { return err.stack } })
+                Object.defineProperty(e, 'stack', {
+                    get: () => err.stack,
+                })
+                throw e
             }) as any
         } catch (e) {
             if (isTooManyFilesError(e)) {
@@ -360,15 +411,13 @@ export function createLocalFs(): Fs & SyncFs {
     async function stat(fileName: string) {
         const stats = await fs.promises.stat(fileName).catch(e => {
             const err = new Error((e as any).message)
-            throw Object.assign(e, { get stack() { return err.stack } })
+            Object.defineProperty(e, 'stack', {
+                get: () => err.stack,
+            })
+            throw e
         })
 
-        return { 
-            type: mapType(stats),
-            size: stats.size, 
-            mtimeMs: stats.mtimeMs, 
-            ctimeMs: stats.ctimeMs,
-        }
+        return toEntityStats(stats)
     }
 
     async function readDirectory(fileName: string) {
@@ -445,4 +494,3 @@ export function createLocalFs(): Fs & SyncFs {
         readDirectory,
     }
 }
-

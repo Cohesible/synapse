@@ -1,4 +1,4 @@
-import { getLogger } from '..'
+import { getLogger } from '../logging'
 import { createEventEmitter } from '../events'
 import { memoize } from '../utils'
 import * as nodeUtil from 'node:util'
@@ -122,6 +122,52 @@ function swap(arr: any[], i: number, j: number) {
     const tmp = arr[i]
     arr[i] = arr[j]
     arr[j] = tmp
+}
+
+
+const getSegmenter = memoize(() => new Intl.Segmenter(undefined, { granularity: 'grapheme' }))
+const emojiPattern = /\p{Emoji_Presentation}/u
+function getGraphemeWidth(str: string) {
+    if (emojiPattern.test(str)) {
+        return 2
+    }
+
+    // TODO: East Asian width (maybe just use a library)
+
+    return 1
+}
+
+function getDisplayWidth(str: string) {
+    let w = 0
+    let j = 0
+    let isEscaped = false
+
+    // const segmenter = getSegmenter()
+    function getSliceWidth(s: string) {
+        return [...s].map(getGraphemeWidth).reduce((a, b) => a + b, 0)
+        //return [...segmenter.segment(s)].map(x => getGraphemeWidth(x.segment)).reduce((a, b) => a + b, 0)
+    }
+
+    for (let i = 0; i < str.length; i++) {
+        if (str[i] === esc && str[i+1] === '[') {
+            if (i > j) {
+                w += getSliceWidth(str.slice(j, i))
+            }
+            isEscaped = true
+            i += 1
+        } else if (isEscaped) {
+            if (str[i] === 'm') {
+                isEscaped = false
+                j = i+1
+            }
+        }
+    }
+
+    if (j < str.length) {
+        w += getSliceWidth(j === 0 ? str : str.slice(j))
+    }
+
+    return w
 }
 
 function createSyncWrapper<T extends Record<string, (...args: any[]) => any>>(obj: T) {
@@ -263,12 +309,23 @@ function createScreenWriter(stream = process.stdout) {
         await write(`${esc}[${lines}T`)
     }
 
-    async function showCursor() {
-        await write(`${esc}[?25h`)
+    let cursorVisible = true
+    function showCursor() {
+        if (cursorVisible) {
+            return
+        }
+
+        cursorVisible = true
+        return write(`${esc}[?25h`)
     }
 
-    async function hideCursor() {
-        await write(`${esc}[?25l`)
+    function hideCursor() {
+        if (!cursorVisible) {
+            return
+        }
+
+        cursorVisible = false
+        return write(`${esc}[?25l`)
     }
 
     async function writeRows(rows: string[], fullScreen = false) {
@@ -295,11 +352,15 @@ function createScreenWriter(stream = process.stdout) {
             return
         }
 
-        const p = new Promise<DeviceStatusEvent>(r => {
-            const l = tty!.onDeviceStatus(ev => {
+        const p = new Promise<DeviceStatusEvent>((resolve, reject) => {
+            function end(ev?: DeviceStatusEvent) {
                 l.dispose()
-                r(ev)
-            })
+                l2.dispose()
+                ev ? resolve(ev) : resolve({ row: 0, column: 0 })
+            }
+
+            const l = tty!.onDeviceStatus(end)
+            const l2 = tty!.onClose(end)
         })
 
         await write(`${esc}[6n`)
@@ -364,7 +425,8 @@ interface DeviceStatusEvent {
 }
 
 function registerTty() {
-    if (!process.stdout.isTTY) {
+    const isStdinTTY = process.stdin.isTTY
+    if (!isStdinTTY) {
         return
     }
 
@@ -426,13 +488,21 @@ function registerTty() {
         }
     }
 
+    function onClose(listener: () => void) {
+        emitter.addListener('close', listener)
+
+        return { dispose: () => emitter.removeListener('close', listener) }
+    }
+
     function onDeviceStatus(listener: (ev: DeviceStatusEvent) => void) {
+        setup()
         emitter.addListener('device-status', listener)
 
         return { dispose: () => emitter.removeListener('device-status', listener) }
     }
 
     function onKeyPress(listener: (ev: KeyPressEvent) => void) {
+        setup()
         emitter.addListener('keypress', listener)
 
         return { dispose: () => emitter.removeListener('keypress', listener) }
@@ -444,20 +514,34 @@ function registerTty() {
         return { dispose: () => emitter.removeListener('signal', listener) }
     }
 
+    const previousRawMode = process.stdin.isRaw
+
     function dispose() {
+        emitter.emit('close')
         emitter.removeAllListeners()
-        if (process.stdin.isTTY) {
-            process.stdin.setRawMode(false)
-            process.stdin.removeListener('data', handleInput)
+        process.stdin.removeListener('data', handleInput)
+        process.stdin.setRawMode(previousRawMode)
+    }
+
+    let didSetup = false
+    function setup() {
+        if (didSetup) {
+            return
         }
-    }
 
-    if (process.stdin.isTTY) {
+        didSetup = true
         process.stdin.setRawMode(true)
+        process.stdin.on('end', dispose)
         process.stdin.on('data', handleInput)
+
+        onSignal(ev => {
+            if (ev.signal === 'SIGINT') {
+                process.emit('SIGINT')
+            }
+        })
     }
 
-    return { onSignal, onKeyPress, onDeviceStatus, dispose }
+    return { onClose, onKeyPress, onDeviceStatus, dispose }
 }
 
 interface DisplayRow {
@@ -498,7 +582,7 @@ export function createDisplay() {
                 return screenTop
             }
 
-            if (!process.stdout.isTTY) {
+            if (!writer.tty) {
                 return screenTop = 0
             }
 
@@ -567,6 +651,28 @@ export function createDisplay() {
             }
         })
 
+        const widthCache = new Map<Span, number>()
+        function getWidth(span: Span) {
+            if (widthCache.has(span)) {
+                return widthCache.get(span)!
+            }
+
+            const width = getDisplayWidth(getSpanText(span))
+            widthCache.set(span, width)
+
+            return width
+        }
+
+        function padDisplayWidth(span: Span, width: number, padding = ' ') {
+            const str = getSpanText(span)
+            const paddingNeeded = width - getWidth(span)
+            if (paddingNeeded <= 0) {
+                return str
+            }
+
+            return str.padEnd(str.length + paddingNeeded, padding)
+        }
+
         function shiftUp() {
             const idx = spans.findIndex(s => s.row === undefined || s.released)
             if (idx === -1) {
@@ -577,14 +683,35 @@ export function createDisplay() {
             // was in the same row + text on the last draw
 
             writer.cursorTo(0, 0)
-            const width = Math.max(spans[0].text.length + 1, process.stdout.columns)
-            writer.write(getSpanText(spans[idx]).padEnd(width, ' '))
+
+            const shiftAmount = getLinesNeeded(spans[idx])
+            writer.write(padDisplayWidth(spans[idx], shiftAmount * process.stdout.columns))
             writer.cursorTo(process.stdout.columns - 1, process.stdout.rows - 1)
 
             swap(spans, idx, spans.length - 1)
-            spans.pop()
+            const removed = spans.pop()!
+            widthCache.delete(removed)
 
-            return true
+            return shiftAmount
+        }
+
+        function getLinesNeeded(span: Span) {
+            // This is generally a reasonable approximation except for some east asian characters
+            // See https://www.unicode.org/Public/UCD/latest/ucd/EastAsianWidth.txt for a list of
+            // code points that are "wide" or ambiguous 
+            //
+            // In this case we're only checking the # of code units, some of which could be displayed
+            // as wide characters. So we use half of the actual width available.
+            if (span.text.length < (process.stdout.columns / 2)) {
+                return 1
+            }
+
+            const width = getWidth(span)
+            if (width < process.stdout.columns) {
+                return 1
+            }
+
+            return Math.ceil(width / process.stdout.columns)
         }
 
         function index(row: number) {
@@ -618,12 +745,9 @@ export function createDisplay() {
             const p = performance.now()
             spans.push(s)
             needsSort = true
-            //sortSpans()
             redraw()
             perfTime += performance.now() - p
         }
-
-        // TODO: account for spans taking up multiple lines
 
         // TODO: track the last 20 or so rows that were pushed off the screen
         // This would allows us to redraw the screen correctly on resize
@@ -648,40 +772,50 @@ export function createDisplay() {
             }
 
             let isCursorAtBottom = false
-            function scroll() {
+            function scroll(amount = 1) {
                 if (!isCursorAtBottom) {
                     writer.cursorTo(process.stdout.columns - 1, process.stdout.rows - 1)
                     isCursorAtBottom = true
                 }
 
-                writer.write('\n')
+                writer.write('\n'.repeat(amount))
             }
 
-            while (spans.length > (process.stdout.rows - screenTop)) {
+            let lineCount = spans.map(getLinesNeeded).reduce((a, b) => a + b, 0)
+            while (lineCount > (process.stdout.rows - screenTop)) {
                 if (screenTop === 0) {
-                    if (!shiftUp()) {
-                        break
-                    } else {
-                        sortSpans()
-                    }
+                    const shiftAmount = shiftUp()
+                    if (!shiftAmount) break
+
+                    sortSpans()
+                    scroll(shiftAmount)
+                    lineCount -= shiftAmount
                 } else {
                     screenTop -= 1
+                    scroll()
                 }
-
-                scroll()
             }
-
-            perfTime += performance.now() - p
 
             writer.cursorTo(0, screenTop)
             writer.clearScreenDown()
 
-            const rows = spans.slice(0, process.stdout.rows - screenTop)
+            lineCount = 0
+            const rows: Span[] = []
+            for (const s of spans) {
+                const l = getLinesNeeded(s)
+                if (lineCount + l > process.stdout.rows - screenTop) break
+
+                rows.push(s)
+                lineCount += l
+            }
+
             writer.write(rows.map(getSpanText).join('\n'))
 
             if (rows.some(s => s.spinner)) {
                 t = +setTimeout(_redraw, 25).unref()
             }
+
+            perfTime += performance.now() - p
         }
 
         let t: number | undefined
@@ -709,6 +843,7 @@ export function createDisplay() {
                 }
 
                 if (s.text !== text) {
+                    widthCache.delete(s)
                     s.text = text
                     redraw()
                 }
@@ -720,6 +855,7 @@ export function createDisplay() {
                 }
 
                 if (text !== undefined) {
+                    widthCache.delete(s)
                     s.text = text
                 }
 
@@ -846,15 +982,7 @@ export function createDisplay() {
             write(text, false)
         }
 
-        let disposed = false
-        async function dispose() {
-            if (disposed) {
-                return
-            }
-
-            clearTimeout(t)
-            disposed = true
-
+        async function _dispose() {
             if (getCursorPosition.cached) {
                 await getCursorPosition()
             }
@@ -882,11 +1010,23 @@ export function createDisplay() {
             getLogger().debug(`Time spent on UI: ${Math.floor(perfTime * 100) / 100}ms (${frames} frames)`)
         }
 
-        function getRow(pos: number) {
+        let disposed = false
+        function dispose() {
+            if (disposed) {
+                return
+            }
 
+            clearTimeout(t)
+            disposed = true
+
+            return _dispose()
         }
 
         async function clearScreen() {
+            if (disposed) {
+                return
+            }
+
             clearTimeout(t)
             spans.length = 0
             if (screenTop !== undefined) {
@@ -1078,17 +1218,6 @@ export function createDisplay() {
         return { show, hide, writeLine, setRows, dispose, moveCursor: (dx: number, dy: number) => moveCursor(name, dx, dy) }
     }
 
-    writer.tty?.onKeyPress(ev => {
-        // const currentView = getCurrentView()
-        // if (currentView) {
-        //     if (ev.key === ControlKey.UpArrow) {
-        //         moveCursor(currentView, 0, -1)
-        //     } else if (ev.key === ControlKey.DownArrow) {
-        //         moveCursor(currentView, 0, 1)
-        //     }
-        // }
-    })
-
     function _createOverlayableView(): ReturnType<typeof createOverlayableView> {
         if (process.stdout.isTTY) {
             return createOverlayableView()
@@ -1150,12 +1279,6 @@ export function createDisplay() {
 
         await releaseTty(true)
     }
-
-    writer.tty?.onSignal(ev => {
-        if (ev.signal === 'SIGINT') {
-            process.emit('SIGINT')
-        }
-    })
 
     return { createView, getOverlayedView, dispose, releaseTty, writer }
 }

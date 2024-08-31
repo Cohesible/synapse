@@ -4,7 +4,7 @@ import { getUserSynapseDirectory } from '../workspaces'
 import { getFs } from '../execution'
 import { ensureDir, getHash } from '../utils'
 import { runCommand } from '../utils/process'
-import { getLogger } from '..'
+import { getLogger } from '../logging'
 
 const getSourcesDirs = () => path.resolve(getUserSynapseDirectory(), 'build', 'sources')
 const getPkgName = (url: string) => url.replace(/^https?:\/\//, '').replace(/\.git$/, '')

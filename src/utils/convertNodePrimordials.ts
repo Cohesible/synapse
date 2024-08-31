@@ -5,7 +5,7 @@ import { getFs, isCancelled, throwIfCancelled } from '../execution'
 import { Symbol, createGraphCompiler, getRootSymbol, printNodes } from '../static-solver'
 import { Mutable, failOnNode, getNodeLocation, getNullTransformationContext } from '../utils'
 import { runCommand } from './process'
-import { getLogger } from '..'
+import { getLogger } from '../logging'
 
 interface Mappings {
     instanceFields: Record<string, string>
@@ -136,7 +136,7 @@ function KnownSymbolReplacer(name: string) {
         fn: (n: ts.Node) => {
             return ts.factory.createPropertyAccessExpression(
                 ts.factory.createIdentifier('Symbol'),
-                `Symbol.${name}`
+                name,
             )
         }
     }
@@ -395,8 +395,8 @@ function createExtras() {
             RegExpPrototypeSymbolSplit:  RegExpStringMethodReplacer('split'),
             RegExpPrototypeSymbolSearch:  RegExpStringMethodReplacer('search'),
     
-            SymbolDispose: SymbolReplacer('dispose'),
-            SymbolAsyncDispose: SymbolReplacer('Symbol.asyncDispose'),
+            SymbolDispose: KnownSymbolReplacer('dispose'),
+            SymbolAsyncDispose: KnownSymbolReplacer('asyncDispose'),
             SymbolIterator: KnownSymbolReplacer('iterator'),
             SymbolAsyncIterator: KnownSymbolReplacer('asyncIterator'),
             SymbolHasInstance: KnownSymbolReplacer('hasInstance'),
@@ -458,9 +458,13 @@ function createExtras() {
                 fn: (n: ts.Node) => {
                     assertCallExpression(n)
     
-                    return ts.factory.createElementAccessExpression(
-                        n.arguments[0],
-                        propertyAccess('Symbol', 'toStringTag')
+                    return ts.factory.createCallExpression(
+                        ts.factory.createElementAccessExpression(
+                            n.arguments[0],
+                            propertyAccess('Symbol', 'toStringTag')
+                        ),
+                        undefined,
+                        [],
                     )
                 }
             },
@@ -613,6 +617,31 @@ function transformMethod(n: ts.Node, v: string) {
     )
 }
 
+function uncapitalize(s: string) {
+    if (s.length === 0) {
+        return s
+    }
+
+    return `${s[0].toLowerCase()}${s.slice(1)}`
+}
+
+function bindPrototypeMethod(n: ts.Node, v: string) {
+    const [name, method] = v.split('Prototype')
+    if (!method) {
+        return n
+    }
+
+    const exp = ts.factory.createPropertyAccessExpression(
+        ts.factory.createPropertyAccessExpression(
+            ts.factory.createIdentifier(name),
+            'prototype'
+        ),
+        uncapitalize(method)
+    )
+
+    return createSelfBoundCall(exp)
+}
+
 function isProtoNull(prop: ts.ObjectLiteralElementLike) {
     if (!ts.isPropertyAssignment(prop)) {
         return false
@@ -648,6 +677,15 @@ function createSelfBound(exp: ts.Expression, ...args: ts.Expression[]) {
     const bind = ts.factory.createPropertyAccessExpression(exp, 'bind')
 
     return ts.factory.createCallExpression(bind, undefined, [exp, ...args])
+}
+
+function createSelfBoundCall(exp: ts.Expression) {
+    const bind = ts.factory.createPropertyAccessExpression(
+        ts.factory.createPropertyAccessExpression(exp, 'call'),
+        'bind'
+    )
+
+    return ts.factory.createCallExpression(bind, undefined, [exp])
 }
 
 const statementsMap = new Map<ts.SourceFile, Set<ts.Statement>>()
@@ -751,6 +789,12 @@ function createMatchers(mappings: Mappings, extras = createExtras()): Matcher[] 
             symbolName: k,
             matchType: [ts.SyntaxKind.CallExpression, 'expression'],
             fn: n => transformMethod(n, v),
+        })
+
+        m.push({
+            symbolName: k,
+            matchType: ts.SyntaxKind.Identifier,
+            fn: n => bindPrototypeMethod(n, v),
         })
 
         if (varargsMethods.has(k)) {

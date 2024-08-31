@@ -177,6 +177,11 @@ async function finishInstall(installDir: string, pkgDir: string, shell?: string)
 
     await setKey('typescript.libDir', path.resolve(pkgDir, 'dist'))
 
+    const zigLibDir = path.resolve(pkgDir, 'zig', 'lib')
+    if (await fs.fileExists(zigLibDir)) {
+        await setKey('zig.synapseLibDir', zigLibDir)
+    }
+
     // Make sure things work
     // `shell: true` is required to spawn `.cmd` files
     const out = child_process.spawnSync(synapse, ['--version'], { encoding: 'utf-8', shell: synapse.endsWith('.cmd') })

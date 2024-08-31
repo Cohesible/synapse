@@ -420,7 +420,7 @@ core.registerLogProvider(
         return events.map(ev => {
             const msg = ev.message!
             // TODO: parse out JSON from the message
-            const sourceType = !!msg.match(/^[A-Z]/) || msg.includes('ERROR\tInvoke Error') ? 'system' : 'user'
+            const sourceType = !!msg.match(/^[A-Z]/) ? 'system' : 'user'
             if (sourceType === 'user') {
                 const columns = msg.split('\t')
                 const rem = columns.slice(3).join('\t')

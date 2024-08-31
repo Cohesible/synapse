@@ -3,8 +3,8 @@ import * as path from 'node:path'
 import { getFs } from '../execution'
 import { RenderableError, colorize, dim, printLine, stripAnsi } from '../cli/ui'
 import { ClassifiedSpan, getClassifications, getLanguageService } from './classifier'
-import { getLogger } from '..'
-import { AsyncResource } from 'async_hooks'
+import { getLogger } from '../logging'
+import { AsyncResource } from 'node:async_hooks'
 import { getWorkingDir } from '../workspaces'
 
 interface SourceLocation {

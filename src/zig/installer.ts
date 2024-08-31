@@ -9,7 +9,7 @@ import { readKey, setKey } from '../cli/config'
 import { extractToDir } from '../utils/tar'
 import { registerToolProvider } from '../pm/tools'
 import { getFs } from '../execution'
-import { getLogger } from '..'
+import { getLogger } from '../logging'
 
 interface ZigDownload {
     readonly tarball: string    // url
@@ -226,4 +226,17 @@ export async function getZigPath() {
     await setKey('zig.path', zigPath)
 
     return zigPath
+}
+
+function getSynapseZigLibDir() {
+    return readKey<string>('zig.synapseLibDir')
+}
+
+export async function getJsLibPath() {
+    const libDir = await getSynapseZigLibDir()
+    if (!libDir) {
+        return
+    }
+
+    return path.resolve(libDir, 'js.zig')
 }

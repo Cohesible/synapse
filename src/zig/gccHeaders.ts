@@ -13,7 +13,7 @@
 
 import ts from 'typescript'
 import * as path from 'path'
-import { getLogger } from '..'
+import { getLogger } from '../logging'
 import { getFs } from '../execution'
 import { Mutable, printNodes, toSnakeCase } from '../utils'
 import { runCommand } from '../utils/process'

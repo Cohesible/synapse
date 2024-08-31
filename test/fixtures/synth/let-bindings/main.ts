@@ -69,6 +69,29 @@ it('handles late bindings', () => {
     expectEqual(fib(10), 55)
 })
 
+const arr: number[] = []
+function push(val: number) {
+    arr.push(val)
+}
+
+function pop() {
+    return arr.pop()
+}
+
+it('shares arrays across functions', () => {
+    push(1)
+    expectEqual(pop(), 1)
+})
+
+const fns: (() => number)[] = []
+for (let i = 0; i < 2; i++) {
+    fns[i] = () => i
+}
+
+it('captures loop variable correctly in closures (constant)', () => {
+    expectEqual(fns[0](), 0)
+    expectEqual(fns[1](), 1)
+})
 
 // !commands
 // synapse deploy

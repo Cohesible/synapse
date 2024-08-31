@@ -340,6 +340,7 @@ export function createrLoader(
         }
 
         const defaultRequire = createRequire2(workingDirectory)
+        const nodeRequire = createRequire(bootstrapPath)
         const tfModule = defaultRequire('synapse:terraform')[unproxy] as typeof terraform
         const constructsModule = tfModule.init(...tfGlobals)
     
@@ -400,25 +401,22 @@ export function createrLoader(
         }
 
         function wrapExports(spec: string, virtualId: string | undefined, exports: any, isInfra: boolean = false) {
-            // if (isProxy(exports)) {
-            //     return exports
-            // }
-
             const cached = proxyCache.get(exports)
             if (cached) {
                 return cached
             }
 
-            if (
-                isBuiltin(spec) || 
-                spec.startsWith(pointerPrefix) ||
-                spec.startsWith('synapse:')
-            ) {
+            if (isBuiltin(spec) || spec.startsWith('synapse:')) {
                 const normalized = isBuiltin(spec) && !spec.startsWith('node:') ? `node:${spec}` : spec
                 const proxy = createModuleProxy(context, normalized, undefined, exports, isInfra, undefined, solveHostPerms)
                 proxyCache.set(exports, proxy)
 
                 return proxy
+            }
+
+            if (spec.startsWith(pointerPrefix)) {
+                proxyCache.set(exports, exports)
+                return exports
             }
 
             const proxy = createModuleProxy(context, spec, virtualId, exports, isInfra, packageResolver, solveHostPerms)
@@ -450,7 +448,7 @@ export function createrLoader(
                 return p
             }
 
-            const commandRunner = createNpmLikeCommandRunner(workingDirectory)
+            const getCommandRunner = memoize(() => createNpmLikeCommandRunner(workingDirectory))
 
             registerSourceMapParser(sourcemapParser, Error)
 
@@ -462,7 +460,7 @@ export function createrLoader(
                 return wrappedJson ??= createGlobalProxy({ JSON: wrapJSON(tfModule.Fn, tfModule.internalState) }).JSON
             }
 
-            const wrapped = createSynthLogger(process, _globalThis.console)
+            const getWrappedIo = memoize(() => createSynthLogger(process, _globalThis.console))
             const ctx = vm.createContext({
                 Promise,
                 URL,
@@ -475,15 +473,19 @@ export function createrLoader(
                 Uint8Array,
                 ArrayBuffer,
                 Error,
-                Response,
                 setTimeout,
                 clearTimeout,
+                // Initializing `Response` is fairly slow
+                get Response() {
+                    return Response
+                },
+                get console() {
+                    return getWrappedIo().console
+                },
                 get JSON() {
                     return getWrappedJson()
                 },
                 RegExp: _globalThis.RegExp,
-                // console: _globalThis.console,
-                console: wrapped.console,
                 global: _globalThis,
                 globalThis: _globalThis, // Probably shouldn't do this
                 get __getCredentials() {
@@ -503,7 +505,9 @@ export function createrLoader(
                 __cwd: () => workingDirectory,
                 __buildTarget: buildTarget,
                 __deployTarget: deployTarget,
-                __runCommand: commandRunner,
+                get __runCommand() {
+                    return getCommandRunner()
+                },
                 __getCurrentId: () => context.getScope(),
                 __getPointer: getPointer,
                 __getCallerModuleId: context.getModuleId,
@@ -524,16 +528,6 @@ export function createrLoader(
         }
 
         function createRequire2(importer: string, addWrap = true) {
-            const getNodeRequire = () => {
-                if (importer.startsWith(pointerPrefix)) {
-                    return createRequire(bootstrapPath)
-                }
-
-                const resolved = moduleResolver.getFilePath(importer)
-
-                return createRequire(resolved.startsWith(pointerPrefix) ? bootstrapPath : resolved)
-            }
-
             return function require2(spec: string) {
                 function addSymbol(exports: any, virtualId?: string, isInfra = false) {
                     if (!addWrap) {
@@ -546,7 +540,7 @@ export function createrLoader(
                     if (spec === 'buffer' || spec === 'node:buffer') {
                         // Don't add the proxy here, otherwise we have to deal with `instanceof` not working
                         // correctly for `Buffer` with built-in modules
-                        return getNodeRequire()(spec)
+                        return nodeRequire(spec)
                     }
                     if (spec === 'path' || spec === 'node:path') {
                         return addSymbol(wrapPath(tfModule.Fn, tfModule.internalState))
@@ -554,7 +548,7 @@ export function createrLoader(
                     if (spec === 'module' || spec === 'node:module') {
                         return addSymbol(patchModule(createRequire2))
                     }
-                    return addSymbol(getNodeRequire()(spec))
+                    return addSymbol(nodeRequire(spec))
                 }
 
                 const location = moduleResolver.resolveVirtual(spec, importer)
@@ -571,14 +565,13 @@ export function createrLoader(
                 const cacheKey = locationIsPointer ? location.hash : undefined
                 const extname = path.extname(physicalLocation)
                 if (extname === '.node') {
-                    cache[location] = { exports: addSymbol(getNodeRequire()(physicalLocation), location) }
+                    cache[location] = { exports: addSymbol(nodeRequire(physicalLocation), location) }
                     return cache[location].exports   
                 } else if (extname === '.json') {
                     cache[location] = { exports: JSON.parse(getSource(physicalLocation, spec, location)) }
                     return cache[location].exports   
                 }
     
-                // ~100ms on `example` 
                 const text = getSource(physicalLocation, spec, location)
 
                 if (typeof text !== 'string') {
@@ -586,11 +579,11 @@ export function createrLoader(
                     return cache[location].exports
                 }
 
-                // Without the `synapse:` check then we would serialize things like `cloud.getArtifactFs` incorrectly
+                // Without the `synapse:` check then we would serialize things like `core.getArtifactFs` incorrectly
                 const isInfraSource = isInfra(physicalLocation) && !spec.startsWith('synapse:')
                 const replacementsData = targets[physicalLocation] 
                 if (replacementsData) {
-                    getLogger().log(`Loaded symbol bindings for: ${physicalLocation}`, Object.keys(replacementsData))
+                    getLogger().log(`Loaded symbol bindings for: ${physicalLocation} [${location}]`, Object.keys(replacementsData))
                 }
 
                 function createModuleStub(val: any) {
@@ -1241,9 +1234,6 @@ function createSerializationProxy(
                 {
                     type: 'import', 
                     module,
-                    // These cause too many perf issues atm
-                    // packageInfo,
-                    // dependencies,
                 },
                 ...operations.slice(1)
             ],
@@ -1433,13 +1423,6 @@ function createSerializationProxy(
 
             return Reflect.set(target, prop, newValue, recv)
         },
-        // ownKeys: (target) => {
-        //     const keys = Reflect.ownKeys(target)
-        //     if (!keys.includes(moveable2)) {
-        //         return [moveable2, ...keys]
-        //     }
-        //     return keys
-        // },
         getOwnPropertyDescriptor: (target, prop) => {
             if (prop === moveable2) {
                 return moveableDesc

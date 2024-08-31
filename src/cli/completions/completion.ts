@@ -1,4 +1,3 @@
-import { getLogger } from '../..'
 import * as path from 'node:path'
 import { getFs } from '../../execution'
 import { glob } from '../../utils/glob'

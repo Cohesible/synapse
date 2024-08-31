@@ -3,7 +3,7 @@ import type { BackendClient } from './runtime/modules/core'
 import { getExecutionId } from './execution'
 import { readState } from './artifacts'
 import { getAuthClient } from './auth'
-import { getLogger } from '.'
+import { getLogger } from './logging'
 import { mapResource } from './deploy/deployment'
 
 type ModulePointer<T extends object = Record<string, unknown>> = T | string  

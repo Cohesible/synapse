@@ -13,7 +13,7 @@ function isUsing(node: ts.VariableStatement) {
         (node.declarationList.flags & ts.NodeFlags.AwaitUsing) === ts.NodeFlags.AwaitUsing
 }
 
-type SubstitutionFunction = (node: ts.Node, scopes: ts.Node[]) => any
+type SubstitutionFunction = (node: ts.Node) => any
 
 const internalBrand = Symbol('internalFunction')
 const uninitialized = Symbol('uninitialized') 
@@ -28,20 +28,11 @@ export function isInternalFunction(fn: (...args: any[]) => unknown): fn is typeo
 }
 
 interface InternalFunctionData {
-    length: number
     getSource: () => string
 }
 
-export function createInternalFunction<T extends Function>(fn: T, length?: number, getSource?: () => string): T {
-    return ((fn as any)[internalBrand] = { length, getSource }, fn)
-}
-
-export function getFunctionLength(fn: any) {
-    if (isInternalFunction(fn)) {
-        return fn[internalBrand].length
-    }
-
-    return fn.length
+export function createInternalFunction<T extends Function>(fn: T, getSource?: () => string): T {
+    return ((fn as any)[internalBrand] = { getSource }, fn)
 }
 
 export function getSourceCode(fn: any) {
@@ -50,10 +41,6 @@ export function getSourceCode(fn: any) {
     }
 
     return fn.toString()
-}
-
-function isInternalThis(thisArg: any): thisArg is ts.Node[] {
-    return Array.isArray(thisArg) && (thisArg.length === 0 || isNode(thisArg[0]))
 }
 
 export function isUnknown(val: any): val is typeof unknown {
@@ -80,12 +67,70 @@ export function createUnion<T>(values: Iterable<T> | (() => Iterable<T>)) {
     return { [unionSymbol]: true, [Symbol.iterator]: values[Symbol.iterator].bind(values) }
 }
 
-export function isUnion(val: unknown): val is ({ [unionSymbol]: true } & Iterable<any>) {
+// Simple test case
+
+// let yielded = 0
+// function* foo() {
+//     for (let i = 0; i < 5; i++) {
+//         yield i
+//         yielded += 1
+//     }
+// }
+
+// const cached = createCachedUnion(foo)
+
+// const pairs: [number, number][] = []
+// for (const i of cached) {
+//     for (const j of cached) {
+//         pairs.push([i, j])
+//     }
+// }
+
+// const expected: typeof pairs = []
+// for (let i = 0; i < 5; i++) {
+//     for (let j = 0; j < 5; j++) {
+//         expected.push([i, j])
+//     }
+// }
+//
+// expectEqual(yielded, 5)
+// expectEqual(pairs.length, 25)
+// expectEqual(pairs, expected)
+
+function createCachedUnion<T>(values: () => Iterable<T>) {
+    const cached: T[] = []
+    let iter: Iterable<T>
+
+    function* gen() {
+        if (!iter) {
+            iter = values()
+        }
+
+        yield* cached
+        for (const v of iter) {
+            cached.push(v)
+            const len = cached.length
+            yield v
+
+            // Play catch-up
+            if (cached.length !== len) {
+                for (let i = len; i < cached.length; i++) {
+                    yield cached[i]
+                }
+            }
+        }
+    }
+
+    return { [unionSymbol]: true, [Symbol.iterator]: gen }
+}
+
+type Union = ({ [unionSymbol]: true; source?: Iterable<any> } & Iterable<any>)
+export function isUnion(val: unknown): val is Union {
     return typeof val === 'object' && !!val && unionSymbol in val
 }
 
 function lazy<T extends any[], U>(fn: (...args: T) => U): ((...args: T) => U) & { [evaluatorSymbol]: any } {
-    return Object.assign(fn, { [evaluatorSymbol]: true })
+    return ((fn as any)[evaluatorSymbol] = true, fn as any)
 }
 
 function isLazy(val: any): val is ((...args: any[]) => any) & { [evaluatorSymbol]: any } {
@@ -97,11 +142,33 @@ export function evaluate(val: any): any {
         if (typeof val === 'function' && evaluatorSymbol in val) {
             return evaluate(val())
         } else if (isUnion(val)) {
-            return createUnion(Array.from(val).map(evaluate))
+            const mapped = Array.from(dedupeUnknown(val)).map(evaluate)
+            if (mapped.length === 1) {
+                return mapped[0]
+            }
+
+            if (mapped.length === 0) {
+                return createUnknown()
+            }
+
+            return createUnion(mapped)
         }
     }
 
     return val
+}
+
+function* dedupeUnknown(union: Union) {
+    let didYieldUnknown = false
+    for (const val of union) {
+        if (isUnknown(val)) {
+            if (didYieldUnknown) {
+                continue
+            }
+            didYieldUnknown = true
+        }
+        yield val
+    }
 }
 
 class _Array extends Array {
@@ -129,12 +196,19 @@ export function createStaticSolver(
     const callStack: [node: ts.Node, args: any[]][] = []
 
     function createSolver(
-        scopes: ts.Node[] = [],
         state = new Map<string, any>(),
         context?: SubstitutionFunction
     ): { solve: (node: ts.Node) => any, getState: () => Map<string, any>, printState: () => void } {
-        if (scopes.length === 0 && !state.has('exports')) {
-            state.set('exports', {})
+        function getExports() {
+            const val = state.get('exports')
+            if (val !== undefined) {
+                return val
+            }
+
+            const newVal = {}
+            state.set('exports', newVal)
+
+            return newVal
         }
 
         function printState(s = state) {
@@ -148,7 +222,7 @@ export function createStaticSolver(
             }
         }   
 
-        function getSubstitute(node: ts.Node, scopes: ts.Node[]): any {
+        function getSubstitute(node: ts.Node): any {
             return evaluate(fn())
 
             function fn() {
@@ -161,7 +235,7 @@ export function createStaticSolver(
                 }
     
                 if (context) {
-                    const sub = context(node, scopes)
+                    const sub = context(node)
                     if (sub === node) {
                         failOnNode(`Found recursive call`, node)
                     }
@@ -237,11 +311,11 @@ export function createStaticSolver(
                 return undefined
             }
 
-            return getSubstitute(node, scopes)
+            return getSubstitute(node)
         }
     
         function solveThisKeyword(node: ts.Node): any {
-            return getSubstitute(node, scopes)
+            return getSubstitute(node)
         }
     
         function access(target: any, arg: any, questionDotToken = false): any {
@@ -298,6 +372,7 @@ export function createStaticSolver(
         }  
     
         function getThisArg(exp: ts.CallExpression): any {
+            // TODO: handle `(x.foo)()`
             if (ts.isPropertyAccessExpression(exp.expression) || ts.isElementAccessExpression(exp.expression)) {
                 return solve(exp.expression.expression)
             }
@@ -312,17 +387,14 @@ export function createStaticSolver(
             const heritage = node.heritageClauses?.filter(x => x.token === ts.SyntaxKind.ExtendsKeyword).map(x => x.types[0].expression)[0]
             const proto: any = {}
     
-            // `this` is the execution scope
-            const c = createInternalFunction(function (this: ts.Node[], thisArg: any, ...args: any[]) {
+            const c = createInternalFunction(function (this: any, ...args: any[]) {
+                let thisArg = this
+
                 if (heritage) {
                     const fn = solve(heritage)
                     if (typeof fn === 'function') {
                         thisArg ??= {}
-                        if (isInternalFunction(fn)) {
-                            thisArg = fn.call(this, thisArg, ...args) ?? thisArg
-                        } else {
-                            thisArg = fn.call(thisArg, ...args) ?? thisArg
-                        }
+                        thisArg = fn.call(thisArg, ...args) ?? thisArg
                     } else {
                         if (fn !== unknown) {
                             failOnNode(`Super class was not a function`, heritage)
@@ -348,11 +420,7 @@ export function createStaticSolver(
                 if (ctor != undefined) {
                     const fn = solve(ctor)
                     if (typeof fn === 'function') {
-                        if (isInternalFunction(fn)) {
-                            thisArg = fn.call(this, thisArg, ...args) ?? thisArg
-                        } else {
-                            thisArg = fn.call(thisArg, ...args) ?? thisArg
-                        }
+                        thisArg = fn.call(thisArg, ...args) ?? thisArg
                     } else {
                         if (fn !== unknown) {
                             failOnNode(`Constructor was not a function`, ctor)
@@ -361,7 +429,7 @@ export function createStaticSolver(
                 }
 
                 return thisArg
-            }, ctor?.parameters.length, () => node.getText(node.getSourceFile()))
+            }, () => node.getText(node.getSourceFile()))
 
             for (const m of methods) {
                 if (m.modifiers?.find(x => x.kind === ts.SyntaxKind.StaticKeyword)) {
@@ -410,53 +478,49 @@ export function createStaticSolver(
         // XXX: only used for recursion
         function callWithStack(...args: Parameters<typeof call>): any {
             if (callStack.length > 50) {
-                // getLogger().warn('Potentially recursive function call, returning "unknown" type')
                 return createUnknown()
             }
 
-            const isRecursive = !!callStack.find(f => f[0] === args[0] && f[1].map((e, i) => e === args[4][i]).reduce((a, b) => a && b, true))
+            const isRecursive = !!callStack.find(f => f[0] === args[0] && f[1].map((e, i) => e === args[3][i]).reduce((a, b) => a && b, true))
             if (isRecursive) {
                 return createUnknown()
             }
 
-            callStack.push([args[0], args[4]])
-           // try {
+            callStack.push([args[0], args[3]])
             const res = call(...args)
             callStack.pop()
 
             return res
-            // } catch (e) {
-            //     // XXX
-            //     return unknown
-            // }
         }
 
-        function call(source: ts.Node, scopes: ts.Node[], fn: any, thisArg: any, args: any[]): any {
+        function call(source: ts.Node, fn: any, thisArg: any, args: any[]): any {
             if (isUnion(fn)) {
-                return createUnion(function* () {
+                return createCachedUnion(function* () {
                     for (const f of fn) {
                         if (isUnknown(f)) {
                             yield f
                             // failOnNode('Found unknown symbol in union', source)
                         } else {
-                            yield callWithStack(source, scopes, f, thisArg, args)
+                            yield callWithStack(source, f, thisArg, args)
                         }
                     }
                 })
             }
 
             if (typeof fn !== 'function') {
-                failOnNode(`Not a function: ${fn}`, source)
+                // This is mostly to handle `.then` or `.catch`
+                // Whether or not a function truly returns a Promise is not always statically known
+                if (!fn) {
+                    return createUnknown()
+                }
+
+                failOnNode(`Not a function (type: ${typeof fn}): ${fn}`, source)
             }
 
-            if (isInternalFunction(fn)) {
-                return fn.call(scopes, thisArg, ...args)
+            if (ts.isNewExpression(source)) {
+                return Reflect.construct(fn, args) // TODO: `new.target`
             } else {
-                if (ts.isNewExpression(source)) {
-                    return Reflect.construct(fn, args)
-                } else {
-                    return fn.call(thisArg, ...args)
-                }
+                return fn.call(thisArg, ...args)
             }
         }
 
@@ -468,7 +532,7 @@ export function createStaticSolver(
                 return unknown
             }
 
-            return callWithStack(node, scopes, fn, thisArg, args)
+            return callWithStack(node, fn, thisArg, args)
         }
 
         function solveNewExpression(node: ts.NewExpression) {
@@ -478,7 +542,7 @@ export function createStaticSolver(
                 return unknown
             }
 
-            return callWithStack(node, scopes, fn, {}, args)
+            return callWithStack(node, fn, {}, args)
         }
 
         function solveSuperExpression(node: ts.SuperExpression) {
@@ -524,14 +588,14 @@ export function createStaticSolver(
             const result = lazy(() => {
                 const val = fn()
                 state.set(name, val)
-                if (isExported && state.has('exports')) {
-                    state.get('exports')![name] = val
+                if (isExported) {
+                    getExports()[name] = val
                 }
                 return val
             })
             state.set(name, result)
-            if (isExported && state.has('exports')) {
-                state.get('exports')![name] = result
+            if (isExported) {
+                getExports()[name] = result
             }
             
             return result
@@ -545,10 +609,10 @@ export function createStaticSolver(
 
                 if (ts.isPropertyAccessExpression(left)) {
                     const target = solve(left.expression)
-                    if (isUnknown(target) || isUnion(target)) {
+                    if (isUnknown(target) || isUnion(target) || target === undefined) {
                         return
                     }
-                    if (target === undefined || (typeof target !== 'object' && typeof target !== 'function')) {
+                    if (typeof target !== 'object' && typeof target !== 'function') {
                         failOnNode(`Not an object: ${target}`, node)
                     }
                     const memberName = solveMemberName(left.name)
@@ -562,12 +626,12 @@ export function createStaticSolver(
                         target[memberName] = solve(right)
                     }
                 } else if (ts.isIdentifier(left)) {
-                    if (!state.has(left.text)) {
-                        const val = solve(left)
-                        if (val === undefined) {
-                            failOnNode(`Identifier "${left.text}" has not been declared`, node)
-                        }
-                    }
+                    // if (!state.has(left.text)) {
+                    //     const val = solve(left)
+                    //     if (val === undefined) {
+                    //         failOnNode(`Identifier "${left.text}" has not been declared`, node)
+                    //     }
+                    // }
                     // FIXME: this only sets the scoped state?
                     if (exp.operatorToken.kind === ts.SyntaxKind.QuestionQuestionEqualsToken) {
                         state.set(left.text, evaluate(state.get(left.text)) ?? solve(right))
@@ -599,10 +663,9 @@ export function createStaticSolver(
                 // XXX: used to dump logs
                 if (ts.isCallExpression(exp) && ts.isPropertyAccessExpression(exp.expression) && ts.isIdentifier(exp.expression.expression) && exp.expression.expression.text === 'console') {
                     evaluate(solve(exp))
+                } else {
+                    setLazyState(`__expression:${node.pos}`, false, () => solve(exp))
                 }
-
-                // getTerminalLogger().log(getNodeLocation(node), node.pos)
-                setLazyState(`__expression:${node.pos}`, false, () => solve(exp))
             }
         }
 
@@ -644,7 +707,7 @@ export function createStaticSolver(
                 }
                 setLazyState(node.name.text, isExported(node), () => solve(node))
             } else if (ts.isVariableStatement(node)) {
-                const solver = createSolver([...scopes, node], undefined, getSubstitute)
+                const solver = createSolver(undefined, getSubstitute)
 
                 // XXX: only handles 1 decl
                 let init: any
@@ -679,8 +742,8 @@ export function createStaticSolver(
                 }
             } else if (ts.isExportDeclaration(node)) {
                 const res = solveExportDeclaration(node)
-                if (res !== undefined && state.has('exports')) {
-                    const exports = state.get('exports')!
+                if (res !== undefined) {
+                    const exports = getExports()
                     for (const [k, v] of Object.entries(res)) {
                         exports[k] = v
                     }
@@ -739,29 +802,21 @@ export function createStaticSolver(
 
             const isGenerator = !!target.asteriskToken
 
-            // `this` refers to execution scopes
-            return createInternalFunction(function (this: ts.Node[], thisArg: any, ...args: any[]) {
-                // If we're called _externally_ then we need to shift all of our args to the left
-                // This will drop our normal `this` value used for execution scope, so we'll assume
-                // the scope of the solver instead
-                const actualThisArg = isInternalThis(this) ? thisArg : this
-                const actualArgs = isInternalThis(this) ? args : [thisArg, ...args]
-                const actualThis = isInternalThis(this) ? this : scopes
-
+            return createInternalFunction(function (this: any, ...args: any[]) {
                 const scopedState = new Map<string, any>()
-                scopedState.set('this', actualThisArg)
+                scopedState.set('this', this)
                 if (isGenerator) {
                     scopedState.set('__generatorState__', [])
                 }
 
                 function resolveParam(p: ts.ParameterDeclaration, i: number) {
                     if (p.dotDotDotToken) {
-                        return actualArgs.slice(i)
+                        return args.slice(i)
                     }
 
                     const init = p.initializer ? solve(p.initializer) : createUnknown()
 
-                    return i >= actualArgs.length ? init : actualArgs[i]
+                    return i >= args.length ? init : args[i]
                 }
 
                 target.parameters.forEach((p, i) => {
@@ -788,7 +843,7 @@ export function createStaticSolver(
                     }
                 })
 
-                const solver = createSolver([...actualThis, target], scopedState, getSubstitute)
+                const solver = createSolver(scopedState, getSubstitute)
                 const result = solver.solve(target.body!)
 
                 // XXX: eval the entire body even if we don't reference anything directly
@@ -805,7 +860,7 @@ export function createStaticSolver(
                 }
 
                 return result
-            }, target.parameters.length, () => target.getText(target.getSourceFile()))
+            }, () => target.getText(target.getSourceFile()))
         }
 
         function solveImportDeclaration(node: ts.ImportDeclaration) {
@@ -843,7 +898,7 @@ export function createStaticSolver(
                 return createUnion(function* () {
                     for (const part of parts[unionIdx]) {
                         if (isUnknown(part)) {
-                            yield unknown
+                            yield part
                         } else {
                             yield substituteUnion([...head, part, ...parts.slice(unionIdx + 1)])
                         }
@@ -882,9 +937,9 @@ export function createStaticSolver(
             return unknown
         }
 
-        function solveScopedState(node: ts.Node, target: ts.Node = node) {
+        function solveScopedState(target: ts.Node) {
             const scopedState = new Map<string, any>()
-            const solver = createSolver([...scopes, node], scopedState, getSubstitute)
+            const solver = createSolver(scopedState, getSubstitute)
             solver.solve(target)
             // XXX: eval the entire body even if we don't reference anything directly
             for (const [k, v] of scopedState.entries()) {
@@ -899,9 +954,9 @@ export function createStaticSolver(
             //     return unknownSymbol
             // }
 
-            solveScopedState(node, node.thenStatement)
+            solveScopedState(node.thenStatement)
             if (node.elseStatement) {
-                solveScopedState(node, node.elseStatement)
+                solveScopedState(node.elseStatement)
             }
         }
 
@@ -914,7 +969,7 @@ export function createStaticSolver(
 
         function solveCaseOrDefaultClause(node: ts.CaseOrDefaultClause) {
             const scopedState = new Map<string, any>()
-            const solver = createSolver([...scopes, node], scopedState, getSubstitute)
+            const solver = createSolver(scopedState, getSubstitute)
 
             if (ts.isCaseClause(node)) {
                 const val = solver.solve(node.expression)
@@ -971,13 +1026,13 @@ export function createStaticSolver(
                         if (isUnion(val)) {
                             // XXX: NOT CORRECT, this should return a union
                             for (const x of val) {
-                                if (!isUnknown(x)) {
+                                if (x && !isUnknown(x)) {
                                     result.push(...x)
                                 } else {
                                     result.push(x)
                                 }
                             }
-                        } else {
+                        } else if (val) {
                             result.push(...val)
                         }
                     }
@@ -1006,20 +1061,20 @@ export function createStaticSolver(
 
         // ERROR HANDLING
         function solveTryStatement(node: ts.TryStatement) {
-            solveScopedState(node, node.tryBlock)
+            solveScopedState(node.tryBlock)
             if (node.catchClause) {
                 // TODO: solve variable decl
-                solveScopedState(node, node.catchClause.block)
+                solveScopedState(node.catchClause.block)
             }
             if (node.finallyBlock) {
-                solveScopedState(node, node.finallyBlock)
+                solveScopedState(node.finallyBlock)
             }
         }
 
         // CONTROL FLOW
         function solveWhileStatement(node: ts.WhileStatement) {
             const scopedState = new Map<string, any>()
-            const solver = createSolver([...scopes, node], scopedState, getSubstitute)
+            const solver = createSolver(scopedState, getSubstitute)
             solver.solve(node.statement)
 
             // TODO: we could simulate evaluation of the loop with iteration and/or time bounds
@@ -1036,13 +1091,26 @@ export function createStaticSolver(
                 // TODO
                 return unknown
             }
+
             const val = solve(node.expression)
             const decl = node.initializer.declarations[0]
+            
             if (ts.isIdentifier(decl.name)) {
+                // TODO: this needs to convert iterables to unions, not just arrays
+                const mapped = isUnion(val) ? createUnion(function* () {
+                    for (const v of val) {
+                        if (Array.isArray(v)) {
+                            yield createUnion(v)
+                        } else {
+                            yield v
+                        }
+                    }
+                }) : Array.isArray(val) ? createUnion(val) : val
+
                 const scopedState = new Map<string, any>()
-                scopedState.set(decl.name.text, val)
-                // getTerminalLogger().log('iterator', decl.name.text)
-                const solver = createSolver([...scopes, node], scopedState, getSubstitute)
+                scopedState.set(decl.name.text, mapped)
+
+                const solver = createSolver(scopedState, getSubstitute)
                 solver.solve(node.statement)
 
                 // XXX: eval the entire body even if we don't reference anything directly
@@ -1072,7 +1140,7 @@ export function createStaticSolver(
                     }
                 }
 
-                const solver = createSolver([...scopes, node], scopedState, getSubstitute)
+                const solver = createSolver(scopedState, getSubstitute)
                 solver.solve(node.statement)
 
                 // XXX: eval the entire body even if we don't reference anything directly
@@ -1094,7 +1162,7 @@ export function createStaticSolver(
                 const scopedState = new Map<string, any>()
                 scopedState.set(decl.name.text, solve(decl.initializer))
                 // getTerminalLogger().log('iterator', decl.name.text)
-                const solver = createSolver([...scopes, node], scopedState, getSubstitute)
+                const solver = createSolver(scopedState, getSubstitute)
                 solver.solve(node.statement)
 
                 // XXX: eval the entire body even if we don't reference anything directly
@@ -1148,7 +1216,7 @@ export function createStaticSolver(
             try {
                 const val = ts.isImportDeclaration(node)
                     ? fn()
-                    : substitute?.(node, scopes) ?? fn()
+                    : substitute?.(node) ?? fn()
 
                 return val
             } catch (e) {
@@ -1271,10 +1339,10 @@ export function createStaticSolver(
     }
 
     function createInstance(node: ts.ClassDeclaration, ...args: any[]) {
-        const solver = createSolver([], undefined)
+        const solver = createSolver()
         solver.solve(ts.findAncestor(node, ts.isSourceFile)!)
         const ctor = solver.solve(node)
-        const instance = ctor.call([], {}, ...args) // FIXME: add `node` to scope??
+        const instance = ctor.call({}, ...args)
         if (instance === unknown) {
             return unknown
         }
@@ -1283,7 +1351,7 @@ export function createStaticSolver(
             get: (target, prop, recv) => {
                 const val = Reflect.get(target, prop, recv)
                 if (typeof val === 'function') {
-                    return (...args: any[]) => val.call([], instance, ...args)
+                    return (...args: any[]) => val.call(instance, ...args)
                 }
 
                 return val
@@ -1292,12 +1360,12 @@ export function createStaticSolver(
     }
 
     function invoke(node: ts.FunctionDeclaration | ts.FunctionExpression | ts.ArrowFunction, thisArg: any, ...args: any[]) {
-        const solver = createSolver([], undefined)
+        const solver = createSolver()
         solver.solve(ts.findAncestor(node, ts.isSourceFile)!) // FIXME: figure out how to avoid this
 
         const fn = solver.solve(node)
 
-        return fn.call([node], thisArg, ...args)
+        return fn.call(thisArg, ...args)
     }
 
     return {

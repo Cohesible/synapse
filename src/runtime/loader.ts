@@ -119,6 +119,7 @@ export function createGetCredentials(auth: ReturnType<typeof createAuth>) {
 export interface BasicDataRepository {
     getDataSync(hash: string): Uint8Array
     getDataSync(hash: string, encoding: BufferEncoding): string
+    getDiskPath?(fileName: string): string
 }
 
 interface ModuleLoaderOptions {
@@ -594,13 +595,15 @@ export function createModuleLinker(fs: Pick<SyncFs, 'readFileSync'>, resolver: M
             case '.mjs':
             case '.mts':
                 return 'esm'
-            case '.cts':
             case '.cjs':
+            case '.cts':
                 return 'cjs'
             case '.json':
                 return 'json'
             case '.node':
                 return 'native'
+            case '.wasm':
+                return 'wasm'
         }
 
         if (spec.startsWith(pointerPrefix)) {
@@ -901,6 +904,10 @@ export function createModuleLoader(
         globalThis.global.WebAssembly = globals.WebAssembly
     }
 
+    if (useThisContext && sourceMapParser) {
+        registerSourceMapParser(sourceMapParser as SourceMapParser, globalThis.Error)
+    }
+
     const getPointerData = (pointer: DataPointer) => {
         const data = hydratePointers(dataRepository, pointer)
 
@@ -1011,6 +1018,15 @@ export function createModuleLoader(
     function createCjs(m: Module, opt?: ModuleCreateOptions) {
         if (m.typeHint === 'builtin') {
             return createSyntheticCjsModule(() => requireNodeModule(m.name))
+        } else if (m.typeHint === 'wasm') {
+            return createSyntheticCjsModule(() => {
+                const source = fs.readFileSync(m.fileName!)
+                const typedArray = new Uint8Array(source.buffer)
+                const wasmModule = new WebAssembly.Module(typedArray)
+                const inst = new WebAssembly.Instance(wasmModule)
+
+                return inst.exports
+            })
         }
 
         const ctx = opt?.context ?? getDefaultContext()
@@ -1027,6 +1043,7 @@ export function createModuleLoader(
                 wrappedProcess,
                 id => _createRequire(m.id, ctx)(id),
                 opt?.importModuleDynamically,
+                // m.cjs,
             ) 
         }
 
@@ -1083,7 +1100,15 @@ export function createModuleLoader(
             case '.json':
                 return createSyntheticCjsModule(() => JSON.parse(fs.readFileSync(fileName, 'utf-8')))
             case '.node':
-                return createSyntheticCjsModule(() => defaultRequire(fileName)) // XXX: FIXME: probably wrong
+                return createSyntheticCjsModule(module => {
+                    const resolved = dataRepository.getDiskPath
+                        ? dataRepository.getDiskPath(path.relative(workingDirectory, fileName))
+                        : fileName
+
+                    process.dlopen(module, resolved)
+
+                    return module.exports
+                })
         }
 
         const contents = fs.readFileSync(fileName, 'utf-8')
@@ -1131,7 +1156,7 @@ export function createModuleLoader(
 
     // Used to make sure `cwd()` works as expected.
     // Probably doesn't work with the working dir in `path.resolve`
-    const wrappedProcess = wrapProcess(process, workingDirectory, env) 
+    const wrappedProcess = wrapProcess(process, workingDirectory, dataRepository, env) 
     function _createRequire(location = dummyEntrypoint, ctx: Context | undefined = getDefaultContext(), linker = getLinker(ctx)) {
         const isVirtualImporter = location.startsWith(pointerPrefix)
         const resolveLocation = isVirtualImporter ? dummyEntrypoint : path.resolve(workingDirectory, location)
@@ -1158,14 +1183,23 @@ export function createModuleLoader(
             return resolver.resolve(id, location)
         }
 
-        Object.defineProperty(require, 'main', {
-            get: () => linker.getModuleFromLocation(location)?.cjs
-        })
-
         return Object.assign(require, { 
             resolve,
             cache: cacheProxy,
+            main: requireMain,
         })
+    }
+
+    let requireMain: CjsModule | undefined
+    function loadCjs(id: string, location = dummyEntrypoint) {
+        const isVirtualImporter = location.startsWith(pointerPrefix)
+        const resolveLocation = isVirtualImporter ? dummyEntrypoint : path.resolve(workingDirectory, location)
+        const ctx = getDefaultContext()
+        const linker = getLinker(ctx)
+        const cjs = linker.getCjs(isVirtualImporter ? location : resolveLocation, id)
+        requireMain = cjs
+
+        return cjs.evaluate() 
     }
 
     async function loadEsm(id: string, location = dummyEntrypoint) {
@@ -1176,15 +1210,16 @@ export function createModuleLoader(
         await linker.linkModule(esm)
 
         return esm.evaluate() 
-    }    
+    } 
 
     // XXX: too lazy to update dependencies
     return Object.assign(_createRequire, {
-        loadEsm
+        loadEsm,
+        loadCjs,
     })
 }
 
-export function createSyntheticCjsModule(evaluate: (exports: any) => any) {
+export function createSyntheticCjsModule(evaluate: (module: any) => any) {
     const cjs: CjsModule = {
         exports: {},
         evaluate: () => {
@@ -1193,7 +1228,7 @@ export function createSyntheticCjsModule(evaluate: (exports: any) => any) {
             }
 
             cjs.evaluated = true
-            cjs.exports = evaluate(cjs.exports)
+            cjs.exports = evaluate(cjs)
             return cjs.exports
         }
     }
@@ -1499,7 +1534,7 @@ export function createSourceMapParser(
             return isDebugMode ? undefined : false
         }
 
-        // Dead code
+        // Dead code?
         const sourceInfoNode = resolver?.getSource(fileName)
         const sourceInfo = sourceInfoNode?.source
         if (sourceInfo?.type === 'artifact') {
@@ -1717,10 +1752,23 @@ function wrapOs(os: typeof import('node:os')): typeof import('node:os') {
     return createModuleWrap(os, overrides)
 }
 
-function wrapProcess(proc: typeof process, workingDirectory: string, env?: Record<string, string | undefined>): typeof process {
+function wrapProcess(
+    proc: typeof process, 
+    workingDirectory: string,
+    dataRepository: BasicDataRepository,
+    env?: Record<string, string | undefined>
+): typeof process {
     const mergedEnv = { ...proc.env, ...env }
     const arch = mergedEnv['NODE_ARCH'] || proc.arch
     const platform = mergedEnv['NODE_PLATFORM'] || proc.platform
+
+    function dlopen(module: any, fileName: string) {
+        const resolved = dataRepository.getDiskPath
+            ? dataRepository.getDiskPath(path.relative(workingDirectory, fileName))
+            : fileName
+
+        proc.dlopen(module, resolved)
+    }
 
     return new Proxy(proc, {
         get: (target, prop, recv) => {
@@ -1732,6 +1780,8 @@ function wrapProcess(proc: typeof process, workingDirectory: string, env?: Recor
                 return platform
             } else if (prop === 'env') {
                 return mergedEnv
+            } else if (prop === 'dlopen') {
+                return dlopen // Only used for reading `.node` modules compiled from Zig
             } else if (prop === 'versions') {
                 // TODO: the same thing should be done in the synth loader too
                 return {

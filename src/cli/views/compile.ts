@@ -2,7 +2,7 @@ import * as nodeUtil from 'node:util'
 import { bold, colorize, dim, getDisplay, renderDuration } from '../ui'
 import { CompilerOptions } from '../../compiler/host'
 import { ResolvedProgramConfig } from '../../compiler/config'
-import { getLogger } from '../..'
+import { getLogger } from '../../logging'
 import { getPreviousDeploymentProgramHash, getTemplateWithHashes, readState } from '../../artifacts'
 import { TfJson } from '../../runtime/modules/terraform'
 import { getBuildTarget } from '../../execution'
@@ -167,6 +167,10 @@ export function createCompileView(inputOptions?: CompilerOptions & { hideLogs?: 
     getLogger().onSynthLog(ev => {
         if (inputOptions?.hideLogs) {
             getLogger().log(`<synth>`, ...ev.args)
+            return
+        }
+
+        if (ev.source === 'symEval' && !inputOptions?.logSymEval) {
             return
         }
 

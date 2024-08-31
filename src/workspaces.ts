@@ -3,7 +3,7 @@ import * as path from 'node:path'
 import * as fs from 'node:fs/promises'
 import { Fs, SyncFs } from './system'
 import { DeployOptions } from './deploy/deployment'
-import { Remote, findRepositoryDir, getCurrentBranch, getCurrentBranchSync, getDefaultBranch, listRemotes } from './git'
+import { Remote, findRepositoryDir, findRepositoryDirSync, getCurrentBranch, getDefaultBranch, listRemotes } from './git'
 import { getLogger } from './logging'
 import { getCiType, getHash, keyedMemoize, makeRelative, memoize, throwIfNotFileNotFoundError, tryReadJson, tryReadJsonSync } from './utils'
 import { glob } from './utils/glob'
@@ -119,6 +119,12 @@ export function getUserConfigFilePath() {
     return path.resolve(getUserSynapseDirectory(), 'config.json')
 }
 
+export function getTempZigBuildDir() {
+    const bt = getBuildTargetOrThrow()
+
+    return path.resolve(bt.buildDir, 'zig', getHash(toProgramRef(bt)))
+}
+
 export interface Project {
     readonly id: string
     readonly name: string
@@ -157,7 +163,16 @@ interface BuildTargetOptions {
     readonly environmentName?: Environment['name']
 }
 
-const getCurrentBranchCached = keyedMemoize(getCurrentBranch)
+const getCurrentBranchCached = keyedMemoize(async (dir: string) => {
+    // Reading the HEAD file directly is a bit faster than calling `git`
+    const headPath = path.resolve(dir, '.git', 'HEAD')
+    const head = await getFs().readFile(headPath, 'utf-8').catch(throwIfNotFileNotFoundError)
+    if (!head) {
+        return
+    }
+
+    return head.match(/^ref: refs\/heads\/(.+)$/)?.[1]
+})
 
 async function getDeploymentById(id: string) {
     const ents = await getEntities()
@@ -190,7 +205,7 @@ function getProjectDirectorySync(id: string) {
 }
 
 async function tryInitProject(cwd: string) {
-    const gitRepo = await findRepositoryDir(cwd)
+    const gitRepo = findRepositoryDirSync(cwd)
     if (!gitRepo) {
         return
     }
@@ -779,7 +794,7 @@ interface EntitiesFile {
 
 const getEntitiesFilePath = () => path.resolve(getUserSynapseDirectory(), 'entities.json')
 
-async function getEntities() {
+async function readEntities() {
     const ents = await tryReadJson<EntitiesFile>(getFs(), getEntitiesFilePath())
 
     // Backwards compat
@@ -790,8 +805,14 @@ async function getEntities() {
     return ents ?? { projects: {}, deployments: {} }
 }
 
+let entitiesCached: EntitiesFile | Promise<EntitiesFile>
+async function getEntities() {
+    return entitiesCached ??= readEntities()
+}
+
 // TODO: project directories within the home dir should be made relative
 async function setEntities(data: EntitiesFile) {
+    entitiesCached = data
     await getFs().writeFile(getEntitiesFilePath(), JSON.stringify(data, undefined, 4))
 }
 
@@ -1404,9 +1425,9 @@ function getRemotePackageId(branch: Branch, programId: string) {
     return environment.packageId
 }
 
-export async function getOrCreateRemotePackage() {
+export async function getOrCreateRemotePackage(useDefaultBranch?: boolean) {
     const bt = getBuildTargetOrThrow()
-    const totalState = await getBranchAwareState(bt.projectId, bt.branchName)
+    const totalState = await getBranchAwareState(bt.projectId, useDefaultBranch ? undefined : bt.branchName)
     if (!totalState) {
         throw new Error(`No project state found: ${bt.projectId}`)
     }

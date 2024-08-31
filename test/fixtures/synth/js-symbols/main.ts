@@ -1,20 +1,27 @@
 import { test, expectEqual } from 'synapse:test'
 
-
-if (Symbol.asyncDispose) {
+{
     let y = 0
-    const x = {
-        [Symbol.asyncDispose]: async () => {
-            y += 1
-        }
-    }
+    const x = { [Symbol.dispose]: () => { y += 1 } }
     
-    test('', async () => {
+    test('dipose', () => {
+        {
+            using _ = x
+        }
+        expectEqual(y, 1)
+    })        
+}
+
+{
+    let y = 0
+    const x = { [Symbol.asyncDispose]: async () => { y += 1 } }
+    
+    test('asyncDispose', async () => {
         {
             await using _ = x
         }
         expectEqual(y, 1)
-    })    
+    })        
 }
 
 let c = 0
@@ -34,5 +41,4 @@ test('iterator', () => {
 })
 
 // !commands
-// synapse deploy
 // synapse test

@@ -22,15 +22,34 @@ interface WebSocketServer {
     onConnect: (listener: (ws: WebSocket) => void) => { dispose: () => void }
 }
 
+interface MinimalSecureContext {
+    readonly cert: string | ArrayBufferView
+    readonly key: string | ArrayBufferView
+}
+
 interface WebSocketServerOptions {
     port?: number
     address?: string
-    secureContext?: tls.SecureContextOptions
+    secureContext?: MinimalSecureContext
     beforeUpgrade?: (request: HttpRequest) => Promise<HttpResponse | void> | HttpResponse | void
     httpRequestHandler?: (request: HttpRequest, body: any) => Promise<HttpResponse> | HttpResponse
 }
 
-export async function upgradeToWebsocket(req: http.IncomingMessage, socket: Duplex, isSecureContext = true): Promise<WebSocket | undefined> {
+interface MinimalIncomingMessage {
+    readonly url?: string
+    readonly headers: Record<string, string | undefined>
+}
+
+// Trying to avoid directly depending on `@types/node`
+interface SimpleDuplex {
+    on(event: string, listener: (...args: any[]) => void): this
+    once(event: string, listener: (...args: any[]) => void): this
+    write(chunk: string | ArrayBufferView, cb?: (err?: Error | null) => void): boolean
+    end(cb?: () => void): this
+    destroy(err?: Error): this
+}
+
+export async function upgradeToWebsocket(req: MinimalIncomingMessage, socket: SimpleDuplex, isSecureContext = true): Promise<WebSocket | undefined> {
     const key = req.headers['sec-websocket-key']
     const protocol = req.headers['sec-websocket-protocol']
     if (!key) {
@@ -76,7 +95,7 @@ export async function upgradeToWebsocket(req: http.IncomingMessage, socket: Dupl
 /** @internal */
 export async function createWebsocketServer(opt: WebSocketServerOptions = {}): Promise<WebSocketServer> {
     const server = opt?.secureContext 
-        ? https.createServer(opt.secureContext)
+        ? https.createServer(opt.secureContext as tls.SecureContextOptions) // Types are too strict, it doesn't need `Buffer`
         : http.createServer()
 
     const emitter = new EventEmitter()
@@ -152,7 +171,7 @@ export async function createWebsocketServer(opt: WebSocketServerOptions = {}): P
             return socket.end(resp + '\r\n')
         }
 
-        const ws = await upgradeToWebsocket(req, socket, !!opt.secureContext)
+        const ws = await upgradeToWebsocket(req as MinimalIncomingMessage, socket, !!opt.secureContext)
         if (!ws) {
             return
         }
@@ -200,7 +219,7 @@ export interface WebSocket {
     send: (data: string | Uint8Array) => Promise<void>
     close: (message?: string) => Promise<void>
     onClose: (listener: (code?: StatusCode, reason?: string) => void) => { dispose: () => void }
-    onMessage: (listener: (message: string | Buffer) => void) => { dispose: () => void }
+    onMessage: (listener: (message: string | Uint8Array) => void) => { dispose: () => void }
     onError: (listener: (error: unknown) => void) => { dispose: () => void }
 }
 
@@ -226,7 +245,7 @@ function createEvent<T extends any[], U extends string>(emitter: EventEmitter, t
     }
 }
 
-function upgradeSocket(socket: Duplex, url: URL, mode: 'client' | 'server' = 'server'): WebSocket {
+function upgradeSocket(socket: SimpleDuplex, url: URL, mode: 'client' | 'server' = 'server'): WebSocket {
     const emitter = new EventEmitter()
     const pongEvent: Event<[message: string]> = createEvent(emitter, 'pong')
     const errorEvent: Event<[error: unknown]> = createEvent(emitter, 'error')
@@ -274,7 +293,6 @@ function upgradeSocket(socket: Duplex, url: URL, mode: 'client' | 'server' = 'se
         try {
             const closePromise = new Promise<void>((resolve, reject) => {
                 socket.once('end', () => resolve())
-                // socket.once('error', reject)
             })
 
             await sendClose(StatusCode.Success, reason)

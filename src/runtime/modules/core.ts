@@ -159,14 +159,6 @@ export function getLogger(): Logger {
     return __getLogger()
 }
 
-// The resource 'backend':
-// 1. Logical and phyiscal identifiers
-// 2. At least one CRUD operation
-//    * Without a `Create` operation then resources must be instantiated by reference (i.e. a "data source")
-
-// More than one get/update operation pairs on a single resource implies that
-// the resource is actually composed of more than one resource
-
 export const context = Symbol.for('synapse.context')
 export const contextType = Symbol.for('synapse.contextType')
 const permissions = Symbol.for('synapse.permissions')
@@ -197,7 +189,10 @@ export function bindConstructorModel<T extends abstract new (...args: any[]) => 
 }
 
 /** @internal */
-export function bindFunctionModel<T extends (...args: any[]) => any>(fn: T, model: Binding<Parameters<T>, Awaited<ReturnType<T>>>): void {
+export function bindFunctionModel<T extends (this: U, ...args: any[]) => any, U = void>(
+    fn: T, 
+    model: Binding<Parameters<T>, Awaited<ReturnType<T>>, U>
+): void {
     _bindModel(fn, model, 'function')
 }
 
@@ -484,57 +479,32 @@ export declare function addTarget<
 // Maybe add it to `this`
 
 interface ResourceDefinition<
-    I extends object = object,
-    T extends I = I, 
+    T extends object = object, 
     U extends any[] = []
 > {
-    read(state: I): T | Promise<T>
-    create?(...args: U): T | Promise<T>
-    update?(state: T, ...args: U): T | Promise<T>
-    delete?(state: T, ...args: U): void | Promise<void>
-}
-
-interface ResourceDefinitionOptionalRead<
-    T extends object = object,
-    I extends object = T,
-    U extends any[] = []
-> {
-    read?(state: I): T | Promise<T>
+    read?(state: T): T | Promise<T>
     create(...args: U): T | Promise<T>
     update?(state: T, ...args: U): T | Promise<T>
     delete?(state: T, ...args: U): void | Promise<void>
+    import?(id: string): T | Promise<T>
 }
 
 type ResourceConstructor<
-    I extends object = object,
     T extends object = object, 
     U extends any[] = [],
-    D extends object = T
 > = {
     new (...args: U): Readonly<T>
-
-    // The below static method is only safe if the class behaves the same without any initialization logic
-    // import<P extends abstract new (...args: any[]) => any>(this: P, state: I): InstanceType<P>
 }
 
 export function defineResource<
     T extends object = object,
-    I extends object = T,
     U extends any[] = []
 >(
-    definition: ResourceDefinitionOptionalRead<T, I, U>
-): ResourceConstructor<I, T, U>
-
-export function defineResource<
-    I extends object = object,
-    T extends I = I, 
-    U extends any[] = []
->(
-    definition: ResourceDefinition<I, T, U>
-): ResourceConstructor<I, T, U>
+    definition: ResourceDefinition<T, U>
+): ResourceConstructor<T, U>
 
 export function defineResource(
-    definition: ResourceDefinition | ResourceDefinitionOptionalRead
+    definition: ResourceDefinition
 ): ResourceConstructor {
     if (typeof __getCurrentId === 'undefined' || typeof arguments[1] !== 'string') {
         return (class {}) as any
@@ -826,11 +796,42 @@ class CustomDataClass extends CustomData {
     }
 }
 
+const resourceDefinitionIds = new Map<string, number>()
 function createCustomResourceClass(id: string, definition: any): any {
     let def: Export
 
+    // XXX: definitions should use `getCurrentId`, `id` is too static
+    // TODO: we need to make sure that scopes aren't being captured from 
+    // lazy eval during target binding, right now `getCurrentId` itself is
+    // too unstable for class ctor instantiation
+    if (resourceDefinitionIds.has(id)) {
+        const base = id
+        const count = resourceDefinitionIds.get(base)!
+        id = `${base}-${count}`
+
+        resourceDefinitionIds.set(base, count + 1)
+    } else {
+        resourceDefinitionIds.set(id, 1)
+    }
+
     // Lazy init
-    const getDef = () => def ??= new Export(id, definition)
+    const getDef = () => {
+        if (def === undefined) {
+            return def = new Export(id, definition)
+        }
+
+        // TODO: this probably isn't needed despite being "technically correct"
+        // We want to strip `testContext` if the shared def is referenced outside of a test
+        const state = (def as any)[terraform.internalState]
+        if (state?.testContext) {
+            const current = __getContext().get('test-suite')?.[0]
+            if (!current) {
+                delete state['testContext']
+            }
+        }
+
+        return def
+    }
 
     return class extends CustomResource {
         static [terraform.customClassKey] = id

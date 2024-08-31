@@ -147,7 +147,7 @@ const moveableStr = '@@__moveable__'
 // an expression and we cannot figure out all possible values then we assume
 // any property could be accessed. 
 function pruneUnusedProperties(
-    table: Record<string | number, ExternalValue>, 
+    table: Record<string | number, ExternalValue | any[]>, 
     captured: any,
     getSourceFile: (pointer: string) => ts.SourceFile,
 ) {
@@ -169,7 +169,7 @@ function pruneUnusedProperties(
     const symbols = new Map<SerializedObject, Symbol>()
 
     for (const [k, val] of Object.entries(table)) {
-        if (!val.captured) continue
+        if (Array.isArray(val) || !val.captured) continue
 
         const sf = getSourceFile(val.module)
         const params = getCapturedNodes(sf)
@@ -313,7 +313,7 @@ function pruneUnusedProperties(
     }
 
     const pruneableResources = new Map<SerializedObject, [key: string, value: ResourceValue]>()
-    const newTable: Record<string | number, ExternalValue> = { ...table }
+    const newTable: Record<string | number, ExternalValue | any[]> = { ...table }
 
     function prune() {
         for (const [k, v] of usedProps) {
@@ -326,7 +326,7 @@ function pruneUnusedProperties(
                         const id = v2[moveableStr].id
                         if (id !== undefined) {
                             const resolved = table[id]
-                            if (resolved.valueType === 'resource') {
+                            if (!Array.isArray(resolved) && resolved.valueType === 'resource') {
                                 pruneableResources.set(k, [k2, resolved as ResourceValue])
                             }
                         }
@@ -384,7 +384,7 @@ function pruneUnusedProperties(
 }
 
 export function optimizeSerializedData(
-    table: Record<string | number, ExternalValue>, 
+    table: Record<string | number, ExternalValue | any[]>, 
     captured: any,
     getSourceFile: (pointer: string) => ts.SourceFile,
     writeDataSync: (buf: Uint8Array) => string
@@ -405,6 +405,10 @@ export function optimizeSerializedData(
     const constructors = new Map<string | number, any>()
     function visitValue(id: string | number) {
         const val = table[id]
+        if (Array.isArray(val)) {
+            return
+        }
+
         if (val.valueType === 'object') {
             const o = val as SerializedObject
             if (o.constructor) {
@@ -449,7 +453,7 @@ export function optimizeSerializedData(
     const constructed = new Map<ExternalValue, Set<ExternalValue>>()
     for (const [k, v] of newExpressions) {
         const val = table[k]
-        if (!val.captured) continue
+        if (Array.isArray(val) || !val.captured) continue
 
         const sf = v[0].getSourceFile()
         const params = getCapturedNodes(sf)
@@ -499,9 +503,9 @@ export function optimizeSerializedData(
     }
 
     const maybeClasses = new Set(constructors.values())
-    function maybePruneValue(id: string | number): ExternalValue {
+    function maybePruneValue(id: string | number): ExternalValue | any[] {
         const val = table[id]
-        if (!canPrune(val)) {
+        if (Array.isArray(val) || !canPrune(val)) {
             return visit(val)
         }
 
@@ -529,7 +533,7 @@ export function optimizeSerializedData(
         return visit(res)
     }
 
-    const newTable: Record<string | number, ExternalValue> = { ...table }
+    const newTable: Record<string | number, ExternalValue | any[]> = { ...table }
     function visit(obj: any): any {
         if (Array.isArray(obj)) {
             return obj.map(visit)

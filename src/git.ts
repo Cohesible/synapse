@@ -17,12 +17,6 @@ export interface Remote {
     readonly headBranch: string
 }
 
-async function isInWorkTree(dir: string) {
-    const output = await runGit(dir, ['rev-parse', '--is-inside-work-tree'])
-
-    return output.trim() === 'true'
-}
-
 // We simply check for a `.git` directory
 export async function findRepositoryDir(dir: string): Promise<string | undefined> {
     const gitDir = path.resolve(dir, '.git')
@@ -33,6 +27,19 @@ export async function findRepositoryDir(dir: string): Promise<string | undefined
     const parentDir = path.dirname(dir)
     if (parentDir !== dir) {
         return findRepositoryDir(parentDir)
+    }
+}
+
+// Sync lookup is a bit faster (ideal for serial startup logic)
+export function findRepositoryDirSync(dir: string): string | undefined {
+    const gitDir = path.resolve(dir, '.git')
+    if (getFs().fileExistsSync(gitDir)) {
+        return dir
+    }
+
+    const parentDir = path.dirname(dir)
+    if (parentDir !== dir) {
+        return findRepositoryDirSync(parentDir)
     }
 }
 

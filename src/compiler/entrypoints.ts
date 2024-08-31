@@ -3,7 +3,7 @@ import * as path from 'node:path'
 import { escapeRegExp, failOnNode, isRelativeSpecifier, keyedMemoize, memoize, throwIfNotFileNotFoundError } from '../utils'
 import { ResolvedProgramConfig } from './config'
 import { getFs } from '../execution'
-import { getLogger } from '..'
+import { getLogger } from '../logging'
 import { getFileHasher } from './incremental'
 import { getProgramFs } from '../artifacts'
 import { JsonFs } from '../system'
@@ -61,8 +61,6 @@ import { getWorkingDir } from '../workspaces'
 // 
 
 type Main = (...args: string[]) => Promise<number | void> | number | void 
-
-// process.exitCode <-- sets the exit code on exit
 
 export function isMainFunction(node: ts.FunctionDeclaration, getTypeChecker?: () => ts.TypeChecker) {
     if (node.name?.text !== 'main') {
@@ -326,8 +324,13 @@ export async function findAllBareSpecifiers(config: ResolvedProgramConfig, host:
         }
 
         const results = findInterestingSpecifiers(sf, resolver.resolveBareSpecifier)
-        const hasZigImport = results.zig.size > 0 ? true : undefined
-        specs[relPath] = { hash: h, specs: [...results.bare], mappings: resolver.getPerFileMappings(), hasZigImport }
+        specs[relPath] = { 
+            hash: h, 
+            specs: [...results.bare], 
+            mappings: resolver.getPerFileMappings(), 
+            zigImports: results.zig.size > 0 ? [...results.zig] : undefined,
+        }
+
         for (const d of results.bare) {
             bare.add(d)
         }
@@ -346,19 +349,42 @@ interface SpecDataElement {
     readonly hash: string
     readonly specs: string[]
     readonly mappings?: Record<string, string>
-    readonly hasZigImport?: boolean
+    readonly zigImports?: string[]
 }
+
+const specDataCache = new Map<Pick<JsonFs, 'writeJson'>, Record<string, SpecDataElement>>()
 
 async function saveSpecData(data: Record<string, SpecDataElement>, fs: Pick<JsonFs, 'writeJson'> = getProgramFs()) {
     await fs.writeJson(specsFileName, data)
+    specDataCache.set(fs, data)
 }
 
 async function getSpecData(fs: Pick<JsonFs, 'readJson'> = getProgramFs()) {
     return await fs.readJson<Record<string, SpecDataElement>>(specsFileName).catch(throwIfNotFileNotFoundError)
 }
 
-const _getSpecData = memoize(() => getSpecData())
+const _getSpecData = memoize(() => {
+    const fs = getProgramFs()
+    if (specDataCache.has(fs)) {
+        return specDataCache.get(fs)!
+    }
+    return getSpecData(fs)
+})
 
-export async function hasZigImport(relPath: string) {
-    return !!(await _getSpecData())?.[relPath].hasZigImport
+export async function getZigImports(relPath: string) {
+    return (await _getSpecData())?.[relPath]?.zigImports
 }
+
+// export async function getAllBareSpecifiers() {
+//     const data = await _getSpecData()
+//     if (!data) {
+//         return
+//     }
+
+//     const specs = new Set<string>()
+//     for (const v of Object.values(data)) {
+//         v.specs.forEach(spec => specs.add(spec))
+//     }
+
+//     return specs
+// }

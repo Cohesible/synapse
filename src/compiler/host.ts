@@ -4,7 +4,7 @@ import { Mutable, makeRelative, memoize, resolveRelative, sortRecord, strcmp, tr
 import { createTranspiler } from '../bundler'
 import { createrLoader } from '../loader'
 import { ResourceTransformer, generateModuleStub, getFqnComponents } from './transformer'
-import { createPermissionsBinder } from '../permissions'
+import { createCapturedSolver } from '../permissions'
 import { runTask } from '../logging'
 import { CompiledFile, createGraphCompiler, createRuntimeTransformer, createSerializer, getModuleType } from '../static-solver'
 import { getOrCreateDeployment, getWorkingDir } from '../workspaces'
@@ -13,16 +13,15 @@ import { PackageService, createPackageService, resolveBareSpecifier, resolveDefe
 import { SourceMapHost, emitChunk } from '../static-solver/utils'
 import { getLogger } from '../logging'
 import { createSourceMapParser, getArtifactSourceMap, hydratePointers } from '../runtime/loader'
-import { Artifact, CompiledChunk, LocalMetadata, ModuleBindingResult, createArtifactFs, getArtifactFs, getDataRepository, getProgramFs, getTargets, readInfraMappings, readModuleManifest, setTargets, toFs, writeInfraMappings, writeModuleManifest, } from '../artifacts'
-import { CombinedOptions } from '..'
+import { Artifact, CompiledChunk, LocalMetadata, ModuleBindingResult, getArtifactFs, getDataRepository, getProgramFs, getTargets, readInfraMappings, readModuleManifest, setTargets, toFs, writeInfraMappings, writeModuleManifest, } from '../artifacts'
 import { ModuleResolver, createModuleResolver } from '../runtime/resolver'
 import { SourceMapV3 } from '../runtime/sourceMaps'
-import { TemplateService } from '../templates'
 import { DeclarationFileHost, createDeclarationFileHost } from './declarations'
 import { ResourceTypeChecker } from './resourceGraph'
 import { coerceToPointer, isDataPointer, pointerPrefix, toAbsolute } from '../build-fs/pointers'
-import { getBuildTargetOrThrow, getFs } from '../execution'
+import { getBuildTargetOrThrow, getCurrentVersion, getFs } from '../execution'
 import { resolveValue } from '../runtime/modules/serdes'
+import type { TfJson } from '../runtime/modules/terraform'
 import { getCurrentPkg, getPackageJson } from '../pm/packageJson'
 import { getOutputFilename } from './config'
 import { getFileHasher } from './incremental'
@@ -34,12 +33,14 @@ interface SynthOptions {
     readonly deployTarget?: string
     // readonly backend?: Backend
     readonly entrypoint?: string
+    readonly logSymEval?: boolean
 
     // For modules
     readonly generateExports?: boolean
 }
 
 export interface CompilerOptions extends SynthOptions {
+    readonly debug?: boolean
     readonly noInfra?: boolean
     readonly noSynth?: boolean
     readonly sharedLib?: boolean
@@ -191,9 +192,7 @@ export class CompilerHost {
 
         return {
             text: Buffer.from(res.result.contents).toString('base64'),
-            //textHash: result.hash,
             sourcemap: res.sourcemap?.contents,
-            //sourcemapHash: sourcemap?.hash,
         }
     }
 
@@ -231,7 +230,7 @@ export class CompilerHost {
             const pointer = await programFs.writeData(
                 key,
                 Buffer.from(JSON.stringify(result), 'utf-8'),
-                { metadata: { sourcemaps, moduleId, sourceDelta: v.sourceDelta } }, // TODO: add support for using pointer as metadata
+                { metadata: { name: v.name, sourcemaps, moduleId, sourceDelta: v.sourceDelta } }, // TODO: add support for using pointer as metadata
             )
 
             return {
@@ -348,15 +347,21 @@ export class CompilerHost {
         const outDir = this.compilerOptions.outDir ?? this.rootDir
         const render = async (f: CompiledFile) => {
             const relPath = this.getOutputFilename(f.source)
-            const virtualOutfile = relPath.replace(/\.(?:t|j)(sx?)$/, `-${f.artifactName.slice(0, 48)}.js`)
-            const inputPath = path.resolve(outDir, path.relative(this.rootDir, f.path)) // Looks weird. Need to do this because TypeScript source maps assume it was emitted in the outdir
+            const virtualOutfile = relPath.replace(/\.(?:t|j)(sx?)$/, `-${f.name.slice(0, 48)}.js`)
+            // Looks weird. Need to do this because TypeScript source maps assume it was emitted in the outdir
+            const inputPath = path.resolve(outDir, path.relative(this.rootDir, f.path))
 
             const [runtime, infra] = await Promise.all([
                 this.renderArtifact(inputPath, f.data, virtualOutfile, false, f.sourcesmaps?.runtime),
                 this.renderArtifact(inputPath, f.infraData, virtualOutfile, true, f.sourcesmaps?.infra),
             ])
 
-            return { name: f.artifactName, runtime, infra, sourceDelta: resourceTransformer.getDeltas(f.sourceNode) }
+            return { 
+                name: f.name, 
+                runtime, 
+                infra, 
+                sourceDelta: resourceTransformer.getDeltas(f.sourceNode),
+            }
         }
 
         this.graphCompiler.onEmitFile(f => {
@@ -373,7 +378,7 @@ export class CompilerHost {
 
     private readonly sourcePromises = new Map<string, Promise<void>>()
     public addSource(name: string, outfile: string, isTsArtifact?: boolean) {
-        const p = getFileHasher().getHash(path.resolve(this.rootDir, name)).then(hash => {
+        const p = getFileHasher().getHash(resolveRelative(this.rootDir, name)).then(hash => {
             this.sources[name] = { outfile, hash, isTsArtifact }
         })
         this.sourcePromises.set(name, p)
@@ -412,7 +417,6 @@ export class CompilerHost {
             sourceFile = generateModuleStub(this.rootDir, this.graphCompiler, ts.getOriginalNode(sourceFile) as ts.SourceFile)
         }
 
-        // const handlers = !needsDeploy ? this.resourceTransformer.getReflectionTransformer() : undefined
         const { text } = emitChunk(this.sourceMapHost, sourceFile, undefined, { emitSourceMap: false, removeComments: true })
         const outfile = this.getOutputFilename(sourceFile.fileName)
         const transpiler = await this.getTranspiler()
@@ -562,13 +566,11 @@ type CompilationMode =
     | 'infra-stub'
     | 'no-synth'
 
-interface Sources {
-    [fileName: string]: {
-        hash: string
-        outfile: string
-        isTsArtifact?: boolean
-    }
-}
+type Sources = Record<string, {
+    hash: string
+    outfile: string
+    isTsArtifact?: boolean
+}>
 
 const sourcesFileName = `[#compile]__sources__.json`
 async function writeSources(fs: Pick<Fs, 'writeFile'>, sources: Sources) {
@@ -636,13 +638,12 @@ export async function synth(entrypoints: string[], deployables: string[], opt: S
     }, 1)
 
     // We do this after loading the index to account for any compiled `package.json`
-    const targets = resolveDeferredTargets(moduleResolver, deferredTargets)
+    const targets = resolveDeferredTargets(moduleResolver, deferredTargets) // This could become expensive with enough symbols
     const sourcemapParser = createSourceMapParser(vfs, moduleResolver, bt.workingDirectory)
 
     const getSource = (fileName: string, spec: string, virtualLocation: string, type: 'runtime' | 'infra' = 'runtime') => {
         if (!spec.startsWith(pointerPrefix)) {
             if (type === 'infra' && infraFiles[fileName]) {
-                // getLogger().log(`Mapped ${fileName} -> ${infraFiles[fileName]}`)
                 return vfs.readFileSync(infraFiles[fileName], 'utf-8')
             }
             return vfs.readFileSync(fileName, 'utf-8')
@@ -695,8 +696,7 @@ export async function synth(entrypoints: string[], deployables: string[], opt: S
         return sf
     }
 
-    const perms = createPermissionsBinder()
-    const solver = perms.createCapturedSolver(getSourceFile)
+    const solver = createCapturedSolver(getSourceFile)
     let permsCount = 0
     // FIXME: `thisArg` is a hack used for the specific case of checking ctor perms
     // would be cleaner to have a different function handle this case
@@ -739,18 +739,19 @@ export async function synth(entrypoints: string[], deployables: string[], opt: S
         return resolved
     })
 
-    if (opt.esm) {
-        const { terraform, permissions } = await loader.synthEsm(targetModules, runtime)
-    
-        getLogger().emitCompileEvent({
-            entrypoint: '',
-            template: terraform.main, 
-        })
-    
-        return terraform.main
+    function addSynapseVersion(template: TfJson) {
+        const version = getCurrentVersion()
+        const ext = (template as Mutable<TfJson>)['//'] ??= {}
+        ext.synapseVersion = `${version.semver}${version.revision ? `-${version.revision}` : ''}`
+
+        return template
     }
 
-    const { terraform, permissions } = loader.synth(targetModules, runtime)
+    const { terraform, permissions } = opt.esm 
+        ? await loader.synthEsm(targetModules, runtime)
+        : loader.synth(targetModules, runtime)
+
+    const template = addSynapseVersion(terraform.main)
 
     // if (permissions.length > 0) {
     //     getLogger().log(`Required permissions:`, permissions)
@@ -758,10 +759,10 @@ export async function synth(entrypoints: string[], deployables: string[], opt: S
 
     getLogger().emitCompileEvent({
         entrypoint: '',
-        template: terraform.main, 
+        template,
     })
 
-    return terraform.main
+    return template
 }
 
 interface Program {

@@ -51,6 +51,7 @@ function createTypescriptLoader() {
         loadEsbuildWithWorkersDisabled()
 
         // TODO: add option to configure sourcemap
+        // TODO: add transform cache to avoid calls to `esbuild`
         const contents = readFileSync(fileName)
         const res = esbuild.transformSync(contents, { format, loader: 'ts', sourcemap: 'inline' })
 
@@ -67,7 +68,7 @@ export function createMinimalLoader(useTsLoader = false) {
     const loader = createModuleLoader(
         { readFileSync }, 
         workingDirectory,
-        createModuleResolver({ readFileSync, fileExistsSync: existsSync }, workingDirectory),
+        createModuleResolver({ readFileSync, fileExistsSync: existsSync }, workingDirectory, useTsLoader),
         {
             codeCache,
             workingDirectory,
@@ -82,7 +83,7 @@ export function createMinimalLoader(useTsLoader = false) {
             return loader.loadEsm(id, origin)
         } 
 
-        return loader(origin)(id)
+        return loader.loadCjs(id, origin)
     }
 
     return { loadModule }

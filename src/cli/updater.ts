@@ -1,10 +1,14 @@
+import * as path from 'node:path'
 import * as github from '../utils/github'
 import * as child_process from 'node:child_process'
-import { getCurrentVersion } from '../execution'
+import { getCurrentVersion, getFs } from '../execution'
 import { compareVersions } from '../pm/versions'
 import { resolveBuildTarget } from '../build/builder'
-import { getLogger } from '..'
+import { getLogger } from '../logging'
 import { colorize, printLine } from './ui'
+import { homedir } from 'node:os'
+import { throwIfNotFileNotFoundError } from '../utils'
+import { rename } from '../system'
 
 
 // TODO:
@@ -43,15 +47,24 @@ export async function tryUpgrade(opt?: { force?: boolean }) {
     // Not using `printLine` here because something else will be writing to `stdout`
     process.stdout.write(`Found newer version ${updateInfo.version}. Upgrading...\n`)
 
+    const installDir = process.env.SYNAPSE_INSTALL ?? path.resolve(homedir(), '.synapse')
+    const execPath = path.resolve(installDir, 'app', 'bin', 'synapse.exe')
+    const oldExecPath = path.resolve(installDir, 'synapse-old.exe')
+
+    if (process.platform === 'win32') {
+        // We can't remove the executable directly if it's already running
+        await getFs().deleteFile(oldExecPath).catch(throwIfNotFileNotFoundError)
+        await rename(execPath, oldExecPath)
+    }
+
     const cmd = process.platform === 'win32'
         ? 'irm https://synap.sh/install.ps1 | iex'
         : 'curl -fsSL https://synap.sh/install | bash'
 
     await new Promise<void>((resolve, reject) => {
         const proc = child_process.spawn(cmd, { 
-            shell: true, 
+            shell: process.platform === 'win32' ? 'powershell.exe' : true, 
             stdio: 'inherit', 
-            detached: process.platform === 'win32', 
             windowsHide: true,
             env: { ...process.env, SYNAPSE_INSTALL_IS_UPGRADE: 'true', }
         })
@@ -59,15 +72,19 @@ export async function tryUpgrade(opt?: { force?: boolean }) {
         proc.on('error', reject)
         proc.on('exit', (code, signal) => {
             if (code || signal) {
-                reject(new Error(`Not zero exit-code or signal. code: ${code}; signal: ${signal}`))
+                const err = new Error(`Not zero exit-code or signal. code: ${code}; signal: ${signal}`)
+                reject(err)
             } else {
                 resolve()
             }
         })
-
+    }).catch(async e => {
         if (process.platform === 'win32') {
-            proc.unref()
-            proc.on('spawn', resolve)
+            if (!(await getFs().fileExists(execPath))) {
+                await rename(oldExecPath, execPath)
+            }
         }
+
+        throw e
     })
 }

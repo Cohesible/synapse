@@ -4,6 +4,7 @@ import type { LogProviderProps, LogQuery, LogEvent } from '../runtime/modules/co
 import { normalizeTerraform } from '../runtime/modules/serdes'
 import { memoize } from '../utils'
 import { getSynapseResourceInput, getSynapseResourceOutput, getSynapseResourceType, mapResource } from '../deploy/deployment'
+import { getLogger } from '../logging'
 
 interface ExtendedLogQuery extends LogQuery {
     readonly resourceName?: string
@@ -73,20 +74,42 @@ function createLogService() {
             }
         }
 
-        const events: LogEventWithResource[] = []
-        for (const [k, v] of Object.entries(res)) {
-            const resp = await v.queryFn(v.state, query)
+        async function doQuery(resourceId: string) {
+            const val = res[resourceId]
+            if (!val) {
+                throw new Error(`Missing query provider for resource: ${resourceId}`)
+            }
+
+            const resp = await val.queryFn(val.state, query)
             const addResource = (events: LogEvent[]) => events.map(ev => ({
-                resourceId: k,
+                resourceId,
                 ...ev,
             }))
 
             if (Array.isArray(resp)) {
-                events.push(...addResource(resp))
-            } else {
-                for await (const page of resp) {
-                    events.push(...addResource(page))
-                }
+                return addResource(resp)
+            }
+
+            const events: LogEventWithResource[] = []
+            for await (const page of resp) {
+                events.push(...addResource(page))
+            }
+            return events
+        }
+
+        const queries: Promise<LogEventWithResource[] | void>[] = []
+        for (const [k, v] of Object.entries(res)) {
+            const eventsPromise = doQuery(k).catch(e => {
+                getLogger().warn(`Failed to get logs from resource "${k}"`, e)
+            })
+            queries.push(eventsPromise)
+        }
+
+        const events: LogEventWithResource[] = []
+        for (const query of queries) {
+            const result = await query
+            if (result) {
+                events.push(...result)
             }
         }
 

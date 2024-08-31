@@ -1,6 +1,6 @@
 import type { TerraformSourceMap, Symbol, TfJson } from './runtime/modules/terraform'
 import { createMinHeap, createTrie, isNonNullable, keyedMemoize, levenshteinDistance } from './utils'
-import { getLogger } from '.'
+import { getLogger } from './logging'
 import { parseModuleName } from './templates'
 import { TfState } from './deploy/state'
 
@@ -467,6 +467,29 @@ export function getRenderedStatementFromScope(scope: ResolvedScope): string {
     return name
 }
 
+export function getKeyFromScopes(scopes: ResolvedScope[]) {
+    if (scopes.length === 0) {
+        throw new Error('No scopes provided')
+    }
+
+    const parts: string[] = []
+    for (const s of scopes) {
+        if (s.assignment) {
+            parts.push(s.assignment.name)
+        }
+        if (s.namespace) {
+            parts.push(...s.namespace.map(x => x.name))
+        }
+        parts.push(s.callSite.name)
+    }
+
+    return parts.join('--')
+
+    //const moduleName = scopes[0].callSite.fileName
+
+    //return `${moduleName}_${parts.join('--')}`
+}
+
 export type SymbolGraph = ReturnType<typeof createSymbolGraph>
 export function createSymbolGraph(sourceMap: TerraformSourceMap, resources: Record<string, any>) {
     let idCounter = 0
@@ -637,7 +660,7 @@ export function createSymbolGraph(sourceMap: TerraformSourceMap, resources: Reco
         return resourceToNode.has(key)
     }
 
-    function matchSymbolNodes(name: string, fileName?: string) {
+    function shallowMatchSymbolNodes(name: string, fileName?: string) {
         const nodes: SymbolNode[] = []
         for (const [k, v] of symbolMap) {
             if (k.name === name && (!fileName || k.fileName === fileName)) {
@@ -646,6 +669,39 @@ export function createSymbolGraph(sourceMap: TerraformSourceMap, resources: Reco
         }
 
         return nodes
+    }
+
+    function matchSymbolNodes(name: string, fileName?: string) {
+        const segments = name.split('/')
+        const root = shallowMatchSymbolNodes(segments[0], fileName)
+        if (segments.length === 1 || root.length !== 1) {
+            return root
+        }        
+
+        const node = root[0]
+        const next = segments[1]
+        const resources: Resource[] = []
+        for (const r of node.value.resources) {
+            if (r.scopes[1]?.assignment?.name === next || r.scopes[1]?.callSite.name === next) {
+                resources.push(r)
+            }
+        }
+
+        if (resources.length === 0) {
+            return []
+        }
+
+        const newNode: SymbolNode = {
+            children: [],
+            type: 'symbol',
+            value: {
+                id: -1,
+                ...resources[0].scopes[1].assignment!,
+                resources,
+            },
+        }
+
+        return [newNode]
     }
 
     function getConfig(key: string): object | undefined {
@@ -772,7 +828,6 @@ interface Resource {
     readonly scopes: ResolvedScope[]
     readonly fileName: string
 }
-
 
 // Goal: minimize # of ops for a given deploy
 // Cost is determined by the LD between the last deployed config vs. now
@@ -1946,6 +2001,153 @@ export function getMovesWithSymbols(moves: Move[], oldGraph: SymbolGraph, newGra
         }
     }
     return result
+}
+
+// Segments are delimited by `/` and describe named scopes
+// `@` is used for ambiguous instance selection e.g. `foo@1` specifies the 2nd occurrence of `foo`
+
+function parseSymbolRefSegment(segment: string) {
+    // TODO: figure out escaping rules to work well with shells
+    const scanner = createJsonPathScanner(segment)
+    const scanned = Array.from(scanner.scan())
+    if (scanned.length === 0) {
+        throw new Error(`Failed to parse resource ref segment: ${segment}`)
+    }
+
+    const [name, selection] = scanned[0].split('@')
+
+    if (selection && isNaN(Number(selection))) {
+        throw new Error(`Not a number: ${selection}`)
+    }
+
+    return {
+        name,
+        selection: selection ? Number(selection) : undefined,
+        accessors: scanned.slice(1),
+    }
+}
+
+function parseSymbolRef(ref: string) {
+    let filename: string | undefined
+    let quote: '"' | "'" | undefined
+    const segments: any[] = []
+
+    let j = 0
+    for (let i = 0; i < ref.length; i++) {
+        if (quote) {
+            if (ref[i] === quote) {
+                quote = undefined
+            }
+
+            continue
+        }
+
+        if (ref[i] === '#' && filename === undefined) {
+            filename = ref.slice(0, i)
+            j = i + 1
+        } else if (ref[i] === '/' && filename !== undefined) {
+            segments.push(parseSymbolRefSegment(ref.slice(j, i)))
+            j = i + 1
+        } else if (ref[i] === '"' || ref[i] === "'") {
+            quote = ref[i] as any
+        } else if (i === ref.length - 1 && filename === undefined) {
+            filename = ''
+            i = 0
+        }
+    }
+
+    if (j !== ref.length) {
+        segments.push(parseSymbolRefSegment(ref.slice(j)))
+    }
+
+    return {
+        filename,
+        segments,
+    }
+}
+
+// copied from `synapse:http`
+function createJsonPathScanner(expression: string) {
+    let pos = 0
+
+    // This state is entered when encountering a '['
+    function parseElementKey() {
+        const c = expression[pos]
+        if (c === "'" || c === '"') {
+            for (let i = pos + 1; i < expression.length; i++) {
+                if (expression[i] === c) {
+                    if (expression[i + 1] !== ']') {
+                        throw new Error(`Expected closing bracket at position ${pos}`)
+                    }
+
+                    const token = expression.slice(pos + 1, i)
+                    pos = i + 2
+
+                    return token
+                }
+            }
+        } else {
+            if ((c < '0' || c > '9') && c !== '-') {
+                throw new Error(`Expected a number or - at position ${pos}`)
+            }
+
+            for (let i = pos + 1; i < expression.length; i++) {
+                const c = expression[i]
+                if (c  === ']') {
+                    const token = expression.slice(pos, i)
+                    pos = i + 1
+
+                    return token
+                }
+
+                if (c < '0' || c > '9') {
+                    throw new Error(`Expected a number at position ${pos}`)
+                }
+            }
+        }
+
+        throw new Error(`Malformed element access at position ${pos}`)
+    }
+
+    function parseIdentifer() {
+        for (let i = pos; i < expression.length; i++) {
+            const c = expression[i]
+            if (c === '[' || c === '.') {
+                const token = expression.slice(pos, i)
+                pos = i
+
+                return token
+            }
+        }
+
+        const token = expression.slice(pos)
+        pos = expression.length
+
+        return token
+    }
+
+    function* scan() {
+        if (pos === expression.length) {
+            return
+        }
+
+        while (pos < expression.length) {
+            const c = expression[pos]
+            if (c === '[') {
+                pos += 1
+    
+                yield parseElementKey()
+            } else if (c === '.') {
+                pos += 1
+    
+                yield parseIdentifer()
+            } else {
+                yield parseIdentifer()
+            }
+        }
+    }
+
+    return { scan }
 }
 
 // TODO:

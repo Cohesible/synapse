@@ -39,7 +39,7 @@ export function createKeyService() {
             ])
         }
     }) {
-        async sign(data: string | Buffer) {
+        async sign(data: string | Uint8Array) {
             const location = `${this.id}.private`
             const privateKey = await importPrivateEdwardsKey(await getKeyData(keyBucket, location))
             const buffer = typeof data === 'string' ? Buffer.from(data) : data
@@ -47,7 +47,7 @@ export function createKeyService() {
             return crypto.subtle.sign('Ed448', privateKey, buffer)
         }
     
-        async verify(data: string | Buffer, signature: Buffer) {
+        async verify(data: string | Uint8Array, signature: Uint8Array) {
             const keyData = await this.getPublicKey()
             const publicKey = await importPublicEdwardsKey(keyData)
             const buffer = typeof data === 'string' ? Buffer.from(data) : data
@@ -95,7 +95,7 @@ export function createKeyService() {
             ])
         }
     }) {
-        async sign(data: string | Buffer) {
+        async sign(data: string | Uint8Array) {
             const location = `${this.id}.private`
             const keyData = Buffer.from(await getKeyData(keyBucket, location))
             const privateKey = crypto.createPrivateKey(keyData)
@@ -104,7 +104,7 @@ export function createKeyService() {
             return signer.update(data).sign(privateKey)
         }
     
-        async verify(data: string | Buffer, signature: Buffer) {
+        async verify(data: string | Uint8Array, signature: Uint8Array) {
             const location = `${this.id}.public`
             const publicKey = crypto.createPublicKey(await getKeyData(keyBucket, location))
             const verifier = crypto.createVerify('RSA-SHA256')
@@ -165,8 +165,8 @@ export interface JsonWebKey {
 export interface KeyPair {
     readonly alg: string
     readonly crv?: string
-    sign(data: string | Buffer): Promise<ArrayBuffer>
-    verify(data: string | Buffer, signature: Buffer): Promise<boolean>
+    sign(data: string | Uint8Array): Promise<ArrayBuffer>
+    verify(data: string | Uint8Array, signature: Uint8Array): Promise<boolean>
     getPublicWebKey(): Promise<JsonWebKey> 
 }
 
@@ -181,13 +181,13 @@ export async function createEdwardsKeyPair() {
     return { publicKey, privateKey }
 }
 
-export async function importPublicEdwardsKey(keyData: Buffer) {
+export async function importPublicEdwardsKey(keyData: Uint8Array) {
     const key = await crypto.subtle.importKey('raw', keyData, { name: 'Ed448' }, true, ['verify'])
 
     return key
 }
 
-export async function importPrivateEdwardsKey(keyData: Buffer) {
+export async function importPrivateEdwardsKey(keyData: Uint8Array) {
     const key = await crypto.subtle.importKey('pkcs8', keyData, { name: 'Ed448' }, true, ['sign'])
 
     return key

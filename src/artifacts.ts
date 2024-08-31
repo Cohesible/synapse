@@ -37,6 +37,9 @@ export interface LocalMetadata {
 
     readonly packageDependencies?: any
 
+    // This is for things like `synapse:*` which are resolved based on the runtime
+    readonly ambientDependencies?: string[]
+
     readonly sourceDelta?: { line: number; column: number }
     // TODO: use a generic `data` field for everything except dependencies/pointers
 }
@@ -76,7 +79,7 @@ export interface SerializedState {
 
 export interface DeployedModule {
     readonly kind: 'deployed'
-    readonly table: Record<string | number, ExternalValue>
+    readonly table: Record<string | number, ExternalValue | any[]>
     readonly captured: any
     readonly rendered?: string
 }
@@ -228,6 +231,7 @@ function cow<T extends Record<string, any>>(val: T): T {
 // * Attributes (metadata)
 
 interface ResolveArtifactOpts {
+    sync?: boolean
     name?: string
     extname?: string
     filePath?: string
@@ -252,6 +256,7 @@ interface RootArtifactStore {
     getMetadata(hash: string, source: string): ArtifactMetadata
     getMetadata2(pointer: string): Promise<ArtifactMetadata>
 
+    resolveArtifact(hash: string, opt: ResolveArtifactOpts & { sync: true }): string
     resolveArtifact(hash: string, opt?: ResolveArtifactOpts): Promise<string> | string
 
     deleteData(hash: string): Promise<void>
@@ -664,7 +669,8 @@ export interface BuildFsFragment {
     writeArtifactSync(data: Uint8Array, metadata?: LocalMetadata): string
     readArtifact(pointer: string): Promise<Uint8Array>
     readArtifactSync(pointer: string): Uint8Array
-    resolveArtifact(pointer: string, opt?: ResolveArtifactOpts): Promise<string>
+    resolveArtifact(pointer: string, opt: ResolveArtifactOpts & { sync: true }): string
+    resolveArtifact(pointer: string, opt?: ResolveArtifactOpts): Promise<string> | string
 
     writeData2(data: any, metadata?: LocalMetadata): Promise<DataPointer>
     readData2(pointer: string): Promise<any>
@@ -1081,7 +1087,9 @@ export function createBuildFsFragment(repo: DataRepository, index: BuildFsIndex,
         return allFiles
     }
 
-    async function resolveArtifact(pointer: string, opt?: ResolveArtifactOpts) {
+    function resolveArtifact(pointer: string, opt: ResolveArtifactOpts & { sync: true }): string
+    function resolveArtifact(pointer: string, opt?: ResolveArtifactOpts): Promise<string> | string
+    function resolveArtifact(pointer: string, opt?: ResolveArtifactOpts) {
         const hash = getArtifactName(pointer)
 
         return repo.resolveArtifact(hash, opt)
@@ -2071,14 +2079,17 @@ export interface DataRepository extends RootArtifactStore {
     hasDataSync(hash: string): boolean
     listHeads(): Promise<Head[]>
     serializeBuildFs(buildFs: ReadonlyBuildFs): Promise<Record<string, Uint8Array>>
+    serializeBuildFs(buildFs: ReadonlyBuildFs, excluded: Iterable<string>): Promise<[objects: Record<string, Uint8Array>, excluded: Set<string>]>
+
     // commit(head: Head['id'], hash: string): Promise<Head>
 
     getDataDir: () => string
     getLocksDir: () => string
+    getBlocksDir: () => string
 
     getRootBuildFs(id: string): Promise<ReturnType<typeof createBuildFsFragment>> | ReturnType<typeof createBuildFsFragment>
     getRootBuildFsSync(id: string): ReturnType<typeof createBuildFsFragment>
-    copyFrom(repo: DataRepository, buildFs: ReadonlyBuildFs, pack?: boolean): Promise<void>
+    copyFrom(repo: DataRepository, buildFs: ReadonlyBuildFs, pack?: boolean | 'both', previous?: ReadonlyBuildFs): Promise<void>
 }
 
 function getStoreHashes(index: BuildFsIndex) {
@@ -2605,13 +2616,29 @@ export async function createMountedFs(procId: string, workingDir: string, mounts
     return toFs(workingDir, bfs.root, getFs())
 }
 
-export function createTempMountedFs(index: BuildFsIndex, workingDir: string, mounts?: Record<string, ReadonlyBuildFs>): Fs & SyncFs & { addMounts: (mounts: Record<string, ReadonlyBuildFs>) => void } {
+export function createTempMountedFs(
+    index: BuildFsIndex, 
+    workingDir: string, 
+    mounts?: Record<string, ReadonlyBuildFs>
+): Fs & SyncFs & { addMounts: (mounts: Record<string, ReadonlyBuildFs>) => void; getDiskPath: (fileName: string) => string } {
     const repo = getDataRepository()
     const bfs = createBuildFsFragment(repo, index)
 
     function addMounts(mounts: Record<string, ReadonlyBuildFs>) {
         for (const [k, v] of Object.entries(mounts)) {
             bfs.root.mount(k, v)
+        }
+    }
+
+    function getDiskPath(fileName: string) {
+        try {
+            const pointer = bfs.getPointer(fileName)
+            
+            return bfs.resolveArtifact(pointer, { sync: true })
+        } catch(e) {
+            throwIfNotFileNotFoundError(e)
+
+            return fileName
         }
     }
 
@@ -2622,6 +2649,7 @@ export function createTempMountedFs(index: BuildFsIndex, workingDir: string, mou
     return {
         ...toFs(workingDir, bfs.root, getFs()),
         addMounts,
+        getDiskPath,
     }
 }
 
@@ -3043,6 +3071,8 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
 
     // PERF
 
+    const printCountsOnFlush = false
+
     let bytesWritten = 0
     let bytesSaved = 0
     const sizes: Record<string, number> = {}
@@ -3055,10 +3085,6 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
         const totals = Object.fromEntries(
             Object.entries(counts).map(([k, v]) => [k, Object.values(v as Record<string, number>).reduce((a, b) => a + b, 0)])
         ) as { [P in keyof PerformanceCounts]: number }
-
-        if (Object.values(totals).reduce((a, b) => a + b, 0) < 25) {
-            return
-        }
 
         getLogger().debug(`Artifact repo perf totals -> ${Object.entries(totals).map(([k, v]) => `${k}: ${v}`).join(', ')}`)
         getLogger().debug(`  Bytes written: ${bytesWritten}`)
@@ -3082,8 +3108,6 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
             }
         }
     }
-
-    // process.on('exit', printCounts)
 
     // END PERF
 
@@ -3131,26 +3155,38 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
         writeAgain = true
     }
 
+    const cachedHeads = new Map<string, Promise<Head | undefined>>()
     function readHead(id: string): Promise<Head | undefined> {
+        if (cachedHeads.has(id)) {
+            return cachedHeads.get(id)!
+        }
+
         if (pendingHeadWrites.has(id)) {
             return pendingHeadWrites.get(id)!
         }
 
-        return fs.readFile(getHeadPath(id), 'utf-8').then(JSON.parse).catch(throwIfNotFileNotFoundError)
+        const p = fs.readFile(getHeadPath(id), 'utf-8').then(JSON.parse).catch(throwIfNotFileNotFoundError)
+        cachedHeads.set(id, p)
+
+        return p
     }
 
-    function writeHead(id: string, head: Head | undefined): Promise<void> {
+    function writeHead(id: string, head: Head | undefined): Promise<unknown> {
         if (pendingHeadWrites.has(id)) {
             throw new Error(`Concurrent write to head: ${id}`)
         }
 
-        const p = head !== undefined
+        const writeOrDelete = head !== undefined
             ? fs.writeFile(getHeadPath(id), Buffer.from(JSON.stringify(head), 'utf-8'))
             : fs.deleteFile(getHeadPath(id))
 
-        pendingHeadWrites.set(id, p.then(() => head).finally(() => pendingHeadWrites.delete(id)))
+        const promise = writeOrDelete.then(() => head)
+            .finally(() => pendingHeadWrites.delete(id))
 
-        return p
+        cachedHeads.set(id, Promise.resolve(head))
+        pendingHeadWrites.set(id, promise)
+
+        return promise
     }
 
     async function listHeads() {
@@ -3165,7 +3201,7 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
     }
 
     async function hasBlock(hash: string) {
-        inc('has', hash)
+        printCountsOnFlush && inc('has', hash)
 
         return fs.fileExists(getBlockPath(hash))
     }
@@ -3190,7 +3226,7 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
     }
 
     async function hasData(hash: string) {
-        inc('has', hash)
+        printCountsOnFlush && inc('has', hash)
         if (isNullHash(hash)) {
             return true
         }
@@ -3199,7 +3235,7 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
     }
 
     function hasDataSync(hash: string) {
-        inc('has', hash)
+        printCountsOnFlush && inc('has', hash)
         if (isNullHash(hash)) {
             return true
         }
@@ -3207,32 +3243,84 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
         return fs.fileExistsSync(getDataPath(hash))
     }
 
-    const getNullData = memoize(() => Buffer.from(JSON.stringify(null)))
-
-    async function readData(hash: string) {
-        inc('read', hash)
-        if (isNullHash(hash)) {
-            return getNullData()
+    function scanBlocks(hash: string, hint?: string) {
+        if (hint) {
+            const block = loadedBlocks.get(hint)
+            if (block?.hasObject(hash)) {
+                return block.readObject(hash)
+            }
         }
 
-        const p = getDataPath(hash)
+        for (const [k, v] of loadedBlocks) {
+            if (k === hint) continue
 
-        return pendingWrites.get(p)?.data ?? fs.readFile(p)
+            if (v.hasObject(hash)) {
+                return v.readObject(hash)
+            }
+        }
+
+        for (const k of deferredBlocks) {
+            deferredBlocks.delete(k)
+
+            try {
+                _openFsBlock(k, true)
+                const block = loadedBlocks.get(k)!
+                if (block.hasObject(hash)) {
+                    return block.readObject(hash)
+                }
+            } catch (err) {
+                throwIfNotFileNotFoundError(err)
+            }
+        }
     }
 
-    function readDataSync(hash: string) {
-        inc('read', hash)
+    const getNullData = memoize(() => Buffer.from(JSON.stringify(null)))
+    let nullDataPromise: Promise<Buffer> | undefined
+
+    function _readData(hash: string, isAsync?: false): Buffer
+    function _readData(hash: string, isAsync: true): Promise<Buffer> 
+    function _readData(hash: string, isAsync?: boolean) {
+        printCountsOnFlush && inc('read', hash)
+
         if (isNullHash(hash)) {
-            return getNullData()
+            return isAsync ? nullDataPromise ??= Promise.resolve(getNullData()) : getNullData()
         }
 
         const p = getDataPath(hash)
         const d = pendingWrites.get(p)?.data
         if (d !== undefined) {
-            return d
+            return isAsync ? Promise.resolve(d) : d
         }
 
-        return fs.readFileSync(p)
+        function handleError(e: unknown) {
+            throwIfNotFileNotFoundError(e)
+
+            const scanned = scanBlocks(hash)
+            if (scanned) {
+                writeData(hash, scanned)
+                return scanned
+            }
+
+            throw e
+        }
+
+        if (!isAsync) {
+            try {
+                return fs.readFileSync(p)
+            } catch (e) {
+                return handleError(e)
+            }
+        }
+
+        return fs.readFile(p).catch(handleError)
+    }
+
+    function readData(hash: string) {
+        return _readData(hash, true)
+    }
+
+    function readDataSync(hash: string) {
+        return _readData(hash)
     }
 
     function throwIfNotFileExistsError(err: unknown): never | void {
@@ -3244,6 +3332,8 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
     // Storing the data is needed to support synchronous reads with async writes
     const didWrite = new Set<string>([getNullHash()])
     const pendingWrites = new Map<string, { promise: Promise<void>, data: Uint8Array }>()
+    const loadedBlocks = new Map<string, ReturnType<typeof openBlock>>()
+    const deferredBlocks = new Set<string>()
 
     function _writeData(hash: string, data: Uint8Array, isAsync?: false): void
     function _writeData(hash: string, data: Uint8Array, isAsync: true): Promise<void> 
@@ -3252,7 +3342,7 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
             return isAsync ? Promise.resolve() : void 0
         }
 
-        inc('write', hash)
+        printCountsOnFlush && inc('write', hash)
 
         function end(e?: unknown) {
             didWrite.add(hash)
@@ -3311,6 +3401,7 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
 
     async function getBuildFs(hash: string) {
         const index = await _getFsIndex(hash)
+        _deferBlocks(index)
 
         return { hash, index }
     } 
@@ -3376,11 +3467,13 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
         return p
     }
 
+    function resolveArtifact(hash: string, opt: ResolveArtifactOpts & { sync: true }): string
+    function resolveArtifact(hash: string, opt?: ResolveArtifactOpts): Promise<string> | string
     function resolveArtifact(hash: string, opt?: ResolveArtifactOpts) {
         const dest = getDataPath(hash)
 
         // XXX
-        if (opt?.noWrite) {
+        if (opt?.noWrite || opt?.sync) {
             if (opt.extname || opt.filePath) {
                 throw new Error(`Cannot use other options with "noWrite"`)
             }
@@ -3575,6 +3668,7 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
         deleteDataSync,
         getDataDir,
         getLocksDir,
+        getBlocksDir,
         getMetadata2,
         getRootBuildFs,
         getRootBuildFsSync,
@@ -3588,15 +3682,27 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
         return { hash, index }
     }
 
-    async function serializeBuildFs2(buildFs: ReadonlyBuildFs, artifacts: Set<string>) {
+    async function _serializeBuildFs(buildFs: ReadonlyBuildFs) {
         const objects: [string, string][] = []
+        const result = new Set<string>()
+        const visited = new Map<string, Set<string>>()
+
+        function addVisited(storeHash: string, hash: string) {
+            result.add(storeHash)
+            result.add(hash)
+            objects.push([storeHash, hash])
+            if (!visited.has(storeHash)) {
+                visited.set(storeHash, new Set())
+            }
+            visited.get(storeHash)!.add(hash)
+        }
 
         for (const f of Object.values(buildFs.index.files)) {
             const storeHash = f.storeHash ?? buildFs.index.stores[f.store].hash
-            artifacts.add(f.hash)
-            artifacts.add(storeHash)
             if (!isNullHash(storeHash)) {
-                objects.push([storeHash, f.hash])
+                addVisited(storeHash, f.hash)
+            } else {
+                result.add(f.hash)
             }
         }
 
@@ -3607,14 +3713,14 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
             if (metadata.dependencies) {
                 for (const [k, v] of Object.entries(metadata.dependencies)) {
                     for (const d of v) {
-                        if (artifacts.has(d)) continue
                         if (isNullHash(k)) {
-                            artifacts.add(d)
+                            result.add(d)
                             continue
                         }
-                        objects.push([k, d])
-                        artifacts.add(k)
-                        artifacts.add(d)
+
+                        if (!visited.get(k)?.has(d)) {
+                            addVisited(k, d)
+                        }
                     }
                 }
             }
@@ -3622,73 +3728,33 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
                 for (const h of Object.values(metadata.sourcemaps)) {
                     const d = toDataPointer(h)
                     const { hash, storeHash } = d.resolve()
-                    artifacts.add(hash)
+                    result.add(hash)
                     if (!isNullHash(storeHash)) {
-                        artifacts.add(storeHash)
+                        result.add(storeHash)
                     }
                 }
             }
         }
+
+        return result
     }
 
-    async function serializeBuildFs(buildFs: ReadonlyBuildFs): Promise<Record<string, Uint8Array>> {
-        if (await hasBlock(buildFs.hash)) {
+    async function serializeBuildFs(buildFs: ReadonlyBuildFs): Promise<Record<string, Uint8Array>>
+    async function serializeBuildFs(buildFs: ReadonlyBuildFs, exclude: Iterable<string>): Promise<[objects: Record<string, Uint8Array>, excluded: Set<string>]>
+    async function serializeBuildFs(buildFs: ReadonlyBuildFs, exclude?: Iterable<string>) {
+        const excludeSet = exclude ? new Set(exclude) : undefined
+
+        if (await hasBlock(buildFs.hash) && !exclude) {
             const data = await fs.readFile(getBlockPath(buildFs.hash))
             const block = openBlock(Buffer.isBuffer(data) ? data : Buffer.from(data))
+            const objects = Object.fromEntries(block.listObjects().map(h => [h, block.readObject(h)]))
 
-            return Object.fromEntries(block.listObjects().map(h => [h, block.readObject(h)]))
+            return objects
         }
 
         const stores = getStoreHashes(buildFs.index)
-        const artifacts = new Set([buildFs.hash])
-
-        async function visitStore(hash: string, stack = [hash]) {
-            async function _getStore() {
-                try {
-                    return await getStore(hash)
-                } catch (e) {
-                    const trace = stack.map(x => `  ${x}`).join('\n')
-                    getLogger().error('Failed to find object. Trace:\n', trace)
-                    throw e
-                }
-            }
-
-            const s = await _getStore()
-            artifacts.add(hash)
-
-            for (const [k2, v2] of Object.entries(await s.listArtifacts())) {
-                for (const [k3, v3] of Object.entries(v2)) {
-                    artifacts.add(k3)
-
-                    if (v3.dependencies) {
-                        const storePromises: Promise<void>[] = []
-                        for (const [d, deps] of Object.entries(v3.dependencies)) {
-                            if (isNullHash(d)) {
-                                deps.forEach(x => artifacts.add(x))
-                            } else if (!artifacts.has(d)) {
-                                artifacts.add(d)
-                                storePromises.push(visitStore(d, [...stack, d]))
-                            }
-                        }
-                        await Promise.all(storePromises)
-                    }
-
-                    if (v3.sourcemaps) {
-                        for (const h of Object.values(v3.sourcemaps)) {
-                            const d = toDataPointer(h)
-                            const { hash, storeHash } = d.resolve()
-                            artifacts.add(hash)
-                            if (!isNullHash(storeHash)) {
-                                artifacts.add(storeHash)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        await Promise.all([...stores].map(h => visitStore(h)))
-        // await serializeBuildFs2(buildFs, artifacts)
+        const artifacts = await _serializeBuildFs(buildFs)
+        artifacts.add(buildFs.hash)
 
         for (const f of Object.values(buildFs.index.files)) {
             const storeHash = f.storeHash || buildFs.index.stores[f.store].hash
@@ -3701,15 +3767,22 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
             }
         }
 
+        const actualExcluded = new Set<string>()
         const promises: Promise<[string, Uint8Array]>[] = []
         for (const hash of artifacts) {
+            if (excludeSet?.has(hash)) {
+                actualExcluded.add(hash)
+                continue
+            }
             promises.push(readData(hash).then(d => [hash, d]))
         }
 
-        return Object.fromEntries(await Promise.all(promises))
+        const objects = Object.fromEntries(await Promise.all(promises))
+
+        return excludeSet ? [objects, actualExcluded] : objects
     }
 
-    async function copyFrom(repo: DataRepository, buildFs: ReadonlyBuildFs, pack?: boolean): Promise<void> {
+    async function copyFrom(repo: DataRepository, buildFs: ReadonlyBuildFs, pack?: boolean | 'both', previous?: ReadonlyBuildFs): Promise<void> {
         if (repo.getDataDir() === root.getDataDir()) {
             return
         }
@@ -3718,43 +3791,101 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
             return
         }
 
-        const data = await repo.serializeBuildFs(buildFs)
-        if (!pack) {
-            // ~150ms
-            await runTask('objects', 'copyFrom', async () => {
-                const hasObject = Object.fromEntries(
-                    await Promise.all(Object.keys(data).map(async k => [k, await hasData(k)] as const))
-                )
-                
-                await Promise.all(Object.entries(hasObject).filter(x => !x[1]).map(([k]) => writeData(k, data[k])))
-            }, 10)
-
-            return
+        if (pack && pack !== 'both') {
+            const maybeBlockPath = path.resolve(repo.getBlocksDir(), buildFs.hash)
+            const blockData = await fs.readFile(maybeBlockPath).catch(throwIfNotFileNotFoundError)
+            if (blockData) {
+                return fs.writeFile(getBlockPath(buildFs.hash), blockData)
+            }
         }
 
-        // TODO: if the target repo has a block we can copy it directly
-        const block = createBlock(Object.entries(data))
-        checkBlock(block, buildFs.index, data) // For debugging
+        async function maybeGetPreviousBlock(hash: string) {
+            const maybeBlockPath = getBlockPath(hash)
+            if (await fs.fileExists(maybeBlockPath)) {
+                const data = await fs.readFile(maybeBlockPath)
+                
+                return openBlock(Buffer.isBuffer(data) ? data : Buffer.from(data))
+            }
+        }
 
-        await writeBlock(buildFs.hash, block)        
+        async function packBlock(data: Record<string, Uint8Array>) {
+            const block = createBlock(Object.entries(data))
+            checkBlock(block, buildFs.index, data) // For debugging
+    
+            await writeBlock(buildFs.hash, block)
+        }
+
+        async function dumpObjects(data: Record<string, Uint8Array>) {
+            await Promise.all(Object.entries(data).map(([k, v]) => writeData(k, v)))
+        }
+
+        const previousBlock = previous ? await maybeGetPreviousBlock(previous.hash) : undefined
+        const excluded = previousBlock ? new Set(previousBlock.listObjects()) : undefined
+        if (excluded) {
+            const data = await runTask('serialize', 'copyFrom', () => repo.serializeBuildFs(buildFs, excluded), 10)
+            if (!pack) {
+                return dumpObjects(data[0])
+            }
+
+            if (previousBlock) {
+                for (const k of data[1]) {
+                    data[0][k] = previousBlock.readObject(k)
+                }
+            }
+
+            if (pack === 'both') {
+                await dumpObjects(data[0])
+            }
+
+            return packBlock(data[0])
+        }
+
+        const data = await runTask('serialize', 'copyFrom', () => repo.serializeBuildFs(buildFs), 10)
+        if (pack) {
+            if (pack === 'both') {
+                await dumpObjects(data)
+            }
+
+            return packBlock(data)    
+        }
+
+        // ~150ms
+        await runTask('objects', 'copyFrom', async () => {
+            const hasObject = Object.fromEntries(
+                await Promise.all(Object.keys(data).map(async k => [k, await hasData(k)] as const))
+            )
+            
+            await Promise.all(Object.entries(hasObject).filter(x => !x[1]).map(([k]) => writeData(k, data[k])))
+        }, 10)
     }
 
     function createStore() {
         return createArtifactStore(root, initArtifactStoreState()) as OpenedArtifactStore
     }
 
-    async function _openFsBlock(hash: string) {
-        const data = await fs.readFile(getBlockPath(hash))
+    function _loadFsBlock(hash: string, data: Uint8Array): BuildFsIndex {
         const block = openBlock(Buffer.isBuffer(data) ? data : Buffer.from(data))
+        loadedBlocks.set(hash, block)
 
-        // XXX: not great
-        for (const k of block.listObjects()) {
-            pendingWrites.set(getDataPath(k), { promise: Promise.resolve(), data: block.readObject(k) })
+        return JSON.parse(block.readObject(hash).toString('utf-8'))
+    }
+
+    function _openFsBlock(hash: string, sync = false) {
+        if (loadedBlocks.has(hash)) {
+            const block = loadedBlocks.get(hash)!
+
+            return JSON.parse(block.readObject(hash).toString('utf-8')) as BuildFsIndex
         }
 
-        const index: BuildFsIndex = JSON.parse(block.readObject(hash).toString('utf-8'))
+        if (sync) {
+            return _loadFsBlock(hash, fs.readFileSync(getBlockPath(hash)))
+        }
 
-        return index
+        return fs.readFile(getBlockPath(hash)).then(data => _loadFsBlock(hash, data))
+    }
+
+    function _openFsBlockSync(hash: string) {
+        return _openFsBlock(hash, true) as BuildFsIndex
     }
 
     async function _getFsIndex(hash: string) {
@@ -3767,18 +3898,42 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
         }
     }
 
-    async function getBuildFsIndex(id: string) {
-        const head = await getHeadData(id)
-        const index = head ? await _getFsIndex(head.storeHash) : { stores: {}, files: {} }
+    function _getFsIndexSync(hash: string) {
+        try {
+            return _openFsBlockSync(hash)
+        } catch (e) {
+            throwIfNotFileNotFoundError(e)
+
+            return readJsonRawSync<BuildFsIndex>(root, hash)
+        }
+    }
+
+    function _deferBlocks(index: BuildFsIndex) {
+        if (!index.dependencies) {
+            return index
+        }
+
+        for (const [k, v] of Object.entries(index.dependencies)) {
+            if (!loadedBlocks.has(v)) {
+                deferredBlocks.add(v)
+            }
+        }
 
         return index
     }
 
+    async function getBuildFsIndex(id: string) {
+        const head = await getHeadData(id)
+        const index = head ? await _getFsIndex(head.storeHash) : { stores: {}, files: {} }
+
+        return _deferBlocks(index)
+    }
+
     function getBuildFsIndexSync(id: string) {
         const head = getHeadDataSync(id)
-        const index = head ? readJsonRawSync<BuildFsIndex>(root, head.storeHash) : { stores: {}, files: {} }
+        const index = head ? _getFsIndexSync(head.storeHash) : { stores: {}, files: {} }
 
-        return index
+        return _deferBlocks(index)
     }
 
     // Store utils
@@ -3992,7 +4147,7 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
             const hash = await writeJsonRaw(root, proposed)
             const newHead = { ...proposed, commitHash: hash }
             await putHead(newHead)
-    
+
             return newHead
         }
 
@@ -4057,7 +4212,7 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
         const hash = await fs.flush()
         if (hash) {
             didChange = true
-            await saveFs(id, hash)
+            await runTask('saveFs', id, () => saveFs(id, hash), 1)
         } else {
             getLogger().log(`Skipped saving index ${id} (no changes)`)
         }
@@ -4089,10 +4244,11 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
             for (const [k] of buildFileSystems) {
                 await flushFs(k)
             }
-
-            // Possibly needed?
-            // await Promise.all(pendingHeadWrites.values())
         }, 10)
+
+        if (printCountsOnFlush) {
+            printCounts()
+        }
     }
 
     return {
@@ -4275,12 +4431,13 @@ async function resolveBindingTypes(fs: Pick<Fs, 'readFile'>, types: BindingTypes
     return { name: types.name, text, sourcemap, references: types.references, symbols: types.symbols } 
 }
 
-async function resolveBindingResult(fs: Pick<Fs, 'readFile'>, result: Omit<ModuleBindingResult, 'id'>): Promise<typeof result> {
+async function resolveBindingResult(index: BuildFsIndex, fs: Pick<Fs, 'readFile'>, result: Omit<ModuleBindingResult, 'id'>): Promise<HashedModuleBinding> {
+    const hash = index.files[result.path].hash
     if (!result.types) {
-        return result
+        return { ...result, hash }
     }
 
-    return { ...result, types: await resolveBindingTypes(fs, result.types) }
+    return { ...result, hash, types: await resolveBindingTypes(fs, result.types) }
 }
 
 export async function readModuleManifest(fs: Pick<JsonFs, 'readJson'>): Promise<Record<string, ModuleBindingResult> | undefined> {
@@ -4466,12 +4623,16 @@ async function deserializeTemplate(reader: Pick<BuildFsFragment, 'readData'>, te
     return builder.build()
 }
 
+export type HashedModuleBinding = Omit<ModuleBindingResult, 'id'> & {
+    hash: string
+}
+
 export interface Snapshot {
     storeHash: string
     published?: Record<string, string>
     pointers?: Record<string, Record<string, string>>
     targets?: TargetsFile
-    moduleManifest?: Record<ModuleBindingResult['id'], Omit<ModuleBindingResult, 'id'>>
+    moduleManifest?: Record<ModuleBindingResult['id'], HashedModuleBinding>
     store?: ReadonlyBuildFs
     types?: TypesFileData
 }
@@ -4496,24 +4657,24 @@ async function loadSnapshotFromManifest(repo: DataRepository, fs: Fs & SyncFs, d
         return
     }
 
-    // XXX: only added this check for "snapshot" packages
-    if (await repo.hasData(manifest.storeHash)) {
+    try {
         const buildFs = await repo.getBuildFs(manifest.storeHash)
 
         return {
             ...resolveSnapshot(manifest),
             store: buildFs,
         }
+    } catch (err) {
+        throwIfNotFileNotFoundError(err)
     }
 
-    // TODO: this breaks when the package is "linked" instead of downloaded
     const snapshotRepo = getDataRepository(fs, path.resolve(dir, '.synapse'))
     const buildFs = await snapshotRepo.getBuildFs(manifest.storeHash)
-    await repo.copyFrom(snapshotRepo, buildFs)
+    await repo.copyFrom(snapshotRepo, buildFs, true)
 
     return {
         ...resolveSnapshot(manifest),
-        store: buildFs,
+        store: await repo.getBuildFs(manifest.storeHash), //buildFs,
     }
 }
 
@@ -4533,9 +4694,10 @@ export async function writeSnapshotFile(fs: Fs, dir: string, snapshot: Snapshot)
     )
 }
 
-export async function dumpData(dir: string, index: BuildFsIndex, hash: string, pack?: boolean) {
+export async function dumpData(dir: string, index: BuildFsIndex, hash: string, pack?: boolean | 'both', previousHash?: string) {
     const snapshotRepo = getDataRepository(getFs(), path.resolve(dir, '.synapse'))
-    await snapshotRepo.copyFrom(getDataRepository(getFs()), { hash, index }, pack)
+    const previous = previousHash ? await snapshotRepo.getBuildFs(previousHash) : undefined
+    await snapshotRepo.copyFrom(getDataRepository(getFs()), { hash, index }, pack, previous)
 }
 
 
@@ -4629,7 +4791,7 @@ export function getProgramFs(buildTarget?: Pick<BuildTarget, 'programId' | 'proj
     return getRootFs(programRef, buildDir, buildTarget.workingDirectory)
 }
 
-export function getDeploymentFs(id?: string, programId?: string, projectId?: string) {
+export function getDeploymentFs(id?: string, programId?: string, projectId?: string, isTest?: boolean) {
     if (!id) {
         const { deploymentId } = getBuildTargetOrThrow()
         const buildDir = getBuildDir()
@@ -4638,6 +4800,10 @@ export function getDeploymentFs(id?: string, programId?: string, projectId?: str
             throw new Error(`No deployment id found`)
         }
     
+        if (isTest) {
+            return getRootFs(`${deploymentId}_test`, buildDir, workingDirectory)
+        }
+
         return getRootFs(deploymentId, buildDir, workingDirectory)
     }
 
@@ -4733,6 +4899,11 @@ export async function loadSnapshot(location: string): Promise<Snapshot | undefin
     const deployStore = res.deploymentId ? await snapshotRepo.getBuildFsIndex(res.deploymentId) : undefined
     const programFs = getProgramFs(res)
     const deploymentFs = res.deploymentId ? getDeploymentFs(res.deploymentId) : undefined
+
+    const merged = deployStore 
+        ? { index: mergeBuilds([fullStore.index, deployStore]), hash: 'unknown' }
+        : fullStore
+
     const [targets, moduleMappings, published, pointers, types] = await Promise.all([
         getTargets(programFs),
         getModuleMappings(programFs),
@@ -4741,19 +4912,25 @@ export async function loadSnapshot(location: string): Promise<Snapshot | undefin
         getTypesFile(programFs),
     ])
 
-    const merged = deployStore 
-        ? { index: mergeBuilds([fullStore.index, deployStore]), hash: 'unknown' }
-        : fullStore
+    const moduleManifest = moduleMappings ? await mapModuleManifest(merged.index, programFs, moduleMappings) : undefined
 
     return {
         published,
         targets,
         store: merged,
         storeHash: merged.hash,
-        moduleManifest: moduleMappings,
+        moduleManifest,
         pointers,
         types,
     }
+}
+
+async function mapModuleManifest(fsIndex: BuildFsIndex, programFs: Pick<Fs, 'readFile'>, moduleMappings: NonNullable<Awaited<ReturnType<typeof getModuleMappings>>>) {
+    return Object.fromEntries(
+        await Promise.all(
+            Object.entries(moduleMappings).map(([k, v]) => resolveBindingResult(fsIndex, programFs, v).then(x => [k, x] as const))
+        )
+    )
 }
 
 export async function tryLoadSnapshot(location: string) {
@@ -4772,11 +4949,7 @@ export async function createSnapshot(fsIndex: BuildFsIndex, programId: string, d
     const published = deploymentFs ? await getPublished(deploymentFs) : undefined
     const moduleMappings = await getModuleMappings(programFs)
     const committed = await getRepo(getFs(), getBuildDir()).saveIndex(fsIndex)
-    const moduleManifest = moduleMappings ? Object.fromEntries(
-        await Promise.all(
-            Object.entries(moduleMappings).map(([k, v]) => resolveBindingResult(programFs, v).then(x => [k, x] as const))
-        )
-    ) : undefined
+    const moduleManifest = moduleMappings ? await mapModuleManifest(fsIndex, programFs, moduleMappings) : undefined
 
     const pointersFile = await readPointersFile(programFs)
     const pointers: Record<string, Record<string, string>> = {}
@@ -4855,28 +5028,6 @@ export async function syncRemote(projectId: string, deploymentId: string) {
     await syncHeads(repo, remote, localProcessHead, remoteProcessHead)
 }
 
-async function readData(repo: DataRepository, hash: string) {
-    const data = await repo.readData(hash).catch(throwIfNotFileNotFoundError)
-    if (data || !shouldUseRemote) {
-        return data
-    }
-
-    const projId = await getRemoteProjectId(getBuildTargetOrThrow().projectId)
-    if (!projId) {
-        getLogger().log(`No remote project found while reading object "${hash}"`)
-        return
-    }
-
-    const remote = createRemoteArtifactRepo(repo, projId)
-
-    return remote.getObject(hash).catch(e => {
-        if ((e as any).statusCode === 404 || (e as any).status === 404) {
-            throw Object.assign(new Error((e as any).message), { code: 'ENOENT' })
-        }
-        throw e
-    })
-}
-
 /** @deprecated */
 export async function createArtifactFs(
     fs: Fs & SyncFs,
@@ -4887,7 +5038,7 @@ export async function createArtifactFs(
     const getCurrentProgramStore = memoize(() => repo.getProgramStore(buildTarget))
     const getCurrentProcessStore = memoize(async () => {
         if (!buildTarget.deploymentId) {
-            throw new Error(`No process exists for the current build target`)
+            throw new Error(`No deployment exists for the current build target`)
         }
 
         return getDeploymentStore(buildTarget.deploymentId)
@@ -5030,6 +5181,8 @@ export async function dumpFs(id?: string, dest = path.resolve('.vfs-dump'), repo
                 return toProgramRef(getBuildTargetOrThrow())
             case 'deployment':
                 return getBuildTargetOrThrow().deploymentId!
+            case 'test':
+                return `${getBuildTargetOrThrow().deploymentId!}_test`
             default:
                 return id ?? toProgramRef(getBuildTargetOrThrow())
         }
@@ -5214,7 +5367,7 @@ export function getDeploymentStore(deploymentId: string, repo = getDataRepositor
 
     const getStateWriter = memoize(createStateWriter)
 
-    function saveResponse(resource: string, inputDeps: string[], resp: any, opType: 'data' | 'read' | 'create' | 'update' | 'delete') {
+    function saveResponse(resource: string, inputDeps: string[], resp: any, opType: 'data' | 'read' | 'create' | 'update' | 'delete' | 'import') {
         const [state, pointers, summary] = extractPointers(resp)
         if (opType === 'data') {
             return { state, pointers }

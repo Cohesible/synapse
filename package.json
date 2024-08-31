@@ -1,6 +1,6 @@
 {
     "name": "synapse",
-    "version": "0.0.9",
+    "version": "0.0.11",
     "bin": "./src/cli/index.ts",
     "dependencies": {
         "esbuild": "^0.20.2",
@@ -18,7 +18,7 @@
     },
     "scripts": {
         "compileSelf": "synapse compile --no-synth && synapse publish --local",
-        "testFixtures": "synapse run src/testing/internal.ts --skipValidation -- \"$@\""
+        "testFixtures": "synapse run src/testing/internal.ts -- \"$@\""
     },
     "synapse": {
         "config": {
@@ -35,7 +35,7 @@
             "terraform": "https://github.com/Cohesible/terraform.git"
         },
         "devTools": {
-            "zig": "0.12.0"
+            "zig": "0.13.0"
         }
     }
 }

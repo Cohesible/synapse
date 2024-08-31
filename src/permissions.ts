@@ -1,10 +1,11 @@
 import ts from 'typescript'
-import { AsyncLocalStorage, AsyncResource } from 'async_hooks'
 import { Fn, isElement, isGeneratedClassConstructor, isOriginalProxy, isRegExp } from './runtime/modules/terraform'
-import { createStaticSolver, createUnknown, getFunctionLength, isUnion, isUnknown, isInternalFunction, getSourceCode, evaluate as evaluateUnion } from './static-solver'
+import { createStaticSolver, createUnknown, isUnion, isUnknown, isInternalFunction, getSourceCode, evaluate as evaluateUnion } from './static-solver'
 import { getLogger } from './logging'
-import { dedupe } from './utils'
+import { dedupe, memoize, wrapWithProxy } from './utils'
 import { getArtifactOriginalLocation } from './runtime/loader'
+import { ExternalValue } from './runtime/modules/serdes'
+import type { LogLevel } from './cli/logger'
 
 export function isModuleExport(node: ts.Node): node is ts.ExpressionStatement & { expression: ts.BinaryExpression } {
     if (!ts.isExpressionStatement(node)) {
@@ -155,8 +156,45 @@ export function createSolver(substitute?: (node: ts.Node) => any) {
         }
     })
 
+    const getSymEvalLogger = memoize(() => {
+        function logEvent(level: LogLevel, ...args: any[]) {
+            const mapped = args.map(a => {
+                if (isInternalFunction(a)) {
+                    return getSourceCode(a) + ' [wrapped]'
+                }
 
-    const solver = createStaticSolver((node, scope) => {
+                if (isUnknown(a)) {
+                    return '[unknown]'
+                }
+
+                if (isUnion(a)) {
+                    return '[union]'
+                }
+
+                return a
+            })
+
+            return getLogger().emitSynthLogEvent({
+                level,
+                args: mapped,
+                source: 'symEval',
+            })
+        }
+
+        const m = (level: LogLevel) => (...args: any[]) => logEvent(level, args)
+
+        const logMethods = {
+            log: m('info'),
+            warn: m('warn'),
+            error: m('error'),
+            debug: m('debug'),
+            trace: m('trace'),
+        }
+
+        return wrapWithProxy(console, logMethods)
+    })
+
+    const solver = createStaticSolver(node => {
         if (ts.isIdentifier(node) && node.text === 'require') {
             return (id: string) => {
                 return createUnknown()
@@ -176,23 +214,7 @@ export function createSolver(substitute?: (node: ts.Node) => any) {
                 // case 'Symbol':
                 //     return Symbol
                 case 'console':
-                    return new Proxy(console, {
-                        get: (target, prop, recv) => {
-                            if (prop === 'log' || prop === 'warn' || prop === 'error') {
-                                return (...args: any[]) => {
-                                    getLogger().log('permissions logger:', ...args.map(a => {
-                                        if (isInternalFunction(a)) {
-                                            return getSourceCode(a) + ' [wrapped]'
-                                        }
-
-                                        return a
-                                    }))
-                                }
-                            }
-
-                            return target[prop as keyof typeof console]
-                        },
-                    })
+                    return getSymEvalLogger()
                 case 'JSON':
                     return {
                         parse: (o: any) => {
@@ -238,7 +260,6 @@ export function createSolver(substitute?: (node: ts.Node) => any) {
 //     "type": "Microsoft.Authorization/roleDefinitions"
 // }
 
-const original = Symbol.for('original')
 const unproxy = Symbol.for('unproxy')
 const moveable = Symbol.for('__moveable__')
 const moveable2 = Symbol.for('__moveable__2')
@@ -250,21 +271,42 @@ function isProxy(o: any, checkPrototype = false) {
     return !!o && ((checkPrototype && unproxy in o) || !!Reflect.getOwnPropertyDescriptor(o, moveable2))
 }
 
-function substitute(template: any, args: any[], thisArg?: any): any {
-    if (Array.isArray(template)) {
-        template.forEach(v => substitute(v, args, thisArg))
+function createCachedSubstitute(getCacheKey: (template: any, args: any[], thisArg?: any) => string) {
+    const cachedEvals = new Map<string, any>()
 
-        return createUnknown()
-    } else if (typeof template === 'function') {
-        return template.apply(thisArg, args)
-    } else if (typeof template === 'object' && !!template) {
-        for (const [k, v] of Object.entries(template)) {
-            substitute(v, args, thisArg)
+    function substitute(template: any, args: any[], thisArg?: any) {
+        const key = getCacheKey(template, args, thisArg)
+        if (cachedEvals.has(key)) {
+            return cachedEvals.has(key)
         }
 
-        return createUnknown()
-    } else {
-        return String(template)
+        const val = _substitute(template, args, thisArg)
+        cachedEvals.set(key, val)
+
+        return val
+    }
+
+    function _substitute(template: any, args: any[], thisArg?: any): any {
+        if (Array.isArray(template)) {
+            template.forEach(v => substitute(v, args, thisArg))
+    
+            return createUnknown()
+        } else if (typeof template === 'function') {
+            return template.apply(thisArg, args)
+        } else if (typeof template === 'object' && !!template) {
+            for (const [k, v] of Object.entries(template)) {
+                substitute(v, args, thisArg)
+            }
+    
+            return createUnknown()
+        } else {
+            return String(template)
+        }
+    }
+
+    return {
+        substitute,
+        clearCache: () => cachedEvals.clear(),
     }
 }
 
@@ -279,404 +321,402 @@ function getModel(o: any): PermissionsBinding | undefined {
     }
 }
 
-export function createPermissionsBinder() {
-    // Does two things:
-    // 1. Loads in any models discovered
-    // 2. Infers the "permissions signature" of statements
+export function createCapturedSolver(
+    getSourceFile: (fileName: string) => ts.SourceFile
+) {
+    const resolveCache = new Map<any, any>()
 
+    const solver = createSolver()
+    const factoryFunctions = new Map<string, (...args: any[]) => any>()
+    function getFactoryFunction(fileName: string) {
+        if (factoryFunctions.has(fileName)) {
+            return factoryFunctions.get(fileName)!
+        }
 
+        const sf = getSourceFile(fileName)
+        const decl = sf.statements.find(ts.isFunctionDeclaration) ?? sf.statements.find(isModuleExport)?.expression.right
+        if (!decl) {
+            throw new Error(`No export found: ${fileName}`)
+        }
 
-    function createCapturedSolver(
-        getSourceFile: (fileName: string) => ts.SourceFile
-    ) {
-        const resolveCache = new Map<any, any>()
-        const ctx = new AsyncLocalStorage<{ statements: any[]; canCache?: boolean }>()
+        const fn = solver.createSolver().solve(decl)
+        const factory = (...args: any[]) => fn.call(undefined, ...args)
+        factoryFunctions.set(fileName, factory)
 
-        // Can probably cache most things now
-        function skipCache() {
-            const store = ctx.getStore()
-            if (store !== undefined) {
-                store.canCache = false
+        return factory
+    }
+
+    const ids = new Map<any, number>()
+    function getValueId(obj: any): number {
+        const _id = ids.get(obj)
+        if (_id !== undefined) {
+            return _id
+        }
+
+        if (typeof obj === 'object' && obj !== null) {
+            const proto = Object.getPrototypeOf(obj)
+            if (proto === Object.prototype) {
+                const id = getValueId(JSON.stringify(obj))
+                ids.set(obj, id)
+
+                return id
             }
         }
 
-        function getStatements() {
-            return ctx.getStore()?.statements ?? []
+        const id = ids.size
+        ids.set(obj, id)
+
+        return id
+    }
+
+    function getCacheKey(template: any, args: any[], thisArg?: any) {
+        const argKeys = args.map(getValueId)
+        argKeys.push(getValueId(thisArg))
+        argKeys.push(getValueId(template))
+
+        return argKeys.join(':')
+    }
+
+    const { substitute, clearCache } = createCachedSubstitute(getCacheKey)
+
+    function evaluate(target: any, globals?: { console?: any }, args: any[] = [], thisArg?: any) {
+        clearCache()
+
+        function createFunction(model: FunctionPermissionsBinding['call'], t: any) {
+            return function (this: any, ...args: any[]) {
+                return substitute(model, args, t)
+            }
         }
 
-        function addStatement(s: any) {
-            s.Effect ??= 'Allow'
-            getStatements().push(s)
+        function createInstance(model: ObjectPermissionsBinding['methods'] | ClassPermissionsBinding['methods'], t: any) {
+            const proto = {} as Record<string, any>
+            for (const [k, v] of Object.entries(model)) {
+                proto[k] = function (this: any, ...args: any[]) {
+                    return substitute(v, args, t)
+                }
+            }
+
+            return proto
         }
 
-        function evaluate(target: any, globals?: { console?: any }, args: any[] = [], thisArg?: any) {
-            const solver = createSolver()
-            const factoryFunctions = new Map<string, (...args: any[]) => any>()
-            function getFactoryFunction(fileName: string) {
-                if (factoryFunctions.has(fileName)) {
-                    return factoryFunctions.get(fileName)!
-                }
-
-                const sf = getSourceFile(fileName)
-                const decl = sf.statements.find(ts.isFunctionDeclaration) ?? sf.statements.find(isModuleExport)?.expression.right
-                if (!decl) {
-                    throw new Error(`No export found: ${fileName}`)
-                }
-
-                const fn = solver.createSolver().solve(decl)
-                const factory = (...args: any[]) => fn.call([decl], undefined, ...args)
-                factoryFunctions.set(fileName, factory)
-
-                return factory
+        function createTree(model: any, t: any) {
+            if (model.type === 'function') {
+                return createFunction(model.call, t)
             }
 
-            function createFunction(model: FunctionPermissionsBinding['call'], t: any) {
-                skipCache()
+            if (model.type !== 'container') {
+                return function () { return createInstance(model.methods, t) }
+            }
 
-                return function (...args: any[]) {
-                    return substitute(model, args, t)
+            const res: Record<string, any> = {}
+            for (const [k, v] of Object.entries(model.properties)) {
+                if (typeof v !== 'object' || v === null) {
+                    throw new Error(`Unexpected permissions binding: ${v}`)
+                }
+
+                if ((v as any).type) {
+                    res[k] = createTree(v, t)
                 }
             }
 
-            function createInstance(model: ObjectPermissionsBinding['methods'] | ClassPermissionsBinding['methods'], t: any) {
-                skipCache()
+            return Object.assign(resolveObject(t), res)
+        }
 
-                const proto = {} as Record<string, any>
-                for (const [k, v] of Object.entries(model)) {
-                    proto[k] = function (...args: any[]) {
-                        return substitute(v, args, t)
-                    }
-                }
-
-                return proto
-            }
-
-            function createTree(model: any, t: any) {
-                if (model.type === 'function') {
-                    return createFunction(model.call, t)
-                }
-
-                if (model.type !== 'container') {
-                    return function () { return createInstance(model.methods, t) }
-                }
-
-                const res: Record<string, any> = {}
-                for (const [k, v] of Object.entries(model.properties)) {
-                    if (typeof v !== 'object' || v === null) {
-                        throw new Error(`Unexpected permissions binding: ${v}`)
+        function createStubFromModel(model: PermissionsBinding, obj: any) {
+            if (model.type === 'class') {
+                return function (this: any, ...args: any[]) { 
+                    if (model.$constructor) {
+                        substitute(model.$constructor, args, this ?? obj)
                     }
 
-                    if ((v as any).type) {
-                        res[k] = createTree(v, t)
-                    }
-                }
-
-                return Object.assign(resolveObject(t), res)
-            }
-
-            function createStubFromModel(model: PermissionsBinding, obj: any) {
-                if (model.type === 'class') {
-                    return function (...args: any[]) { 
-                        if (model.$constructor) {
-                            const t = thisArg ?? obj
-                            substitute(model.$constructor, args, t)
-                        }
-
-                        return createInstance(model.methods, obj)
-                    }
-                } else if (model.type === 'object') {
                     return createInstance(model.methods, obj)
-                } else if (model.type === 'function') {
-                    return createFunction(model.call, obj)
                 }
+            } else if (model.type === 'object') {
+                return createInstance(model.methods, obj)
+            } else if (model.type === 'function') {
+                return createFunction(model.call, obj)
+            }
+        }
+
+        function getBaseObject(o: any) {
+            if (!o.constructor || Object.getPrototypeOf(o) === null) {
+                return Object.create(null)
+            } else if (o.constructor.name === 'Object') {
+                return {}
             }
 
-            function getBaseObject(o: any) {
-                if (!o.constructor || Object.getPrototypeOf(o) === null) {
-                    return Object.create(null)
-                } else if (o.constructor.name === 'Object') {
-                    return {}
-                }
-
-                const ctor = resolve(o.constructor)
-                if (ctor && !isUnknown(ctor)) {
-                    return Object.create(ctor.prototype, {
-                        constructor: {
-                            value: ctor,
-                            enumerable: true,
-                            configurable: true,
-                        }
-                    })
-                }
-
-                return createUnknown()
+            const ctor = resolve(o.constructor)
+            if (ctor && !isUnknown(ctor)) {
+                return Object.create(ctor.prototype, {
+                    constructor: {
+                        value: ctor,
+                        enumerable: true,
+                        configurable: true,
+                    }
+                })
             }
 
-            function resolveObject(o: any) {
-                const resolved = getBaseObject(o)
-                resolveCache.set(o, resolved) // This cache is probably redundant with the heavy caching in `resolveProperties`
+            return createUnknown()
+        }
 
-                if (isUnknown(resolved)) {
-                    return resolved
-                }
+        function resolveObject(o: any) {
+            const resolved = getBaseObject(o)
+            resolveCache.set(o, resolved) // This cache is probably redundant with the heavy caching in `resolveProperties`
 
-                const _ctx = { canCache: true, statements: getStatements() }
-                ctx.run(_ctx, resolveProperties)
-
-                if (!_ctx.canCache) {
-                    skipCache()
-                    resolveCache.delete(o)
-                }
-
+            if (isUnknown(resolved)) {
                 return resolved
-
-                function resolveProperties() {
-                    // Lazily-evaluate every enumerable property
-                    for (const k of Object.keys(o)) {
-                        let currentVal: any
-                        let didResolve = false
-                        Object.defineProperty(resolved, k, {
-                            get: () => {
-                                if (didResolve) {
-                                    return currentVal
-                                }
-
-                                const _ctx = { canCache: true, statements: getStatements() }
-                                const val = ctx.run(_ctx, () => resolve(o[k]))
-
-                                if (_ctx.canCache) {
-                                    didResolve = true
-                                    currentVal = val
-                                }
-
-                                return val
-                            },
-                            set: (nv) => {
-                                didResolve = true
-                                currentVal = nv
-                            },
-                            configurable: true,
-                            enumerable: true,
-                        })
-                    }    
-                }
             }
 
-            function resolve(o: any): any {
-                if ((typeof o !== 'object' && typeof o !== 'function') || !o) {
+            resolveProperties()
+
+            return resolved
+
+            function resolveProperties() {
+                // Lazily-evaluate every enumerable property
+                for (const k of Object.keys(o)) {
+                    let currentVal: any
+                    let didResolve = false
+                    Object.defineProperty(resolved, k, {
+                        get: () => {
+                            if (didResolve) {
+                                return currentVal
+                            }
+
+                            const val = resolve(o[k])
+
+                            didResolve = true
+                            currentVal = val
+
+                            return val
+                        },
+                        set: (nv) => {
+                            didResolve = true
+                            currentVal = nv
+                        },
+                        configurable: true,
+                        enumerable: true,
+                    })
+                }    
+            }
+        }
+
+        function resolve(o: any): any {
+            if ((typeof o !== 'object' && typeof o !== 'function') || !o) {
+                return o
+            }
+
+            if (resolveCache.has(o)) {
+                return resolveCache.get(o)
+            }
+
+            const res = inner()
+            resolveCache.set(o, res)
+
+            return res
+
+            function inner() {
+                if (expressionSym in o) {
+                    if (!isOriginalProxy(o) || !o.constructor || isGeneratedClassConstructor(o.constructor)) {
+                        return o
+                    }
+                }
+                    
+                if (Array.isArray(o)) {
+                    return o.map(resolve)
+                }
+
+                if (isProxy(o)) {
+                    const unproxied = o[unproxy]
+                    const ctor = unproxied.constructor
+                    if (ctor) {
+                        const ctorM = getModel(ctor[unproxy])
+                        if (ctorM && ctorM.type === 'class') {
+                            return createInstance(ctorM.methods, unproxied)
+                        }
+                    }
+
+                    const p = o[unproxyParent]
+                    const pm = getModel(p)
+                    if (pm) {
+                        return createStubFromModel(pm, unproxied)
+                    }
+
+                    if (ctor && typeof ctor[moveable] === 'function') {
+                        const resolved = resolveObject(unproxied)
+                        const model = getModel(ctor)
+
+                        if (model && model.type !== 'function') {
+                            // Merges the model into the current object
+                            const partial = createInstance(model.methods, unproxied)
+
+                            return Object.assign(resolved, partial)
+                        }
+
+                        if (isOriginalProxy(unproxied)) {
+                            return new Proxy(resolved, {
+                                get: (target, prop, recv) => {
+                                    if (Reflect.has(target, prop)) {
+                                        return target[prop]
+                                    }
+
+                                    return unproxied[prop]
+                                }
+                            })
+                        }
+
+                        return resolved
+                    }
+
+                    const opm = getModel(unproxied)
+                    if (opm !== undefined) {
+                        return createStubFromModel(opm, unproxied)
+                    }
+
+                    const fromDesc = maybeResolveDescription(o)
+                    if (fromDesc !== undefined) {
+                        return fromDesc
+                    }
+
+                    const x = o[moveable2]()
+                    if (x?.valueType === 'reflection') {
+                        return createUnknown()
+                    }
+
+                    return resolve(unproxied)
+                }
+
+                const m = getModel(o)
+                if (m) {
+                    return createStubFromModel(m, o)
+                }
+
+                const ctor = o.constructor
+                const ctorModel = ctor ? getModel(ctor) : undefined
+                if (ctorModel && ctorModel.type !== 'function') {
+                    const partial = createInstance(ctorModel.methods, o)
+                    return Object.assign(resolveObject(o), partial)
+                }
+
+                if (isUnion(o)) {
                     return o
                 }
 
-                if (resolveCache.has(o)) {
-                    return resolveCache.get(o)
+                const perms = o[permissions]
+                if (perms) {
+                    if (perms.type === 'container') {
+                        return createTree(perms, o)
+                    }
+
+                    return createStubFromModel(perms, o)
                 }
 
-                const _ctx = { canCache: true, statements: getStatements() }
-                const res = ctx.run(_ctx, inner)
-
-                if (_ctx.canCache) {
-                    resolveCache.set(o, res)
-                } else {
-                    skipCache()
+                const fromDesc = maybeResolveDescription(o)
+                if (fromDesc !== undefined) {
+                    return fromDesc
                 }
 
-                return res
-
-                function inner() {
-                    if (expressionSym in o) {
-                        if (!isOriginalProxy(o) || !o.constructor || isGeneratedClassConstructor(o.constructor)) {
-                            return o
-                        }
-                    }
-                        
-                    if (Array.isArray(o)) {
-                        return o.map(resolve)
-                    }
-
-                    if (isProxy(o)) {
-                        const unproxied = o[unproxy]
-                        const ctor = unproxied.constructor
-                        if (ctor) {
-                            const ctorM = getModel(ctor[unproxy])
-                            if (ctorM && ctorM.type === 'class') {
-                                return createInstance(ctorM.methods, unproxied)
-                            }
-                        }
-
-                        const p = o[unproxyParent]
-                        const pm = getModel(p)
-                        if (pm) {
-                            return createStubFromModel(pm, unproxied)
-                        }
-
-                        if (ctor && typeof ctor[moveable] === 'function') {
-                            const resolved = resolveObject(unproxied)
-                            const model = getModel(ctor)
-
-                            if (model && model.type !== 'function') {
-                                // Merges the model into the current object
-                                const partial = createInstance(model.methods, unproxied)
-
-                                return Object.assign(resolved, partial)
-                            }
-
-                            if (isOriginalProxy(unproxied)) {
-                                return new Proxy(resolved, {
-                                    get: (target, prop, recv) => {
-                                        if (Reflect.has(target, prop)) {
-                                            return target[prop]
-                                        }
-
-                                        return unproxied[prop]
-                                    }
-                                })
-                            }
-
-                            return resolved
-                        }
-
-                        const opm = getModel(unproxied)
-                        if (opm !== undefined) {
-                            return createStubFromModel(opm, unproxied)
-                        }
-
-                        if (typeof o[moveable] === 'function') {
-                            const val = o[moveable]()
-                            if (val.valueType === 'function') {
-                                return invokeCaptured(val.module, resolve(substituteGlobals(val.captured)))
-                            } else if (val.valueType === 'reflection') {
-                                return createUnknown()   
-                            }
-                        }
-                
-                        const x = o[moveable2]()
-                        if (x?.valueType === 'reflection') {
-                            return createUnknown()
-                        }
-
-                        return resolve(unproxied)
-                    }
-
-                    const m = getModel(o)
-                    if (m) {
-                        return createStubFromModel(m, o)
-                    }
-
-                    const ctor = o.constructor
-                    const ctorModel = ctor ? getModel(ctor) : undefined
-                    if (ctorModel && ctorModel.type !== 'function') {
-                        const partial = createInstance(ctorModel.methods, o)
-                        return Object.assign(resolveObject(o), partial)
-                    }
-
-                    if (isUnion(o)) {
-                        return o
-                    }
-
-                    const perms = o[permissions]
-                    if (perms) {
-                        if (perms.type === 'container') {
-                            return createTree(perms, o)
-                        }
-
-                        return createStubFromModel(perms, o)
-                    }
-
-                    if (typeof o[moveable] === 'function') {
-                        const val = o[moveable]()
-                        if (val.valueType === 'function') {
-                            return invokeCaptured(val.module, resolve(substituteGlobals(val.captured)))
-                        } else if (val.valueType === 'reflection') {
-                            return createUnknown()   
-                        }
-                    }
-
-                    if (isRegExp(o)) {
-                        return o
-                    }
-
-                    if (typeof o === 'object') {
-                        return resolveObject(o)
-                    }
-        
-                    return createUnknown()
-                }
-            }
-
-            function substituteGlobals(captured: any[]) {
-                if (!globals) {
-                    return captured
+                if (isRegExp(o)) {
+                    return o
                 }
 
-                return captured.map(c => {
-                    if ((typeof c === 'object' || typeof c === 'function') && !!c && typeof c[moveable2] === 'function') {
-                        const desc = c[moveable2]()
-                        if (desc.operations && desc.operations[0].type === 'global') {
-                            const target = desc.operations[1]
-                            if (target && target.type === 'get') {
-                                return globals[target.property as keyof typeof globals] ?? c
-                            }
-                        }
-                    }
-
-                    return c
-                })
-            }
-            
-            function invokeCaptured(fileName: string, captured: any[]): any {
-                skipCache() // We'll keep a separate cache for re-hydrated factory functions
-        
-                return getFactoryFunction(fileName)(...captured)
-            }
+                if (typeof o === 'object') {
+                    return resolveObject(o)
+                }
     
-            const statements: any[] = []
-            try {
-                ctx.run({ statements }, () => {
-                    const fn = resolve(target)
-                    call(fn, args)
-                })    
-            } catch (e) {
-                const module = (typeof target === 'object' || typeof target === 'function')
-                    ? target?.[moveable]?.().module
-                    : undefined
+                return createUnknown()
+            }
+        }
 
-                if (module) {
-                    const location = getArtifactOriginalLocation(module)
-                    if (location) {
-                        throw new Error(`Failed to solve permissions for target: ${location}`, { cause: e })
+        function maybeResolveDescription(o: any): any | undefined {
+            if (typeof o[moveable] !== 'function') {
+                return
+            }
+
+            const desc: ExternalValue = o[moveable]()
+            switch (desc.valueType) {
+                case 'reflection':
+                    return createUnknown()
+                case 'function':
+                    return invokeCaptured(desc.module, resolve(substituteGlobals(desc.captured!)))
+                case 'bound-function': {
+                    const fn = resolve(desc.boundTarget!)
+                    if (typeof fn !== 'function') {
+                        return
+                    }
+
+                    const resolvedArgs = [desc.boundThisArg, ...desc.boundArgs!].map(resolve) as [any, ...any[]]
+
+                    return fn.bind(resolvedArgs[0], ...resolvedArgs.slice(1))
+                }
+            }
+        }
+
+        function substituteGlobals(captured: any[]) {
+            if (!globals) {
+                return captured
+            }
+
+            return captured.map(c => {
+                if ((typeof c === 'object' || typeof c === 'function') && !!c && typeof c[moveable2] === 'function') {
+                    const desc = c[moveable2]()
+                    if (desc.operations && desc.operations[0].type === 'global') {
+                        const target = desc.operations[1]
+                        if (target && target.type === 'get') {
+                            return globals[target.property as keyof typeof globals] ?? c
+                        }
                     }
                 }
 
-                throw new Error(`Failed to solve permissions for target: ${require('node:util').inspect(target)}`, { cause: e })
+                return c
+            })
+        }
+        
+        function invokeCaptured(fileName: string, captured: any[]): any {
+            return getFactoryFunction(fileName)(...captured)
+        }
+
+        function getLocation(target: any) {
+            const module = (typeof target === 'object' || typeof target === 'function')
+                ? target?.[moveable]?.().module
+                : undefined
+
+            if (module) {
+                return getArtifactOriginalLocation(module)
+            }
+        }
+
+        try {
+            const fn = resolve(target)
+            call(fn, args, thisArg)
+        } catch (e) {
+            const location = getLocation(target)
+            if (location) {
+                throw new Error(`Failed to solve permissions for target: ${location}`, { cause: e })
             }
 
-            return dedupe(statements.flat(100))
+            throw new Error(`Failed to solve permissions for target: ${require('node:util').inspect(target)}`, { cause: e })
         }
 
-        return { evaluate }
+        return [] // XXX: legacy return value
     }
 
-    function call(fn: any, args: any[]) {
-        if (isUnknown(fn)) {
-            return
-        }
+    return { evaluate }
+}
 
-        if (isUnion(fn)) {
-            for (const f of fn) {
-                call(f, args)
-            }
-
-            return
-        }
-
-        if (isInternalFunction(fn)) {
-            fn.call([], undefined, ...args)
-        } else {
-            fn.call(undefined, ...args)
-        }
+function call(fn: any, args: any[], thisArg?: any) {
+    if (isUnknown(fn)) {
+        return
     }
 
-    return { createCapturedSolver }
+    if (isUnion(fn)) {
+        for (const f of fn) {
+            call(f, args, thisArg)
+        }
+
+        return
+    }
+
+    fn.call(thisArg, ...args)
 }
 
 // STUB

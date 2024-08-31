@@ -1,6 +1,7 @@
 import * as child_process from 'node:child_process'
+import { memoize } from '../utils'
 
-interface RunCommandOptions extends child_process.SpawnOptions {
+export interface RunCommandOptions extends child_process.SpawnOptions {
     readonly input?: string | Uint8Array // Passed directly to stdin
     /** Defaults to `utf-8` */
     readonly encoding?: BufferEncoding | 'none'
@@ -32,21 +33,22 @@ export function execCommand(cmd: string, opts: child_process.ExecOptions = {}) {
 export function createCommandRunner(opts?: RunCommandOptions): (cmd: string, args?: string[]) => Promise<string>
 export function createCommandRunner(opts: RunCommandOptions & { encoding: 'none' }): (cmd: string, args?: string[]) => Promise<Buffer>
 export function createCommandRunner(opts: RunCommandOptions = {}) {
+    const shell = opts.shell !== undefined ? opts.shell : true
+
     async function runCommand(executableOrCommand: string, args?: string[]): Promise<string | Buffer> {
         const proc = !args
-            ? child_process.spawn(executableOrCommand, { shell: true, ...opts })
-            : child_process.spawn(executableOrCommand, args, { shell: true, ...opts })
+            ? child_process.spawn(executableOrCommand, { ...opts, shell })
+            : child_process.spawn(executableOrCommand, args, { ...opts, shell })
 
         // Likely not needed
         if (proc.exitCode || proc.signalCode) {
             throw new Error(`Non-zero exit code: ${proc.exitCode} [signal ${proc.signalCode}]`)
         }
 
-        if (opts.input) {
-            proc.stdin?.end(opts.input)
-        }
+        proc.stdin?.end(opts.input)
 
-        const result = await toPromise(proc, opts?.encoding === 'none' ? undefined : (opts.encoding ?? 'utf-8'))
+        const encoding = opts?.encoding === 'none' ? undefined : (opts.encoding ?? 'utf-8')
+        const result = await toPromise(proc, encoding)
 
         return result.stdout
     }
@@ -75,36 +77,29 @@ function toPromise(proc: child_process.ChildProcess, encoding?: BufferEncoding) 
             proc.kill()
         }
 
-        proc.on('error', onError)
-        proc.on('close', (code, signal) => {
-            if (code !== 0) {
-                const message = `Non-zero exit code: ${code} [signal ${signal}]`
-                const err = Object.assign(
-                    new Error(message), 
-                    { code, stdout: getResult(stdout), stderr: getResult(stderr, 'utf-8') },
-                    { stack: message + '\n' + _err.stack?.split('\n').slice(1).join('\n') }
-                )
-
-                reject(err)
-            } else {
-                resolve({ stdout: getResult(stdout), stderr: getResult(stderr) })
+        function close(code: number | null, signal: NodeJS.Signals | null) {
+            if (code === 0) {
+                return resolve({ stdout: getResult(stdout), stderr: getResult(stderr) })
             }
-        })
 
-        // Likely not needed
-        if (!proc.stdout && !proc.stderr) {
-            proc.on('exit', (code, signal) => {
-                if (code !== 0) {
-                    const err = Object.assign(
-                        new Error(`Non-zero exit code: ${code} [signal ${signal}]`), 
-                        { code, stdout: '', stderr: '' }
-                    )
-    
-                    reject(err)
-                } else {
-                    resolve({ stdout: '', stderr: '' })
-                }
+            const message = `Non-zero exit code: ${code} [signal ${signal}]`
+            const err = Object.assign(
+                new Error(message), 
+                { code, stdout: getResult(stdout), stderr: getResult(stderr, 'utf-8') },
+            )
+
+            Object.defineProperty(err, 'stack', {
+                get: memoize(() => message + '\n' + _err.stack?.split('\n').slice(1).join('\n'))
             })
+
+            reject(err)
+        }
+
+        proc.on('error', onError)
+        proc.on('close', close)
+
+        if (!proc.stdout && !proc.stderr) {
+            proc.on('exit', close)
         }
     })
 
@@ -119,9 +114,7 @@ export function patchPath(dir: string, env = process.env) {
 }
 
 export async function which(executable: string) {
-    if (process.platform === 'win32') {
-        return runCommand('where', [executable])
-    }
+    const cmd = process.platform === 'win32' ? 'where' : 'which'
 
-    return runCommand('which', [executable])
+    return runCommand(cmd, [executable]).then(resp => resp.trim())
 }

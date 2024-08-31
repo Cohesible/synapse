@@ -5,7 +5,7 @@ import { createSyntheticComment, failOnNode, getNodeLocation, isExported, isWind
 import { JsonFs } from '../system'
 import { createGraphCompiler, Scope, Symbol } from '../static-solver'
 import { Compilation } from './incremental'
-import { getLogger } from '..'
+import { getLogger } from '../logging'
 import { getCallableDirective, getResourceDirective } from './transformer'
 import { getProgramFs } from '../artifacts'
 import { getWorkingDir } from '../workspaces'
@@ -39,6 +39,10 @@ export interface TypeInfo {
 
 export interface TypesFileData {
     [fileName: string]: Record<string, TypeInfo>
+}
+
+function isSimpleAssignmentExpression(node: ts.Node): node is ts.BinaryExpression {
+    return ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken
 }
 
 // Used for incremental builds
@@ -359,6 +363,15 @@ export function createResourceGraph(
                 types.set(node, type)
                 
                 return type
+            } else if (isSimpleAssignmentExpression(node)) {
+                const type = getNodeType(node.right)
+                if (!type) {
+                    return
+                }
+
+                types.set(node, type)
+
+                return type
             }
 
             const isClassLike = ts.isClassLike(node)
@@ -657,6 +670,10 @@ export function createResourceGraph(
         function getResourceInstantiations() {
             const instantiations = new Map<ts.Node, ResourceInstantiation[]>()
             function visitNode(node: ts.Node) {
+                if (ts.isBlock(node)) {
+                    return visitStatements(node.statements)
+                }
+
                 const type = getNodeType(node)
                 if ((type?.instantiations && type.instantiations.length > 0) || type?.instanceType) {
                     const inst = [...type.instantiations ?? []]
@@ -667,17 +684,30 @@ export function createResourceGraph(
                 }
             }
 
-            for (const s of sf.statements) {
-                if (ts.isVariableStatement(s)) {
-                    for (const decl of s.declarationList.declarations) {
-                        visitNode(decl)
+            function visitStatements(statements: readonly ts.Statement[]) {
+                for (const s of statements) {
+                    if (ts.isVariableStatement(s)) {
+                        for (const decl of s.declarationList.declarations) {
+                            visitNode(decl)
+                        }
+                    } else if (ts.isExpressionStatement(s)) {
+                        visitNode(s.expression)
+                    } else if (ts.isIfStatement(s)) {
+                        visitNode(s.expression)
+                        visitNode(s.thenStatement)
+
+                        if (s.elseStatement) {
+                            visitNode(s.elseStatement)
+                        }
+                    } else if (ts.isForStatement(s)) {
+                        visitNode(s.statement)
+                    } else if (!ts.isFunctionDeclaration(s) && !ts.isClassDeclaration(s)) {
+                        visitNode(s)
                     }
-                } else if (ts.isExpressionStatement(s)) {
-                    visitNode(s.expression)
-                } else if (!ts.isFunctionDeclaration(s) && !ts.isClassDeclaration(s)) {
-                    visitNode(s)
                 }
             }
+
+            visitStatements(sf.statements)
 
             // for (const [k, v] of instantiations) {
             //     console.log(getNodeLocation(k), v)

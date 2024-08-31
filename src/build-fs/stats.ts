@@ -1,4 +1,4 @@
-import { DataRepository, getDataRepository, listCommits, readJsonRaw, Head } from '../artifacts'
+import { DataRepository, getDataRepository, listCommits, readJsonRaw, Head, CompiledChunk } from '../artifacts'
 import { colorize, printLine, print } from '../cli/ui'
 import { getBuildTargetOrThrow, getFs, throwIfCancelled } from '../execution'
 import { BaseOutputMessage, getLogger, getTypedEventEmitter } from '../logging'
@@ -646,15 +646,73 @@ function diffJson(a: any, b: any) {
     showJsonDiff(diff)
 }
 
+function greedilyMatchLines(l1: string[], l2: string[]) {
+    const m = new Map<string, number[]>()
+    for (let i = 0; i < l1.length; i++) {
+        if (!m.has(l1[i])) {
+            m.set(l1[i], [])
+        }
+        m.get(l1[i])!.push(i)
+    }
+
+    const pairs: [number, number][] = []
+    for (let i = 0; i < l2.length; i++) {
+        const arr = m.get(l2[i])
+        if (!arr || arr.length === 0) continue
+
+        pairs.push([arr.shift()!, i])
+    }
+
+    return pairs
+}
+
+function diffLine(a: string, b: string) {
+    const r = arrayEditDistance(a.split(''), b.split(''), {
+        update: (a, b) => 2,
+    })
+
+    for (const op of r.ops) {
+        switch (op[0]) {
+            case 'insert':
+                print(colorize('green', op[1]))
+                break
+            case 'remove':
+                print(colorize('red', op[1]))
+                break
+            case 'noop':
+                print(op[1])
+                break
+            case 'update':
+                throw new Error('Should not happen')
+        }
+    }
+}
+
 function diffLines(a: string, b: string) {
     const l1 = a.split('\n')
     const l2 = b.split('\n')
 
+    const pairs = greedilyMatchLines(l1, l2)
+
+    for (const i of pairs.map(x => x[0]).sort((a, b) => a - b).reverse()) {
+        l1.splice(i, 1)
+    }
+
+    for (const i of pairs.map(x => x[1]).sort((a, b) => a - b).reverse()) {
+        l2.splice(i, 1)
+    }
+
     const r = arrayEditDistance(l1, l2, {
         insert: a => a.length,
         remove: b => b.length,
-        update: (a, b) => a.length + b.length, //(a, b) => levenshteinDistance(a, b),
+        update: (a, b) => levenshteinDistance(a, b),
+        // update: (a, b) => a.length + b.length,
     })
+
+    if (r.ops.length === 0) {
+        printLine(colorize('paleGreen', 'Files are the same'))
+        return
+    }
 
     for (const op of r.ops) {
         switch (op[0]) {
@@ -665,27 +723,8 @@ function diffLines(a: string, b: string) {
                 printLine(renderRemove(op[1]))
                 break
             case 'update':
-                const r2 = arrayEditDistance(op[1].split(''), op[2].split(''), {
-                    update: (a, b) => 2,
-                })
-
-                for (const op2 of r2.ops) {
-                    switch (op2[0]) {
-                        case 'insert':
-                            print(colorize('green', op2[1]))
-                        case 'remove':
-                            print(colorize('red', op2[1]))
-                            break
-                        case 'noop':
-                            print(op2[1])
-                            break
-                        case 'update':
-                            throw new Error(`Shouldn't happen`)
-                    }
-                }
-
+                diffLine(op[1], op[2])
                 printLine()
-            
                 break
         }
     }
@@ -951,6 +990,26 @@ async function _diffObjects(repo: DataRepository, a: Ref, b: Ref) {
     return diffLines(strA, strB)
 }
 
+function isCompiledChunk(o: any): o is CompiledChunk {
+    return typeof o === 'object' && !!o && o.kind === 'compiled-chunk' && typeof o.runtime == 'string' && typeof o.infra === 'string'
+}
+
+function diffCompiledChunks(a: CompiledChunk, b: CompiledChunk) {
+    function diffEncodedText(a: string, b: string, title: string) {
+        const diff = jsonDiff(a, b)
+        if (diff.kind === 'value' && diff.type === 'string') {
+            printLine(colorize('gray', title))
+            diffLines(
+                Buffer.from(diff.left, 'base64').toString(),
+                Buffer.from(diff.right, 'base64').toString()
+            )
+        }
+    }
+
+    diffEncodedText(a.infra, b.infra, 'infra')
+    diffEncodedText(a.runtime, b.runtime, 'runtime')
+}
+
 export async function diffObjects(repo: DataRepository, a: string, b: string) {
     const resolved = await Promise.all([getArtifactByPrefix(repo, a), getArtifactByPrefix(repo, b)])
     const datum = await Promise.all([repo.readData(resolved[0]), repo.readData(resolved[1])])
@@ -960,7 +1019,13 @@ export async function diffObjects(repo: DataRepository, a: string, b: string) {
         return diffLines(strA, strB)
     }
 
-    return diffJson(JSON.parse(strA), JSON.parse(strB))
+    const parsedA = JSON.parse(strA)
+    const parsedB = JSON.parse(strB)
+    if (isCompiledChunk(parsedA) && isCompiledChunk(parsedB)) {
+        return diffCompiledChunks(parsedA, parsedB)
+    }
+
+    return diffJson(parsedA, parsedB)
 }
 
 function renderInsert(s: string) {
@@ -1020,13 +1085,22 @@ export async function diffFileInCommit(repo: DataRepository, fileName: string, c
     const currentFileHash = currentIndex.index.files[fileName]?.hash
     const previousFileHash = previousIndex?.index.files[fileName]?.hash
 
-    const currentFile = currentFileHash ? JSON.parse(Buffer.from(await repo.readData(currentFileHash)).toString('utf-8')) : undefined
-    const previousFile = previousFileHash ? JSON.parse(Buffer.from(await repo.readData(previousFileHash)).toString('utf-8')) : undefined
-    if (currentFile === previousFile) {
+    if (currentFileHash === undefined && currentFileHash === previousFileHash) {
         printLine(colorize('brightRed', 'File does not exist'))
-    } else {
-        diffJson(previousFile, currentFile)
+        return
     }
+
+    const currentData = currentFileHash ? Buffer.from(await repo.readData(currentFileHash)).toString('utf-8') : undefined
+    const previousData = previousFileHash ? Buffer.from(await repo.readData(previousFileHash)).toString('utf-8') : undefined
+
+    if (!currentData?.startsWith('{') || !previousData?.startsWith('{')) {
+        return diffLines(previousData ?? '', currentData ?? '')
+    }
+
+    const currentFile = currentData ? JSON.parse(currentData) : undefined
+    const previousFile = previousData ? JSON.parse(previousData) : undefined
+
+    diffJson(previousFile, currentFile)
 }
 
 export async function diffFileInLatestCommit(fileName: string, opt?: { commitsBack?: number }) {

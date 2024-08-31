@@ -1,5 +1,6 @@
 import { Function } from 'synapse:srl/compute'
 import { describe, it, test, expectEqual } from 'synapse:test'
+import './symEval'
 
 const add = (a: number, b: number) => a + b
 const plus1 = add.bind(undefined, 1)
@@ -33,8 +34,6 @@ describe('Function', () => {
         expectEqual(await fn(1), 2)
     })
 })
-
-// TODO: implement permissions for bound functions
 
 
 // !commands

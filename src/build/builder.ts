@@ -25,7 +25,7 @@ export interface QualifiedBuildTarget {
     readonly os: Os
     readonly arch: Arch
     readonly endianness: 'LE' | 'BE'
-    readonly libc?: 'musl'
+    readonly libc?: 'musl' | 'gnu'
 }
 
 function parseOs(osType: string): Os {

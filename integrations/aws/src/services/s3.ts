@@ -11,6 +11,13 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import { getContentType } from 'synapse:http'
 import { addResourceStatement } from '../permissions'
 
+function throwIfNotNoSuchKey(err: unknown) {
+    if (!(err instanceof Error) || err.name !== 'NoSuchKey') {
+        throw err
+    }
+    return undefined
+}
+
 export class Bucket implements storage.Bucket {
     private readonly client = new S3.S3({})
     public readonly resource: aws.S3Bucket
@@ -42,29 +49,40 @@ export class Bucket implements storage.Bucket {
             // TODO: need way to convert web stream to blob
             return !encoding ? new Blob([bytes]) : Buffer.from(bytes).toString(encoding)
         } catch (e) {
-            if (!(e instanceof Error) || e.name !== 'NoSuchKey') {
-                throw e
-            }
-            return undefined
+            return throwIfNotNoSuchKey(e)
         }
     }
 
-    public async put(key: string, blob: string | Uint8Array): Promise<void> {
+    public async put(key: string, blob: string | Uint8Array | Blob | ReadableStream<Uint8Array>): Promise<void> {
+        // Currently run into:
+        // "Are you using a Stream of unknown length as the Body of a PutObject request? Consider using Upload instead from @aws-sdk/lib-storage."
+        if (typeof blob === 'object' && Symbol.asyncIterator in blob) {
+            const chunks: Uint8Array[] = []
+            for await (const chunk of blob) {
+                chunks.push(chunk)
+            }
+            
+            await this.client.putObject({ Bucket: this.name, Key: key, Body: Buffer.concat(chunks) })
+            return
+        }
+
         await this.client.putObject({ Bucket: this.name, Key: key, Body: blob })
     }
 
-    public async stat(key: string): Promise<{ size: number; contentType?: string }> {
-        const resp = await this.client.headObject({ Bucket: this.name, Key: key })
+    public async stat(key: string): Promise<{ size: number; contentType?: string } | undefined> {
+        try {
+            const resp = await this.client.headObject({ Bucket: this.name, Key: key })
 
-        return { size: resp.ContentLength!, contentType: resp.ContentType }
+            return { size: resp.ContentLength!, contentType: resp.ContentType }
+        } catch (e) {
+            if ((e as any).name === 'NotFound') {
+                return
+            }
+            return throwIfNotNoSuchKey(e)
+        }
     }
 
     public async delete(key: string): Promise<void> {
-        // TODO: make a `tryDelete` instead
-        // if ((e as any).name !== 'NoSuchKey') {
-        //     throw e
-        // }
-
         await this.client.deleteObject({ Bucket: this.name, Key: key })
     }
 

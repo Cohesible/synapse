@@ -1,10 +1,10 @@
 import * as path from 'node:path'
-import { getLogger, runTask } from '..'
+import { getLogger, runTask } from '../logging'
 import { createMountedFs, getPublished, getDeploymentFs, getDataRepository, getDeploymentStore, readState, toFsFromIndex, createTempMountedFs, getFsFromHash, toFsFromHash, getProgramFs, getProgramHash, DataRepository } from '../artifacts'
 import { getAuth } from '../auth'
 import { getBackendClient } from '../backendClient'
 import { isDataPointer } from '../build-fs/pointers'
-import { getBuildTargetOrThrow, getFs } from '../execution'
+import { getAbortSignal, getBuildTargetOrThrow, getFs } from '../execution'
 import { createPackageService, importMapToManifest } from '../pm/packages'
 import { createMergedView, getSelfDir } from '../pm/publish'
 import { ImportMap, SourceInfo } from '../runtime/importMaps'
@@ -39,7 +39,7 @@ export async function loadBuildState(bt: BuildTarget, repo = getDataRepository()
 
     return {
         repo,
-        mountedFs: mountedFs as Fs & SyncFs,
+        mountedFs,
         resolver: resolver as ModuleResolver,
         registerPointerDependencies: pkgService.registerPointerDependencies,
     }
@@ -72,7 +72,7 @@ export async function loadBuildState(bt: BuildTarget, repo = getDataRepository()
     }
 }
 
-export async function getModuleLoader(wrapConsole = true): Promise<ModuleLoader> {
+export async function getModuleLoader(wrapConsole = true, useThisContext = false): Promise<ModuleLoader> {
     const bt = getBuildTargetOrThrow()
     const repo = getDataRepository()
     const auth = getAuth()
@@ -96,12 +96,14 @@ export async function getModuleLoader(wrapConsole = true): Promise<ModuleLoader>
     }
 
 
-    const loaderContext = createContext(bt, backendClient, auth, wrapConsole ? createConsoleWrap() : undefined)
+    const loaderContext = !useThisContext 
+        ? createContext(bt, backendClient, auth, wrapConsole ? createConsoleWrap() : undefined)
+        : undefined
 
     const getSourceMapParser = memoize(async () => {
         const selfDir = await getSelfDir()
         const sourceMapParser = createSourceMapParser(mountedFs, resolver, bt.workingDirectory, selfDir ? [selfDir] : undefined)
-        loaderContext.registerSourceMapParser(sourceMapParser)
+        loaderContext?.registerSourceMapParser(sourceMapParser)
 
         return sourceMapParser
     })
@@ -111,6 +113,8 @@ export async function getModuleLoader(wrapConsole = true): Promise<ModuleLoader>
     function createModuleLoader2(): ReturnType<SessionContext['createModuleLoader']> {
         const dataDir = repo.getDataDir()
         const codeCache = createCodeCache(fs, getV8CacheDirectory())
+        const dataRepository = createBasicDataRepo(repo)
+        dataRepository.getDiskPath = mountedFs.getDiskPath
 
         const loader = createModuleLoader(
             mountedFs, 
@@ -121,7 +125,13 @@ export async function getModuleLoader(wrapConsole = true): Promise<ModuleLoader>
                 workingDirectory: bt.workingDirectory,
                 codeCache,
                 deserializer: resolveValue,
-                dataRepository: createBasicDataRepo(repo),
+                dataRepository,
+                // Cross-context code can have performance issues
+                //
+                // It seems that if `exports` is created in one context,
+                // it prevents it from being used as a fast-call receiver
+                // in another context
+                useThisContext,
             }            
         )
 
@@ -130,15 +140,19 @@ export async function getModuleLoader(wrapConsole = true): Promise<ModuleLoader>
                 await registerPointerDependencies(id)
             }
 
-            return loader(origin, loaderContext.ctx)(id)
+            return loader(origin, loaderContext?.ctx)(id)
         }
+
+        const runWithContext = loaderContext 
+            ? async <T>(namedContexts: Record<string, any>, fn: () => Promise<T> | T) => {
+                return loaderContext.runWithNamedContexts(namedContexts, fn)
+            }
+            : async () => { throw new Error('Cannot use "runWithContext" with "useThisContext"') }
 
         return {
             loadModule,
+            runWithContext,
             registerMapping: resolver.registerMapping,
-            runWithContext: async <T>(namedContexts: Record<string, any>, fn: () => Promise<T> | T) => {
-                return loaderContext.runWithNamedContexts(namedContexts, fn)
-            },
         }
     }
 
@@ -168,10 +182,19 @@ export async function createSessionContext(programHash?: string): Promise<Sessio
     const deploymentId = bt.deploymentId ?? await runTask('projects', 'deployment', getOrCreateDeployment, 10)
     const repo = getDataRepository()
 
-    const resolvedProgramHash = programHash ?? (await repo.getHead(toProgramRef(bt)))!.storeHash
+    async function getProgramHashOrThrow() {
+        const head = await repo.getHead(toProgramRef(bt))
+        if (!head) {
+            throw new Error('No compiled program found')
+        }
+        return head.storeHash
+    }
+
+    const resolvedProgramHash = programHash ?? await getProgramHashOrThrow()
     getLogger().debug(`Creating session context with program hash [deploymentId: ${deploymentId}]`, resolvedProgramHash)
 
-    const tmpMountedFs = createTempMountedFs((await repo.getBuildFs(resolvedProgramHash)).index, bt.workingDirectory)
+    const programBuildFs = await repo.getBuildFs(resolvedProgramHash)
+    const tmpMountedFs = createTempMountedFs(programBuildFs.index, bt.workingDirectory)
 
     const fs = tmpMountedFs
     const terraformPath = await getTerraformPath()
@@ -188,13 +211,29 @@ export async function createSessionContext(programHash?: string): Promise<Sessio
     const backendClient = getBackendClient()
 
     function createConsoleWrap() {
-        const logEvent = getLogger().emitDeployLogEvent
+        const logTest = getLogger().emitTestLogEvent
+        const logDeploy = getLogger().emitDeployLogEvent
+
+        function doLog(level: 'info' | 'warn' | 'error' | 'debug' | 'trace', args: any[]) {
+            const test = loaderContext.getContext('test')?.[0]
+            if (test && typeof test === 'object' && typeof test.id === 'number') {
+                return logTest({ level, args, name: test.name, id: test.id, parentId: test.parentId })
+            }
+
+            const resource = loaderContext.getContext('resource')?.[0]
+            if (typeof resource === 'string') {
+                return logDeploy({ level, args, resource })
+            }
+
+            return logDeploy({ level, args, resource: '' })
+        }
+
         const logMethods = {
-            log: (...args: any[]) => logEvent({ level: 'info', args, resource: loaderContext.getContext('resource') }),
-            warn: (...args: any[]) => logEvent({ level: 'warn', args, resource: loaderContext.getContext('resource') }),
-            error: (...args: any[]) => logEvent({ level: 'error', args, resource: loaderContext.getContext('resource') }),
-            debug: (...args: any[]) => logEvent({ level: 'debug', args, resource: loaderContext.getContext('resource') }),
-            trace: (...args: any[]) => logEvent({ level: 'trace', args, resource: loaderContext.getContext('resource') }),
+            log: (...args: any[]) => doLog('info', args),
+            warn: (...args: any[]) => doLog('warn', args),
+            error: (...args: any[]) => doLog('error', args),
+            debug: (...args: any[]) => doLog('debug', args),
+            trace: (...args: any[]) => doLog('trace', args),
         }
         
         return wrapWithProxy(globalThis.console, logMethods)
@@ -228,6 +267,8 @@ export async function createSessionContext(programHash?: string): Promise<Sessio
     function createModuleLoader2(): ReturnType<SessionContext['createModuleLoader']> {
         const dataDir = repo.getDataDir()
         const codeCache = createCodeCache(fs, getV8CacheDirectory())
+        const dataRepository = createBasicDataRepo(repo)
+        // dataRepository.getDiskPath = tmpMountedFs.getDiskPath
 
         const loader = createModuleLoader(
             mountedFs, 
@@ -239,7 +280,7 @@ export async function createSessionContext(programHash?: string): Promise<Sessio
                 workingDirectory,
                 codeCache,
                 deserializer: resolveValue,
-                dataRepository: createBasicDataRepo(repo),
+                dataRepository,
             }            
         )
 
@@ -275,6 +316,7 @@ export async function createSessionContext(programHash?: string): Promise<Sessio
         createModuleResolver: () => resolver,
         createModuleLoader: createModuleLoader2,
         createZip,
+        abortSignal: getAbortSignal(),
     }
 } 
 
@@ -412,6 +454,23 @@ export async function createSession(ctx: SessionContext, opt?: DeployOptions) {
         return parsePlan(p, resources)
     }
 
+    async function importResource(target: string, id: string) {
+        await loadStateOnce()
+        ensurePersister()
+        const error = await session.importResource(target, id).catch(e => e)
+
+        // Possible crash, save what we can
+        if (!session.isAlive()) {
+            await persister?.dispose()
+            persister = undefined
+            throw error
+        }
+
+        return {
+            error,
+            state: await finalizeState(),
+        }
+    }
 
     async function _dispose() {
         getLogger().log('Shutting down session', ctx.buildTarget.deploymentId!)
@@ -454,6 +513,7 @@ export async function createSession(ctx: SessionContext, opt?: DeployOptions) {
         getState,
         getRefs: session.getRefs,
         setTemplate,
+        importResource,
         templateService: ctx.templateService,
         moduleLoader,
         ctx,

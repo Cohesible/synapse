@@ -1,9 +1,9 @@
 import ts from 'typescript'
-import { isNonNullable } from '../utils'
+import * as zig from './ast.zig'
+import * as path from 'node:path'
+import { isNonNullable, isRelativeSpecifier, keyedMemoize } from '../utils'
 import { emitChunk } from '../static-solver/utils'
 import { getFs } from '../execution'
-import * as zig from './ast.zig'
-import { getLogger } from '..'
 
 type SyntheticUnion<T extends Record<string, any>> = { [P in keyof T as 'x']: { $type: P } & T[P] }['x']
 
@@ -106,14 +106,37 @@ function convertType(name: string): ZigType | undefined {
             width: -1,
         }
     }
-
-    if (name === 'FsPromise') {
-        return { type: 'alias', name }
-    }
 }
 
 function createPromiseTypeNode(inner: ts.TypeNode) {
     return ts.factory.createTypeReferenceNode('Promise', [inner])
+}
+
+function getJsImportName(node: zig.Node) {
+    const n = createSyntheticUnion(node)
+    if (n.$type !== 'field_access') {
+        return
+    }
+
+    const target = createSyntheticUnion(n.exp)
+    if (target.$type !== 'ident') {
+        return
+    }
+
+    // XXX: need symbol resolution
+    if (target.name !== 'js') {
+        return
+    }
+
+    return n.member
+}
+
+function isJsPromise(node: zig.Node) {
+    return getJsImportName(node) === 'Promise'
+}
+
+function isUtf8String(node: zig.Node) {
+    return getJsImportName(node) === 'UTF8String'
 }
 
 // This type conversion assumes immutability
@@ -122,6 +145,10 @@ function toTsTypeNode(node: zig.Node): ts.TypeNode {
     const n = createSyntheticUnion(node)
     switch (n.$type) {
         case 'ident':
+            if (n.name === 'void') {
+                return ts.factory.createTypeReferenceNode('void')
+            }
+
             if (n.name === 'anyopaque') {
                 return ts.factory.createTypeReferenceNode('any')
             }
@@ -135,16 +162,15 @@ function toTsTypeNode(node: zig.Node): ts.TypeNode {
                 return ts.factory.createTypeReferenceNode(n.name)
             }
 
-            if (converted.type === 'alias' && converted.name === 'FsPromise') {
-                return createPromiseTypeNode(ts.factory.createTypeReferenceNode('any'))
-            }
-
             return ts.factory.createTypeReferenceNode('number')
         case 'field_access':
-            if (n.member === 'UTF8String') {
+            if (isUtf8String(node)) {
                 return ts.factory.createTypeReferenceNode('string')
             }
+        
             break
+        case 'error_union':
+            return toTsTypeNode(n.rhs)
         case 'ptr_type':
             if (isStringTypeNode(node)) {
                 return ts.factory.createTypeReferenceNode('string')
@@ -164,7 +190,13 @@ function toTsTypeNode(node: zig.Node): ts.TypeNode {
                 ts.factory.createLiteralTypeNode(ts.factory.createNull())
             ])
         }
+        case 'call_exp': {
+            if (isJsPromise(n.exp) && n.args.length === 1) {
+                return createPromiseTypeNode(toTsTypeNode(n.args[0]))
+            }
 
+            break
+        }
     }
 
     return ts.factory.createTypeReferenceNode('any')
@@ -317,7 +349,7 @@ function toTsNode(node: zig.Node, treatPubAsExport?: boolean): ts.Node | undefin
 
 type AstRoot = zig.ContainerDecl & { subtype: 'root' }
 
-async function getAst(sourceFile: string): Promise<AstRoot> {
+async function _getAst(sourceFile: string): Promise<AstRoot> {
     if ('parse' in (zig as any)) {
         const data = await getFs().readFile(sourceFile, 'utf-8')
         const rawAst = zig.parse(data)
@@ -333,6 +365,8 @@ async function getAst(sourceFile: string): Promise<AstRoot> {
 
     return ast.container
 }
+
+const getAst = keyedMemoize(_getAst)
 
 function generateSourceFile(root: AstRoot, treatPubAsExport?: boolean) {
     const statements = root.members.map(m => {
@@ -358,6 +392,11 @@ export interface ExportedFn {
     readonly name: string
     readonly params: Param[]
     readonly returnType: string
+}
+
+export interface ImportedModule {
+    readonly name?: string
+    readonly specifier: string
 }
 
 function toSimpleType(node: zig.Node): string {
@@ -426,6 +465,62 @@ function isNativeModule(ast: AstRoot) {
         })
 }
 
+function getVarDecls(nodes: zig.Node[]): zig.VarDecl[] {
+    return nodes.map(createSyntheticUnion).filter(n => n.$type === 'vardecl')
+        .map(n => n as any as zig.VarDecl)
+}
+
+function getBuiltinCalls(nodes: zig.Node[]): { expression: zig.CallExp, name: string }[] {
+    const decls = getVarDecls(nodes)
+    const initializers = decls.map(d => d.initializer).filter(isNonNullable)
+
+    return initializers.map(createSyntheticUnion).filter(n => n.$type === 'call_exp')
+        .map(n => n as any as zig.CallExp)
+        .map(n => {
+            const exp = createSyntheticUnion(n.exp)
+            if (exp.$type !== 'ident' || !exp.name.startsWith('@')) {
+                return
+            }
+
+            return {
+                expression: n,
+                name: exp.name.slice(1),
+            }
+        })
+        .filter(isNonNullable)
+}
+
+
+function getImportedModules(nodes: zig.Node[]) {
+    return getBuiltinCalls(nodes)
+        .filter(n => n.name === 'import')
+        .map(n => {
+            const arg0 = n.expression.args[0] ? createSyntheticUnion(n.expression.args[0]) : undefined
+            if (!arg0 || arg0.$type !== 'literal' || arg0.subtype !== 'string') {
+                return
+            }
+
+            return {
+                specifier: arg0.value,
+            }
+        })
+        .filter(isNonNullable) as ImportedModule[]
+}
+
+export async function getImportedModulesFromFile(target: string) {
+    const ast = await getAst(target)
+    const dir = path.dirname(target)
+
+    const result = new Set<string>()
+    for (const n of getImportedModules(ast.members)) {
+        if (n.specifier.endsWith('.zig')) {
+            result.add(path.resolve(dir, n.specifier))
+        }
+    }
+
+    return result
+}
+
 export async function generateTsZigBindings(target: string) {
     const ast = await getAst(target)
     const isModule = isNativeModule(ast)
@@ -452,9 +547,11 @@ export async function generateTsZigBindings(target: string) {
 
     // Requires `--allowArbitraryExtensions` for tsc
     const outfile = target.replace(/\.zig$/, '.d.zig.ts')
+    const importedModules = getImportedModules(ast.members)
 
     return {
         isModule,
+        importedModules,
         exportedFunctions,
         typeDefinition: { name: outfile, text: text },
     }

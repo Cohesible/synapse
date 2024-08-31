@@ -36,6 +36,15 @@ describe('HttpService', () => {
         expectEqual(actual, undefined)
     })
 
+    const blobResponseRoute = service.route('POST', '/blob', req => req.blob())
+
+    it('can return blobs', async () => {
+        const data = Buffer.from('foo')
+        // TODO: types are wrong
+        const resp = await http.fetch(blobResponseRoute, data)
+        expectEqual((resp as any).toString(), 'foo')
+    })
+
     describe('HttpError', () => {
         const errorRoute = service.route('GET', '/error', req => {
             throw new http.HttpError('Nope', {
@@ -66,6 +75,33 @@ describe('HttpService', () => {
         it('handles data requests', async () => {
             const data = Buffer.from('foo')
             expectEqual(await http.fetch(dataRequestRoute, data), { size: data.byteLength })
+        })
+
+        const echoRoute = service.route('POST', '/echo', (req, body: any) => body)
+
+        it('handles strings', async () => {
+            const data = 'foo'
+            expectEqual(await http.fetch(echoRoute, data), data)
+        })
+
+        // TODO: add recursion detection in library code
+        const recursive = service.route('GET', '/recursive/{count}', async (req): Promise<number> => {
+            const { count } = req.pathParameters
+            const num = Number(count)
+            if (isNaN(num) || num < 0) {
+                return -1
+            }
+
+            if (num > 1) {
+                return num
+            }
+
+            return http.fetch(recursive, String(num + 1))
+        })
+
+        it('handles recursive calls', async () => {
+            const resp = await http.fetch(recursive, '0')
+            expectEqual(resp, 2)
         })
     })
 

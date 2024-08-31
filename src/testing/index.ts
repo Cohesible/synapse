@@ -1,18 +1,118 @@
 import type { TestSuite, Test } from '../runtime/modules/test'
+import { Fs } from '../system'
 import { Logger, getLogger } from '../logging'
 import { TemplateService, parseModuleName } from '../templates'
-import { readResourceState } from '../artifacts'
+import { getDeploymentFs, readResourceState } from '../artifacts'
 import { SessionContext } from '../deploy/deployment'
 import { isDataPointer } from '../build-fs/pointers'
-import { TfState } from '../deploy/state'
-import { keyedMemoize } from '../utils'
+import { keyedMemoize, memoize, sortRecord, tryReadJson } from '../utils'
+import { PackageService } from '../pm/packages'
+
+interface TestResult {
+    id: number
+    name: string
+    hash: string
+    parentId?: number
+}
+
+interface TestResultsCache {
+    files: Record<string, TestResult[]>
+}
+
+const testResultsKey = '__testResults__.json'
+
+async function getCachedTestResults(fs: Pick<Fs, 'readFile'>): Promise<TestResultsCache | undefined> {
+    return tryReadJson(fs, testResultsKey)
+}
+
+async function setCachedTestResults(fs: Pick<Fs, 'writeFile'>, data: TestResultsCache): Promise<void> {
+    const sorted = sortRecord(data.files)
+    for (const [k, v] of Object.entries(sorted)) {
+        sorted[k] = v.sort((a, b) => a.id - b.id)
+    }
+
+    return await fs.writeFile(testResultsKey, JSON.stringify({ ...data, files: sorted }))
+}
+
+// Tests are effectively treated as separate deployments
+const getTestFs = () => getDeploymentFs(undefined, undefined, undefined, true)
 
 export function createTestRunner(
-    loader: ReturnType<SessionContext['createModuleLoader']>, 
+    loader: ReturnType<SessionContext['createModuleLoader']>,
+    pkgService: PackageService,
+    opt?: { noCache?: boolean }
 ) {
-    function emitStatus(info: TestItem, status: 'running' | 'passed' | 'pending'): void
+    const useCache = !opt?.noCache
+    const getCache = memoize(async () => await getCachedTestResults(getTestFs()) ?? { files: {} })
+
+    async function saveCache() {
+        if (!useCache) {
+            return
+        }
+
+        await setCachedTestResults(getTestFs(), await getCache())
+    }
+
+    function maybeGetHash(test: ResolvedTest) {
+        // Older versions won't have `pointer`
+        // And we don't attempt to forcibly update
+        const p = test.resolved.pointer
+        if (!p) {
+            return
+        }
+
+        return pkgService.getHashWithDeps(p)
+    }
+
+    async function updateCache(test: TestItem) {
+        if (!useCache || test.type !== 'test') {
+            return
+        }
+
+        const hash = maybeGetHash(test)
+        if (!hash) {
+            return
+        }
+
+        const cache = await getCache()
+        const results = cache.files[test.fileName] ??= []
+        const index = results.findIndex(r => r.id === test.id)
+        const r: TestResult = {
+            id: test.id,
+            name: test.name,
+            hash,
+        }
+
+        if (index === -1) {
+            results.push(r)
+        } else {
+            results[index] = r
+        }
+    }
+
+    async function findCachedTestResult(test: TestItem) {
+        if (!useCache || test.type !== 'test') {
+            return
+        }
+
+        const cache = await getCache()
+        const results = cache.files[test.fileName]
+        if (!results) {
+            return
+        }
+
+        const currentHash = maybeGetHash(test)
+        if (!currentHash) {
+            return
+        }
+
+        return results.find(r => r.hash === currentHash && r.name === test.name)
+    }
+
+    type TestEvent = Parameters<Logger['emitTestEvent']>[0]
+    function emitStatus(info: TestItem, status: Exclude<TestEvent['status'], 'failed'>): void
     function emitStatus(info: TestItem, status: 'failed', error: Error): void
-    function emitStatus(info: TestItem, status: 'running' | 'passed' | 'failed' | 'pending', reason?: Error) {
+    function emitStatus(info: TestItem, status: TestEvent['status'], reason?: Error) {
         if (info.hidden) return
 
         getLogger().emitTestEvent({
@@ -22,15 +122,21 @@ export function createTestRunner(
             name: info.name,
             itemType: info.type,
             parentId: info.parentId,
-        } as Parameters<Logger['emitTestEvent']>[0])
+        } as TestEvent)
     }
 
     async function runTest(test: ResolvedTest) {
+        const cached = await findCachedTestResult(test)
+        if (cached) {
+            return emitStatus(test, 'cached')
+        }
+
         emitStatus(test, 'running')
 
         try {
-            await test.resolved.run()
+            await loader.runWithContext({ test: [test] }, test.resolved.run.bind(test.resolved))
             emitStatus(test, 'passed')
+            await updateCache(test)
         } catch (e) {
             const err = e as Error
             emitStatus(test, 'failed', err)
@@ -81,6 +187,8 @@ export function createTestRunner(
                 await runTest(item)
             }
         }
+
+        await saveCache()
     }
 
     async function loadSuite(location: string) {
@@ -179,6 +287,7 @@ interface TestFilter {
     parentId?: number
     fileNames?: string[]
     targetIds?: number[]
+    names?: string
 }
 
 function canIncludeItem(item: BaseTestItem, filter: TestFilter) {
@@ -191,6 +300,10 @@ function canIncludeItem(item: BaseTestItem, filter: TestFilter) {
     }
 
     if (filter.targetIds !== undefined && !filter.targetIds.includes(item.id)) {
+        return false
+    }
+
+    if (filter.names !== undefined && !item.name.includes(filter.names)) {
         return false
     }
 
@@ -250,7 +363,8 @@ export async function listTestSuites(templates: TemplateService, filter: TestFil
 
             const hidden = parentId === undefined
             const item : BaseTestItem = { id, name, fileName, parentId, hidden }
-            if (!canIncludeItem(item, filter)) {
+            // XXX: don't use names to include all relevant suites
+            if (!canIncludeItem(item, { ...filter, names: undefined })) {
                 continue
             }
 

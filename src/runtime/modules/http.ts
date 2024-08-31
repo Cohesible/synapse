@@ -54,6 +54,16 @@ export interface TypedRequest<T extends string = string> extends Request {
     readonly context?: any
 }
 
+// TODO: we should use `Blob` instead of `Buffer` for `application/octet-stream` with known sizes
+// Unfortunately `Blob` doesn't support purely streamed data with unknown initial sizes. So we'll
+// need to use a special-case of `Blob` that has `size` optional. `slice` can technically work
+// too because the spec allows for ranges beyond the true size of the blob.
+//
+// Summary: use `StreamedBlob` for all binary data
+interface StreamedBlob extends Omit<Blob, 'size'>{
+    readonly size?: number
+}
+
 export type RequestHandler<T extends string = string, R = unknown> = 
     (request: TypedRequest<T>) => Promise<HandlerResponse<R>> | HandlerResponse<R>
 
@@ -105,7 +115,6 @@ interface BodyBinding extends BindingBase {
 
 type HttpBinding = PathBinding | QueryBinding | HeaderBinding | BodyBinding
 
-// This is always `https` for now
 export interface HttpRoute<T extends any[] = any[], R = any> {
     readonly host: string
     readonly port?: number
@@ -117,6 +126,11 @@ export interface HttpRoute<T extends any[] = any[], R = any> {
         readonly request: HttpBinding[]
         readonly response: HttpBinding[]
     }
+
+    // "Phantom" fields to force type coercion
+    // These will never have a value in practice
+    readonly _args?: T
+    readonly _body?: R
 }
 
 // FIXME: make this more robust
@@ -310,46 +324,53 @@ function resolveBody(body: any) {
         return
     }
 
-    if (typeof body === 'object') {
-        if (body === null) {
-            return {
-                contentType: 'application/json',
-                body: 'null'
-            }
-        }
-
-        if (isTypedArray(body)) {
-            const contentEncoding = body[kContentEncoding]
-
-            return {
-                body,
-                contentEncoding,
-            }
-        }
-
-        if (body instanceof ReadableStream) {
-            return {
-                contentType: 'application/octet-stream',
-                body,
-            }
-        }
-
-        if (body instanceof URLSearchParams) {
-            return {
-                contentType: 'application/x-www-form-urlencoded',
-                body: body.toString()
-            }
-        }
-    
+    if (typeof body === 'string' || typeof body === 'number' || typeof body === 'boolean') {
         return {
             contentType: 'application/json',
-            body: typeof Buffer !== 'undefined' 
-                ? Buffer.from(JSON.stringify(body), 'utf-8').toString('utf-8')
-                : JSON.stringify(body)
+            body: JSON.stringify(body),
         }
     }
 
-    return { body }
+    if (typeof body !== 'object') {
+        return { body }
+    }
+
+    if (body === null) {
+        return {
+            contentType: 'application/json',
+            body: 'null'
+        }
+    }
+
+    if (isTypedArray(body)) {
+        const contentEncoding = body[contentEncodingSym]
+
+        return {
+            body,
+            contentEncoding,
+        }
+    }
+
+    if (body instanceof ReadableStream) {
+        return {
+            contentType: 'application/octet-stream',
+            body,
+        }
+    }
+
+    if (body instanceof URLSearchParams) {
+        return {
+            contentType: 'application/x-www-form-urlencoded',
+            body: body.toString()
+        }
+    }
+
+    return {
+        contentType: 'application/json',
+        body: typeof Buffer !== 'undefined' 
+            ? Buffer.from(JSON.stringify(body), 'utf-8').toString('utf-8')
+            : JSON.stringify(body)
+    }
 }
 
 function parseContentType(header: string) {
@@ -385,7 +406,7 @@ function toLowerCase<T extends Record<string, any>>(obj: T): { [P in keyof T & s
     return Object.fromEntries(Object.entries(obj).map(([k, v]) => [k.toLowerCase(), v])) as any
 }
 
-const kContentEncoding = Symbol.for('contentEncoding')
+const contentEncodingSym = Symbol.for('contentEncoding')
 
 /** @internal */
 export function encode(data: ZlibInputType, encoding: 'gzip' | 'br' = 'gzip') {
@@ -395,7 +416,7 @@ export function encode(data: ZlibInputType, encoding: 'gzip' | 'br' = 'gzip') {
         if (err) {
             reject(err)
         } else {
-            Object.defineProperty(res, kContentEncoding, {
+            Object.defineProperty(res, contentEncodingSym, {
                 value: encoding,
                 configurable: true,
                 enumerable: false,
@@ -463,8 +484,9 @@ interface FetchInit {
     headers?: Record<string, string>
 }
 
-export async function fetch<T extends any[] = [], R = unknown>(route: HttpRoute<T, R>, ...request: T): Promise<R>
-export async function fetch(url: string, init?: FetchInit): Promise<any>
+export function fetch<T extends any[] = []>(route: HttpRoute<T, Response>, ...request: T): Promise<Buffer>
+export function fetch<T extends any[] = [], R = unknown>(route: HttpRoute<T, R>, ...request: T): Promise<R>
+export function fetch(url: string, init?: FetchInit): Promise<any>
 export async function fetch(urlOrRoute: string | HttpRoute, ...args: [init?: FetchInit] | any[]): Promise<any> {
     if (isRoute(urlOrRoute)) {
         const { request, body } = applyRoute(urlOrRoute, args)
@@ -658,6 +680,10 @@ function doRequest(request: http.RequestOptions | URL, body?: any) {
             request.agent = getAgent(http)
         }
 
+        if (!(request instanceof URL) && (request as any).search && !request.path?.includes('?')) {
+            request.path = `${request.path}${(request as any).search}`
+        }
+
         const req = http.request(request, res => {
             const contentType = res.headers['content-type'] ? parseContentType(res.headers['content-type']) : undefined
             const contentEncoding = res.headers['content-encoding']
@@ -744,10 +770,6 @@ function substitutePaths(template: any, args: any[]): any {
     }
 
     return template
-}
-
-function createBody(bodyTemplate: any, bindings: BodyBinding[], args: any[]) {
-
 }
 
 export function createPathBindings(pathTemplate: string) {

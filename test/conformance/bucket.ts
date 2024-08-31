@@ -1,11 +1,11 @@
 import * as synapse from 'synapse:core'
 import { Bucket } from 'synapse:srl/storage'
-import { describe, it, expect, expectEqual } from 'synapse:test'
+import { describe, it, test, expect, expectEqual } from 'synapse:test'
 
 describe('Bucket', () => {
     const b = new Bucket()
 
-    it('returns undefined if the key is absent', async () => {
+    it('returns `undefined` if the key is absent', async () => {
         const data = await b.get('missing-key')
         expectEqual(data, undefined)
     })
@@ -20,7 +20,14 @@ describe('Bucket', () => {
     it('stores', async () => {
         const data = 'hi'
         await b.put('my-key', data)
-        expect(await b.get('my-key', 'utf-8') === data)
+        expectEqual(await b.get('my-key', 'utf-8'), data)
+    })
+
+    it('stores streams', async () => {
+        const data = 'hi'
+        const blob = new Blob([data])
+        await b.put('my-key', blob.stream())
+        expectEqual(await b.get('my-key', 'utf-8'), data)
     })
 
     it('deletes', async () => {
@@ -33,7 +40,7 @@ describe('Bucket', () => {
     it('stores (nested)', async () => {
         const data = 'im-nested'
         await b.put('my/nested/key', data)
-        expect(await b.get('my/nested/key', 'utf-8') === data)
+        expectEqual(await b.get('my/nested/key', 'utf-8'), data)
     })
 
     describe('Bucket (Fresh)', () => {
@@ -70,6 +77,19 @@ describe('Bucket', () => {
         const assetKey = b.addBlob(synapse.asset('table.ts'))
         it('works with assets', async () => {
             expect(await b.get(assetKey))
+        })
+    })
+
+    describe('stat', () => {
+        it('returns size', async () => {
+            const data = Buffer.from('foobar')
+            await b.put('my-key', data)
+            const stats = await b.stat('my-key')
+            expectEqual(stats?.size, data.byteLength)
+        })
+
+        it('returns `undefined` for missing items', async () => {
+            expectEqual(await b.stat('i-do-not-exist'), undefined)
         })
     })
 })
