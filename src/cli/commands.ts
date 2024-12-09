@@ -8,12 +8,12 @@ import { readKey, setKey } from './config'
 import { RenderableError, colorize, printJson, printLine, stripAnsi } from './ui'
 import { runWithContext, getBuildTargetOrThrow } from '../execution'
 import { handleCompletion } from './completions/completion'
-import { downloadNodeLib } from './buildInternal'
 import { runInternalTestFile } from '../testing/internal'
 import { getAuth } from '../auth'
 import { tryUpgrade } from './updater'
 import { getLogger, runTask } from '../logging'
-import { passthroughZig } from '../zig/compile'
+import { passthroughZig, downloadNodeLib } from '../zig/compile'
+import { internalBundle } from './buildInternal'
 
 
 interface TypeMap {
@@ -542,7 +542,8 @@ registerTypedCommand(
             ...deployOptions, 
             { name: 'deploymentId', type: 'string', hidden: true },
             { name: 'tests-only', type: 'boolean', hidden: true },
-            { name: 'yes', type: 'boolean', hidden: true }
+            { name: 'yes', type: 'boolean', hidden: true },
+            { name: 'clean-after', type: 'boolean', hidden: true }
         ],
         requirements: { program: true, process: true },
         inferBuildTarget: true,
@@ -558,6 +559,7 @@ registerTypedCommand(
             deploymentId: opt.deploymentId,
             useTests: opt['tests-only'],
             yes: opt['yes'],
+            cleanAfter: opt['clean-after'],
         })
     }
 )
@@ -585,6 +587,10 @@ registerTypedCommand(
         args: [varargsFiles],
         options: [
             ...buildTargetOptions, 
+            // TODO: should this include all compile/deploy options because this can do both?
+            // I've wanted to do `test --target aws` a few times now
+            // I'm thinking we'll categorize options by commands but still have options share a global namespace
+            // That way `--target` always means the same thing, though most commands would ignore it
             { name: 'destroy-after', type: 'boolean', hidden: true },
             { name: 'rollback-if-failed', type: 'boolean', hidden: true },
             { name: 'filter', type: 'string', hidden: true },
@@ -1078,28 +1084,29 @@ registerTypedCommand(
     }
 )
 
+const internalBundleOptions = [
+    { name: 'snapshot', type: 'boolean' }, 
+    { name: 'sea', type: 'boolean' },
+    { name: 'production', type: 'boolean' },
+    { name: 'lto', type: 'boolean' },
+    { name: 'stagingDir', type: 'string' },
+    { name: 'downloadOnly', type: 'boolean' },
+    { name: 'preserveSource', type: 'boolean' },
+    { name: 'libc', type: 'string' },
+    { name: 'integration', type: 'string', allowMultiple: true },
+    { name: 'seaPrep', type: 'boolean' },
+    { name: 'pipelined', type: 'string' },
+] as const satisfies SwitchArgument[]
+
+// Will be removed soon
 registerTypedCommand(
     'bundle',  
     {
         internal: true,
         args: [{ name: 'target', type: hostTargetType, optional: true }],
-        options: [
-            { name: 'snapshot', type: 'boolean' }, 
-            { name: 'snapshotOnly', type: 'boolean' }, 
-            { name: 'sea', type: 'boolean' },
-            { name: 'production', type: 'boolean' },
-            { name: 'lto', type: 'boolean' },
-            { name: 'integrationsOnly', type: 'boolean' },
-            { name: 'seaOnly', type: 'boolean' },
-            { name: 'stagingDir', type: 'string' },
-            { name: 'downloadOnly', type: 'boolean' },
-            { name: 'preserveSource', type: 'boolean' },
-            { name: 'libc', type: 'string' },
-            { name: 'integration', type: 'string', allowMultiple: true },
-            { name: 'seaPrep', type: 'boolean' },
-        ]
+        options: internalBundleOptions
     },
-    (target, opt) => synapse.internalBundle(target, opt)
+    (target, opt) => internalBundle(target, opt)
 )
 
 registerTypedCommand(

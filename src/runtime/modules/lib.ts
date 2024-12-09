@@ -7,7 +7,7 @@ import * as core from 'synapse:core'
 import { Fn, peekNameSym } from 'synapse:terraform'
 import { readFileSync } from 'node:fs'
 
-interface BundleOptions {
+export interface BundleOptions {
     readonly external?: string[]
     readonly destination?: string
     readonly moduleTarget?: 'cjs' | 'esm' | 'iife'
@@ -21,6 +21,18 @@ interface BundleOptions {
     readonly publishName?: string
     /** @internal */
     readonly includeAssets?: boolean
+
+    /** @internal */
+    readonly arch?: 'aarch64' | 'x64'
+
+    /** @internal */
+    readonly os?: 'windows' | 'darwin' | 'linux'
+
+    /** @internal */
+    readonly libc?: 'gnu' | 'musl'
+
+    /** @internal */
+    readonly endianness?: 'LE' | 'BE'
 
     /** 
      * @internal
@@ -50,7 +62,12 @@ export class Bundle extends core.Closure {
             captured: new core.SerializedObject(target).filePath,
         })
 
-        Object.assign(this, { destination: tagPointer(this.destination) })
+        Object.assign(this, {
+            // Terraform doesn't understand that some output fields are optional
+            // So we need to give hints to downstream code
+            hasAssets: opt?.includeAssets,
+            destination: tagPointer(this.destination),
+        })
     }
 }
 
@@ -91,7 +108,7 @@ class AssetConstruct extends core.Asset {
             path: props.path,
             extname: props.extname,
             type: props.type ?? AssetType.Archive,
-            // extraFiles: props.extraFiles,
+            extraFiles: props.extraFiles,
             // filePath: props.destination,
         })
 
@@ -100,18 +117,29 @@ class AssetConstruct extends core.Asset {
     }
 }
 
+function maybeGetAssets(pathOrTarget: string | Bundle) {
+    if (!(pathOrTarget instanceof Bundle)) {
+        return
+    }
+
+    if (!(pathOrTarget as any).hasAssets) {
+        return
+    }
+
+    return pathOrTarget.assets
+}
+
 //# resource = true
 export class Archive extends AssetConstruct {
     public constructor(pathOrTarget: string | Bundle) {
         const filePath = pathOrTarget instanceof Bundle ? pathOrTarget.destination : pathOrTarget as string
-        const extname =  pathOrTarget instanceof Bundle ? pathOrTarget.extname : path.extname(pathOrTarget as string)
-        //const extraFiles =  pathOrTarget instanceof Bundle ? (pathOrTarget as any).assets : undefined
+        const extname = pathOrTarget instanceof Bundle ? pathOrTarget.extname : path.extname(pathOrTarget as string)
 
         super({
             extname,
             path: filePath,
             type: AssetType.Archive,
-            // extraFiles,
+            extraFiles: maybeGetAssets(pathOrTarget),
         })
     }
 }

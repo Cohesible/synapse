@@ -3,7 +3,7 @@ import * as path from 'node:path'
 import { createFileHasher, isWindows, keyedMemoize, memoize, throwIfNotFileNotFoundError } from '../utils'
 import { Fs } from '../system'
 import { getGlobalCacheDirectory } from '../workspaces'
-import { getFs } from '../execution'
+import { getFs, pushDisposable } from '../execution'
 import { getProgramFs } from '../artifacts'
 
 interface DependencyEdge {
@@ -183,7 +183,11 @@ export async function clearIncrementalCache() {
     await getProgramFs().deleteFile(incrementalFileName).catch(throwIfNotFileNotFoundError)
 }
 
-export const getFileHasher = memoize(() =>  createFileHasher(getFs(), getGlobalCacheDirectory()))
+export const getFileHasher = memoize(() => {
+    const hasher = createFileHasher(getFs(), getGlobalCacheDirectory())
+
+    return pushDisposable(hasher)
+})
 
 // TODO: clear cache when updating packages
 export type IncrementalHost = ReturnType<typeof createIncrementalHost>
@@ -251,10 +255,7 @@ export function createIncrementalHost(opt: ts.CompilerOptions) {
             })
         }
 
-        await Promise.all([
-            saveCache({ ...cache, ...updatedCache }),
-            fileChecker.flush(),
-        ])
+        await saveCache({ ...cache, ...updatedCache })
 
         if (isWindows()) {
             return new Set([...changed].map(f => f.replaceAll('\\', '/')))

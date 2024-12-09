@@ -7,12 +7,13 @@ import { parseVersionConstraint } from '../versions'
 import { PackageInfo } from '../../runtime/modules/serdes'
 import { getFs } from '../../execution'
 import { extractTarball, extractToDir, hasBsdTar } from '../../utils/tar'
-import { findRemotePackage, listRemotePackages } from '../../workspaces'
+import { findRemotePackage, listRemotePackages, isRemoteDisabled } from '../../workspaces'
 
 export const sprPrefix = 'spr:'
 
-const shouldUseRemote = !!process.env['SYNAPSE_SHOULD_USE_REMOTE']
-const getClient = memoize(() => registry.createClient(shouldUseRemote ? undefined : { authorization: () => 'none' }))
+const getClient = memoize(() => 
+    registry.createClient(isRemoteDisabled() ? { authorization: () => 'none' } : undefined)
+)
 
 const downloadPackage = keyedMemoize(async (pkgId: string, hash: string) => {
     const data = await getClient().downloadPackage(hash, pkgId)
@@ -27,14 +28,22 @@ const downloadPackage = keyedMemoize(async (pkgId: string, hash: string) => {
     return await gunzip(data)
 })
 
-async function maybeParseRefsFromPipeline() {
+export const getPipelineDeps = memoize(() => {
     const data = process.env.SYNAPSE_PIPELINE_DEPS
     if (!data) {
         return
     }
 
+    return JSON.parse(data) as Record<string, string | { stepKeyHash: string; gitRef?: string; repoUrl?: string }>
+})
+
+async function maybeParseRefsFromPipeline() {
+    const parsed = getPipelineDeps()
+    if (!parsed) {
+        return
+    }
+
     const result: Record<string, string> = {}
-    const parsed = JSON.parse(data) as Record<string, string | { stepKeyHash: string; gitRef?: string; repoUrl?: string }>
     for (const [k, v] of Object.entries(parsed)) {
         if (typeof v !== 'string') continue // TODO
 
@@ -162,14 +171,19 @@ export function createSynapsePackageRepo(): PackageRepository {
     }
 }
 
-export async function downloadSynapsePackage(info: PackageInfo, dest: string) {
+export async function downloadSynapsePackageTarball(info: PackageInfo, dest?: string) {
     const integrity = info.resolved?.integrity
     if (!integrity?.startsWith('sha256:')) {
-        throw new Error(`Missing integrity for package: ${info.name} [destination: ${dest}]`)
+        throw new Error(`Missing integrity for package: ${info.name}${dest ? `[destination: ${dest}]` : ''}`)
     }
 
     const publishedHash = integrity.slice('sha256:'.length)
-    const tarball = await downloadPackage(info.name, publishedHash)
+
+    return downloadPackage(info.name, publishedHash)
+}
+
+export async function downloadSynapsePackage(info: PackageInfo, dest: string) {
+    const tarball = await downloadSynapsePackageTarball(info, dest)
     const files = extractTarball(tarball)
     await Promise.all(files.map(async f => {
         const absPath = path.resolve(dest, f.path)

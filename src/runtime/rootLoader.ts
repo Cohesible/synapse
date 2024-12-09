@@ -22,7 +22,7 @@ export function createBasicDataRepo(repo: DataRepository): BasicDataRepository {
         return encoding ? data.toString(encoding) : data
     }
 
-    return { getDataSync }
+    return { getDataSync, getMetadata: repo.getMetadata }
 }
 
 export function createModuleResolverForBundling(fs: Fs & SyncFs, workingDirectory: string): ModuleResolver {

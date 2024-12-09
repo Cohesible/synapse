@@ -4,7 +4,7 @@
 import * as assert from 'node:assert'
 import { Export } from 'synapse:lib'
 import { createSynapseClass } from 'synapse:terraform'
-import { using, defer, getCurrentId, contextType, maybeGetContext, importArtifact, isDataPointer } from 'synapse:core'
+import { using, defer, getCurrentId, contextType, maybeGetContext, importArtifact } from 'synapse:core'
 
 // Starting at one to guard against erroneous falsy checks on the id
 let idCounter = 1
@@ -18,11 +18,7 @@ export function test(name: string, fn: () => Promise<void> | void): void {
     }
 }
 
-export function it(name: string, fn: () => Promise<void> | void): void {
-    return test(name, fn)
-}
-
-export function describe(name: string, fn: () => void): void {
+export function suite(name: string, fn: () => void): void {
     const suite = maybeGetContext(TestSuite)
     if (suite) {
         const id = getCurrentId()
@@ -32,6 +28,18 @@ export function describe(name: string, fn: () => void): void {
         addDeferredTestItem({ type: 'suite', name, fn })
     }
 }
+
+export function it(name: string, fn: () => void) {
+    return test(name, fn)
+}
+
+export function describe(name: string, fn: () => void) {
+    return suite(name, fn)
+}
+
+// TODO: `resourceGraph.ts` needs to propagate the types to these declarations 
+// export const it = test
+// export const describe = suite
 
 export function before(fn: () => Promise<void> | void): void {
     const suite = maybeGetContext(TestSuite)
@@ -135,7 +143,7 @@ export class TestSuite {
 
             if (suite.hooks.after) {
                 const arr = this.hooks.after ??= []
-                arr.splice(0, 0, ...suite.hooks.after)
+                arr.push(...suite.hooks.after)
             }
         })
     }
@@ -283,7 +291,12 @@ function deepArrayEqual(actual: unknown[], expected: unknown[], message?: string
 // TODO: check proto, check descriptors
 function assertDeepStrictEqual(actual: unknown, expected: unknown, message?: string) {
     if (typeof actual !== typeof expected) {
-        throw createAssertionError(typeof actual, typeof expected, 'deepStrictEqual', message)
+        throw createAssertionError(
+            actual === null ? 'null' : typeof actual, 
+            expected === null ? 'null' : typeof expected, 
+            'deepStrictEqual', 
+            message
+        )
     }
 
     if (Object.is(actual, expected)) {

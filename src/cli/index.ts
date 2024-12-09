@@ -5,8 +5,8 @@ import * as path from 'node:path'
 import * as inspector from 'node:inspector'
 import { getLogger } from '../logging'
 import { LogLevel, logToFile, logToStderr, purgeOldLogs, validateLogLevel } from './logger'
-import { CancelError, getCurrentVersion, runWithContext, setContext, setCurrentVersion } from '../execution'
-import { RenderableError, colorize, getDisplay, printJson, printLine } from './ui'
+import { CancelError, dispose, getCurrentVersion, runWithContext, setContext, setCurrentVersion } from '../execution'
+import { RenderableError, colorize, getDisplay, printLine } from './ui'
 import { showUsage, executeCommand, runWithAnalytics, removeInternalCommands } from './commands'
 import { getCiType } from '../utils'
 import { resolveProgramBuildTarget } from '../workspaces'
@@ -288,7 +288,7 @@ export function main(...args: string[]) {
 
             didThrow = true
         } finally {
-            await getDisplay().dispose()
+            await dispose()
             await disposable?.dispose() // No more log events will be emitted
 
             setTimeout(() => {

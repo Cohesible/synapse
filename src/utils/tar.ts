@@ -36,7 +36,7 @@ export interface TarballFile {
     path: string
     mode: number
     contents: Buffer
-    // mtime: number
+    mtime: number
     // uid: number
     // gid: number
 }
@@ -54,6 +54,7 @@ export function extractTarball(buf: Buffer): TarballFile[] {
         const name = toString(buf, i, 100)
         const mode = parseInt(toString(buf, i + 100, 8), 8)
         const size = parseInt(toString(buf, i + 124, 12), 8)
+        const mtime = parseInt(toString(buf, i + 136, 12), 8)
         i += 512
 
         if (!isNaN(size)) {
@@ -64,6 +65,7 @@ export function extractTarball(buf: Buffer): TarballFile[] {
                 path: p, 
                 mode, 
                 contents,
+                mtime,
             })
 
             // File data section is always padded to the nearest 512 byte increment
@@ -99,7 +101,6 @@ export function createTarball(files: TarballFile[]): Buffer {
         const uid = 0
         const gid = 0
         const size = f.contents.length
-        const mtime = 0
 
         let relPath
         if (f.path.length >= 100) {
@@ -119,8 +120,7 @@ export function createTarball(files: TarballFile[]): Buffer {
         buf.write(toOctal(uid, 8), i + 108, 8, 'ascii')
         buf.write(toOctal(gid, 8), i + 116, 8, 'ascii')
         buf.write(toOctal(size, 12), i + 124, 12, 'ascii')
-        buf.write(toOctal(mtime, 12), i + 136, 12, 'ascii')
-
+        buf.write(toOctal(f.mtime, 12), i + 136, 12, 'ascii')
 
         buf.write(' '.repeat(8), i + 148, 8, 'ascii')
         let checksum = 0
@@ -218,4 +218,39 @@ export async function extractFileFromZip(zip: Buffer, fileName: string) {
     })
 
     return res as any as Buffer
+}
+
+export async function listFilesInZip(zip: Buffer) {
+    if (!(await hasBsdTar())) {
+        const tmp = path.resolve(process.cwd(), 'dist', `tmp-${randomUUID()}.zip`)
+        await getFs().writeFile(tmp, zip)
+        const res = await runCommand('unzip', ['-l', tmp]).finally(async () => {
+            await getFs().deleteFile(tmp)
+        })
+
+        // first three lines and last two lines we don't care
+        const lines = res.trim().split('\n').slice(3, -2)
+        return lines.map(l => {
+            const [length, date, time, name] = l.trim().split(/\s+/)
+
+            return name
+        })
+    }
+
+    if (process.platform === 'win32') {
+        const tmp = path.resolve(process.cwd(), 'dist', `tmp-${randomUUID()}.zip`)
+        await getFs().writeFile(tmp, zip)
+        const res = await runCommand('tar', ['-tzf', tmp]).finally(async () => {
+            await getFs().deleteFile(tmp)
+        })
+    
+        return res.split(/\r?\n/).map(x => x.trim()).filter(x => !!x)
+    }
+
+    // Only works with `bsdtar`
+    const res = await runCommand('tar', ['-tzf-'], {
+        input: zip,
+    })
+
+    return res.split(/\r?\n/).map(x => x.trim()).filter(x => !!x)
 }

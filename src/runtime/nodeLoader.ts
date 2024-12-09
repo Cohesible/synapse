@@ -95,9 +95,16 @@ function findDataRepoSync(dir: string): { dataDir: string; repo: BasicDataReposi
                 return _getDataSync(hash).toString(encoding)
             }
 
+            function getMetadata(hash: string, storeHash: string) {
+                const store = JSON.parse(getDataSync(storeHash, 'utf-8'))
+                const m = store.type === 'flat' ? store.artifacts[hash] : undefined
+        
+                return m
+            }
+
             return {
                 dataDir: path.resolve(dir, '.synapse', 'data'),
-                repo: { getDataSync }
+                repo: { getDataSync, getMetadata },
             }
         } 
     }

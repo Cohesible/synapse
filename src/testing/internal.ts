@@ -1,5 +1,5 @@
 import * as path from 'node:path'
-import { getFs, isSelfSea } from '../execution'
+import { getFs } from '../execution'
 import { createNpmLikeCommandRunner } from '../pm/publish'
 import { getWorkingDir } from '../workspaces'
 import { glob } from '../utils/glob'
@@ -11,6 +11,7 @@ import { isNonNullable } from '../utils'
 const commandsDirective = '!commands'
 const finallyCommand = '@finally'
 const expectFailCommand = '@expectFail'
+const skipCleanCommand = '@skipClean'
 
 function parseCommands(text: string) {
     const lines = text.split('\n')
@@ -57,6 +58,7 @@ function renderCommands(commands: string[], synapseCmd = process.env.SYNAPSE_CMD
         commands = commands.map(cmd => cmd.replaceAll('synapse', synapseCmd))
     }
 
+    let shouldClean = true
     const inner: string[] = []
     const statements: string[] = []
     for (let i = 0; i < commands.length; i++) {
@@ -66,9 +68,19 @@ function renderCommands(commands: string[], synapseCmd = process.env.SYNAPSE_CMD
             continue
         }
 
+        if (c.startsWith(skipCleanCommand)) {
+            shouldClean = false
+            continue
+        }
+
+        // Skip all `@` commands for forwards compat
+        if (c.startsWith('@')) {
+            continue
+        }
+
         const index = c.indexOf(expectFailCommand)
         if (index !== -1) {
-            const command = `${c.slice(0, index)}; if [[ $? -eq 0 ]]; then echo "Expected command ${i} to fail"; exit 1; fi`
+            const command = `${c.slice(0, index)}; if [[ $? -eq 0 ]]; then echo "Expected command ${i} to fail"; false; fi`
             inner.push(command)
         } else {
             inner.push(c)
@@ -80,27 +92,75 @@ function renderCommands(commands: string[], synapseCmd = process.env.SYNAPSE_CMD
         statements.push('exit $_EXIT_CODE')
     }
 
-    return [
+    const cmd = [
         inner.join(' && '),
         ...statements,
     ].join('; ')
+
+    return { cmd, shouldClean }
+}
+
+function getSynapseCmd() {
+    if (process.env.SYNAPSE_CMD) {
+        return process.env.SYNAPSE_CMD
+    }
+
+    const runIndex = process.argv.indexOf('run')
+    if (runIndex <= 0) {
+        return
+    }
+
+    // TODO: we need to get rid of `SYNAPSE_USE_DEV_LOADER` for this to work correctly
+    return process.argv[runIndex - 1]
+}
+
+async function cleanFixtures(dirs: Iterable<string>, synapseCmd = process.env.SYNAPSE_CMD || 'synapse') {
+    const shell = process.platform === 'win32' ? 'bash' : undefined
+
+    for (const dir of dirs) {
+        const runner = createNpmLikeCommandRunner(dir, undefined, 'inherit', shell)
+        await runner(synapseCmd, ['destroy', '--yes', '--clean-after'])
+    }
+}
+
+function parseDirectories(fileName: string, commands: string[]) {
+    const workingDir = path.dirname(fileName)
+    const dirs = new Set<string>([workingDir])
+    for (const cmd of commands) {
+        // Naive impl. only works for simple cases
+        const [_, dir] = cmd.match(/cd ([^\s]+)/) ?? []
+        if (dir) {
+            dirs.add(path.resolve(workingDir, dir))
+        }
+    }
+
+    return dirs
 }
 
 async function runTest(fileName: string, commands: string[], opt?: RunTestOptions) {
     // Force `bash` on windows
     const shell = process.platform === 'win32' ? 'bash' : undefined
+    const { cmd, shouldClean } = renderCommands(commands, opt?.synapseCmd)
 
-    if (opt?.snapshot) {
-        const runner = createNpmLikeCommandRunner(path.dirname(fileName), undefined, ['inherit', 'pipe', 'inherit'], shell)
-        const cmd = renderCommands(commands, opt?.synapseCmd)
-        const result = await runner(cmd)
-        return
+    async function runCommands() {
+        if (opt?.snapshot) {
+            const runner = createNpmLikeCommandRunner(path.dirname(fileName), undefined, ['inherit', 'pipe', 'inherit'], shell)
+            const result = await runner(cmd)
+            return
+        }
+    
+        const runner = createNpmLikeCommandRunner(path.dirname(fileName), undefined, 'inherit', shell)
+        await runner(cmd)
     }
 
-    const runner = createNpmLikeCommandRunner(path.dirname(fileName), undefined, 'inherit', shell)
-    const cmd = renderCommands(commands, opt?.synapseCmd)
-
-    await runner(cmd)
+    try {
+        await runCommands()
+    } finally {
+        if (shouldClean) {
+            const dirs = parseDirectories(fileName, commands)
+            await cleanFixtures(dirs, opt?.synapseCmd)
+        }
+    }
 }
 
 async function findTests(testDir: string, patterns = ['**/*.ts']) {
@@ -134,6 +194,8 @@ export async function main(...patterns: string[]) {
             failures.push([test.fileName, e])
         }
     }
+
+    console.log(`${tests.length - failures.length} tests passed`)
 
     if (failures.length > 0) {
         for (const [fileName, e] of failures) {

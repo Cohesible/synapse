@@ -330,7 +330,6 @@ function transformJsx(
     node: ts.Node, 
     jsxImport: ts.Identifier,
     assets: AssetsMap,
-    mode: 'runtime' | 'infra', 
     factory = ts.factory
 ) {
     const jsxExp = factory.createPropertyAccessExpression(jsxImport, 'jsx')
@@ -703,14 +702,14 @@ function isAssignedTo(node: ts.Node) {
 }
 
 function isConstantVariableDecl(sym: Symbol & { variableDeclaration: ts.VariableDeclaration }) {
-    // No initializer implies not constant
-    if (!sym.variableDeclaration.initializer) {
-        return false
-    }
-
     // Treat other bindings as constant (`var` is largely ignored)
     if (!(sym.variableDeclaration.parent.flags & ts.NodeFlags.Let)) {
         return true
+    }
+
+    // No initializer implies not constant
+    if (!sym.variableDeclaration.initializer) {
+        return false
     }
 
     // `for (let i = ...)`
@@ -900,7 +899,13 @@ function rewriteCapturedSymbols(
         replacementStacks.get(sym)![depth] = newNode
 
         for (const n of nodes) {
-            const exp = ts.isShorthandPropertyAssignment(n.parent) 
+            // We don't need to replace equivalent nodes
+            const isShorthand = ts.isShorthandPropertyAssignment(n.parent)
+            if (!isShorthand && ts.isIdentifier(n) && newNode === identifier && newNode.text === n.text) {
+                continue
+            }
+ 
+            const exp = isShorthand 
                 ? factory.createPropertyAssignment(n.parent.name, cloneNode(newNode) as ts.Expression)
                 : cloneNode(newNode)
 
@@ -911,23 +916,25 @@ function rewriteCapturedSymbols(
         }
     }
 
-    // Replace all non-root references with the identifier
-    const context = getNullTransformationContext()
-    function visit(node: ts.Node): ts.Node {
-        if (replacements.has(node)) {
-            return replacements.get(node)!
-        }
-
-        return ts.visitEachChild(node, visit, context)
-    }
-
     const inner = scope.node
 
     try {
+        const node = runtimeTransformer?.(inner) ?? inner
+        const infraNode = infraTransformer?.(inner, depth + 1) ?? inner
+        if (replacements.size === 0) {
+            return { node, infraNode, parameters: idents }
+        }
+
+        // Replace all non-root references with the identifier
+        const context = getNullTransformationContext()
+        function visit(node: ts.Node): ts.Node {
+            return replacements.get(node) ?? ts.visitEachChild(node, visit, context)
+        }
+
         return {
-            node: visit(runtimeTransformer?.(inner) ?? inner),
+            node: visit(node),
             // TODO: this doesn't need to be recursive
-            infraNode: visit(infraTransformer?.(inner, depth + 1) ?? inner), // TODO: can be made more efficient. We are creating orphaned files atm
+            infraNode: visit(infraNode), // TODO: can be made more efficient. We are creating orphaned files atm
             parameters: idents,
         }
     } catch (e) {
@@ -1144,6 +1151,7 @@ export interface CompiledFile {
     readonly path: string
     readonly data: string
     readonly infraData: string
+    readonly infraDeps?: string[]
     readonly parameters: [Symbol, SymbolMapping][]
     readonly assets?: AssetsMap
     readonly sourcesmaps?: {
@@ -1272,7 +1280,7 @@ export function createGraphCompiler(
     const compiled = new Map<string, Map<string, CompiledFile>>()
     const emitSourceMap = !!compilerOptions.sourceMap
 
-    // const dependencyStack: Set<string>[] = []
+    const dependencyStack: string[][] = []
 
     function getGraph(node: ts.SourceFile) {
         if (rootGraphs.has(node)) {
@@ -1443,8 +1451,8 @@ export function createGraphCompiler(
 
         const assets: AssetsMap = new Map()
 
-        function createClosure(body: ts.Node, mode: 'runtime' | 'infra') {
-            const finalized = finalize(jsxRuntime ? transformJsx(body, jsxRuntime, assets, mode, factory) : body)
+        function createClosure(body: ts.Node) {
+            const finalized = finalize(jsxRuntime ? transformJsx(body, jsxRuntime, assets, factory) : body)
             const withoutModifiers = (ts.isFunctionDeclaration(finalized) || ts.isClassDeclaration(finalized))
                 ? removeModifiers(finalized, [ts.SyntaxKind.ExportKeyword, ts.SyntaxKind.DefaultKeyword], factory)
                 : factory.createReturnStatement(finalized as ts.Expression)
@@ -1472,9 +1480,17 @@ export function createGraphCompiler(
             ]
         }
 
+        if (rewritten.node === rewritten.infraNode) {
+            return { 
+                extracted: createClosure(rewritten.node), 
+                parameters,
+                assets: assets.size > 0 ? assets : undefined,
+            }
+        }
+
         return { 
-            extracted: createClosure(rewritten.node, 'runtime'), 
-            extractedInfra: createClosure(rewritten.infraNode, 'infra'),
+            extracted: createClosure(rewritten.node), 
+            extractedInfra: createClosure(rewritten.infraNode),
             parameters,
             assets: assets.size > 0 ? assets : undefined,
         }
@@ -1507,27 +1523,29 @@ export function createGraphCompiler(
             failOnNode('Missing source file', node)
         }
 
-        if (!compiled.has(sourceFile.fileName)) {
-            compiled.set(sourceFile.fileName, new Map())
+        let chunks = compiled.get(sourceFile.fileName)
+        if (!chunks) {
+            chunks = new Map()
+            compiled.set(sourceFile.fileName, chunks)
         }
 
-        const chunks = compiled.get(sourceFile.fileName)!
-        if (!chunks.has(name)) {
+        let res = chunks.get(name)
+        if (!res) {
+            if (depth > 0) {
+                dependencyStack[dependencyStack.length - 1].push(name)
+            }
+    
             // `doCompile` pops the stack
-            // dependencyStack.push(new Set())
+            dependencyStack.push([])
 
             const chunk = doCompile()
             chunks.set(name, chunk)
             emitFile(chunk)
+            
+            res = chunk
         }
 
-        const res = chunks.get(name)!
-        // if (dependencyStack.length > 0) {
-        //     dependencyStack[dependencyStack.length - 1].add(name)
-        // }
-
         return {
-            depth,
             captured: res.parameters,
             assets: res.assets,
         }
@@ -1535,8 +1553,11 @@ export function createGraphCompiler(
         function doCompile() {
             const { extracted, extractedInfra, parameters, assets } = liftNode(node, factory, runtimeTransformer, infraTransformer, clauseReplacement, jsxRuntime, excluded, depth)
             const outfile = sourceFile.fileName.replace(/\.(t|j)(sx?)$/, `-${name}.$1$2`)
+
             const result = emitChunk(sourceMapHost, sourceFile, extracted as ts.Statement[], { emitSourceMap }) 
-            const resultInfra = emitChunk(sourceMapHost, sourceFile, extractedInfra as ts.Statement[], { emitSourceMap }) 
+            const resultInfra = extractedInfra === undefined 
+                ? result
+                : emitChunk(sourceMapHost, sourceFile, extractedInfra as ts.Statement[], { emitSourceMap })
 
             return {
                 sourceNode: ts.getOriginalNode(node),
@@ -1547,7 +1568,7 @@ export function createGraphCompiler(
                 infraData: resultInfra.text,
                 parameters,
                 assets,
-                // artifactDependencies: Array.from(dependencyStack[dependencyStack.length - 1]),
+                infraDeps: dependencyStack.pop(),
                 sourcesmaps: emitSourceMap ? {
                     runtime: result.sourcemap!,
                     infra: resultInfra.sourcemap!,
@@ -1804,7 +1825,7 @@ export function createSerializer(
             return transforms.expression
         }
 
-        function renderCapturedSymbols(mappings: [Symbol, SymbolMapping][], depth = 0, assets?: AssetsMap) {
+        function renderCapturedSymbols(mappings: [Symbol, SymbolMapping][], assets?: AssetsMap) {
             const base = mappings.map(([x, v]) => renderSymbol(x, v, depth))
             if (assets) {
                 base.push(renderAssets(assets))
@@ -1927,7 +1948,7 @@ export function createSerializer(
                 visitedClass,
                 createSerializationData(
                     getRelativeName(name),
-                    renderCapturedSymbols(r.captured, r.depth, r.assets),
+                    renderCapturedSymbols(r.captured, r.assets),
                     factory,
                     compiler.moduleType,
                 ),
@@ -1939,7 +1960,7 @@ export function createSerializer(
         function visitMethodDeclaration(node: ts.MethodDeclaration) {
             const name = getName(node)
             const r = compiler.compileNode(name, node, context.factory, runtimeTransformer, createInfraTransformer(name, innerTransformer), undefined, jsxRuntime, undefined, depth)
-            hoistMethodSerializationData(node, getRelativeName(name), renderCapturedSymbols(r.captured, r.depth, r.assets))
+            hoistMethodSerializationData(node, getRelativeName(name), renderCapturedSymbols(r.captured, r.assets))
 
             nameStack.push(name)
             const res = ts.visitEachChild(node, visit, context)
@@ -1964,7 +1985,7 @@ export function createSerializer(
                 visitedFn,
                 createSerializationData(
                     getRelativeName(name),
-                    renderCapturedSymbols(r.captured, r.depth, r.assets),
+                    renderCapturedSymbols(r.captured, r.assets),
                     factory,
                     compiler.moduleType,
                 ),
@@ -1984,7 +2005,7 @@ export function createSerializer(
 
             const name = getName(node)
             const r = compiler.compileNode(name, node, context.factory, runtimeTransformer, createInfraTransformer(name, innerTransformer), undefined, jsxRuntime, undefined, depth)
-            hoistSerializationData(node, getRelativeName(name), renderCapturedSymbols(r.captured, r.depth, r.assets))
+            hoistSerializationData(node, getRelativeName(name), renderCapturedSymbols(r.captured, r.assets))
 
             nameStack.push(name)
             const res = ts.visitEachChild(node, visit, context)

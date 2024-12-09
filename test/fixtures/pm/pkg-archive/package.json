@@ -1,5 +1,5 @@
 {
     "dependencies": {
-        "pkg-b": "^0.0.1"
+        "pkg-b": "file:pkg-b/out/pkg.tgz"
     }
 }

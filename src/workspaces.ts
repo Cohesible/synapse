@@ -122,7 +122,11 @@ export function getUserConfigFilePath() {
 export function getTempZigBuildDir() {
     const bt = getBuildTargetOrThrow()
 
-    return path.resolve(bt.buildDir, 'zig', getHash(toProgramRef(bt)))
+    return path.resolve(getGlobalZigBuildDir(), getHash(toProgramRef(bt)))
+}
+
+export function getGlobalZigBuildDir() {
+    return path.resolve(getBuildTargetOrThrow().buildDir, 'zig')
 }
 
 export interface Project {
@@ -576,7 +580,7 @@ async function getOrCreateApp(state: Branch, bt: BuildTarget) {
 }
 
 const getProjectsClient = memoize(() => {
-    if (!shouldCreateRemoteProject) {
+    if (isRemoteDisabled()) {
         return projects.createClient({ authorization: () => 'none' })
     }
     return projects.createClient()
@@ -701,7 +705,7 @@ async function migratePrograms(state: ProjectState) {
 async function updateProjectState(state: ProjectState, updatedBranches: string[] = []) {
     await setProjectState(state)
 
-    if (!shouldUseRemote) {
+    if (isRemoteDisabled()) {
         return
     }
 
@@ -730,12 +734,12 @@ async function updateProjectState(state: ProjectState, updatedBranches: string[]
     }
 }
 
-export async function getOrCreateDeployment(bt: BuildTarget = getBuildTargetOrThrow()) {
+export async function getOrCreateDeployment(bt: BuildTarget = getBuildTargetOrThrow(), useDefaultBranch?: boolean) {
     if (bt.deploymentId) {
         return bt.deploymentId
     }
 
-    const totalState = await getBranchAwareState(bt.projectId, bt.branchName)
+    const totalState = await getBranchAwareState(bt.projectId, useDefaultBranch ? undefined : bt.branchName)
     if (!totalState) {
         throw new Error(`Missing project state: ${bt.projectId} [${bt.rootDirectory}${bt.branchName ? `@${bt.branchName}` : ''}]`)
     }
@@ -1071,8 +1075,8 @@ async function createProject(rootDir: string, remotes?: Omit<Remote, 'headBranch
     return project
 }
 
-function isRemoteDisabled() {
-    return !process.env['SYNAPSE_FORCE_REMOTE_PROJECTS'] && (!shouldCreateRemoteProject || process.env['SYNAPSE_FORCE_NO_REMOTE'])
+export function isRemoteDisabled() {
+    return !process.env['SYNAPSE_FORCE_REMOTE_PROJECTS'] && (!shouldUseRemote || process.env['SYNAPSE_FORCE_NO_REMOTE'])
 }
 
 async function listRemoteProjects() {
@@ -1268,7 +1272,7 @@ export async function findRemotePackage(spec: string): Promise<string | undefine
         if (!app) continue
 
         const env = app.environments[bt.environmentName ?? app.defaultEnvironment ?? 'local']
-        if (!env.packageId) continue
+        if (!env?.packageId) continue
 
         const dir = v.workingDirectory ? path.resolve(bt.rootDirectory, v.workingDirectory) : bt.rootDirectory
         const pkgJson = await getPackageJson(getFs(), dir, false)
@@ -1281,7 +1285,7 @@ export async function findRemotePackage(spec: string): Promise<string | undefine
 }
 
 async function tryGetBranch(projId: string, branchName: string) {
-    if (!shouldUseRemote) {
+    if (isRemoteDisabled()) {
         return
     }
 
@@ -1316,31 +1320,16 @@ async function getBranchAwareState(projId: string, branchName?: string) {
     return { state, branch }
 }
 
-export async function listDeployments(id?: string, branchName?: string) {
-    const projectId = id ?? await getCurrentProjectId()
-    branchName ??= getBuildTargetOrThrow().branchName
-
-    const totalState = await getBranchAwareState(projectId, branchName)
-    if (!totalState) {
-        return {}
-    }
-
-    const branchState = totalState.branch ?? totalState.state
-    const res: [string, string][] = []
-
-    const rootDir = getProjectDirectorySync(projectId)
-    for (const [k, v] of Object.entries(branchState.programs)) {
-        if (!v.processId) continue
-        
-        res.push([v.processId, path.resolve(rootDir, v.workingDirectory ?? '')])
-    }
-
-    return Object.fromEntries(res)
-}
-
 export async function listAllDeployments() {
     const entities = await getEntities()
-    const res: Record<string, { workingDirectory: string, programId: string; projectId: string; branchName?: string }> = {}
+    const res: Record<string, { 
+        workingDirectory: string
+        programId: string 
+        projectId: string
+        branchName?: string
+        environment?: string
+    }> = {}
+
     for (const [k, v] of Object.entries(entities.deployments)) {
         const projDir = v.projectId !== 'global' 
             ? entities.projects[v.projectId]?.directory
@@ -1356,16 +1345,19 @@ export async function listAllDeployments() {
         }
 
         const prog = proj.programs[v.programId]
-        if (!prog) {
+        if (!prog || !prog.appId) {
             continue
         }
 
+        const app = proj.apps[prog.appId]
+        const pair = app ? Object.entries(app.environments).find(([k, v]) => v.deploymentId === v.deploymentId) : undefined
         const workingDirectory = path.resolve(projDir, prog.workingDirectory ?? '') 
         res[k] = { 
             workingDirectory, 
             programId: v.programId, 
             projectId: proj.id, 
             branchName: v.branchName,
+            environment: pair?.[0],
         }
     }
 
@@ -1427,33 +1419,28 @@ function getRemotePackageId(branch: Branch, programId: string) {
 
 export async function getOrCreateRemotePackage(useDefaultBranch?: boolean) {
     const bt = getBuildTargetOrThrow()
+
+    await getOrCreateDeployment(bt, useDefaultBranch)
+
     const totalState = await getBranchAwareState(bt.projectId, useDefaultBranch ? undefined : bt.branchName)
     if (!totalState) {
         throw new Error(`No project state found: ${bt.projectId}`)
     }
 
     const branchState = totalState.branch ?? totalState.state
-    const appId = branchState.programs[bt.programId]?.appId
-    if (!appId) {
-        throw new Error(`No app id found for program: ${bt.programId}`)
-    }
-
-    const app = branchState.apps[appId]
-    if (!app) {
-        throw new Error(`Missing app: ${appId}`)
-    }
+    const app = await getOrCreateApp(branchState, bt)
 
     const envName = bt.environmentName ?? app.defaultEnvironment ?? 'local'
     const environment = app.environments[envName]
     if (!environment) {
-        throw new Error(`Missing environment "${envName}" in app: ${appId}`)
+        throw new Error(`Missing environment "${envName}" in app: ${app.id}`)
     }
 
     if (environment.packageId) {
         return environment.packageId
     }
 
-    if (!shouldUseRemote) {
+    if (isRemoteDisabled()) {
         throw new Error(`Unable to create new remote package for app: ${app.id}`)
     }
 

@@ -342,6 +342,12 @@ function resolveBody(body: any) {
         }
     }
 
+    if (body instanceof ArrayBuffer) {
+        return { 
+            body: typeof Buffer !== 'undefined' ? Buffer.from(body) : body,
+        }
+    }
+
     if (isTypedArray(body)) {
         const contentEncoding = body[contentEncodingSym]
 
@@ -669,6 +675,21 @@ function getAgent(http: typeof import('node:https')) {
     return agent
 }
 
+function tryParseRetryAfter(val: string | undefined) {
+    if (!val) {
+        return
+    }
+
+    const num = Number(val)
+    if (!isNaN(num)) {
+        return num >= 0 ? num * 1000 : undefined
+    }
+
+    const date = new Date(val)
+
+    return Date.now() - date.getTime()
+}
+
 function doRequest(request: http.RequestOptions | URL, body?: any) {
     // We create an error here to preserve the trace
     const err = new Error()
@@ -713,8 +734,25 @@ function doRequest(request: http.RequestOptions | URL, body?: any) {
                     : result
 
                 if (res.statusCode && res.statusCode >= 400) {
+                    if (res.statusCode === 429 || res.statusCode === 503) {
+                        const retryAfter = tryParseRetryAfter(res.headers['retry-after'])
+                        if (retryAfter !== undefined) {
+                            setTimeout(() => {
+                                // TODO: original stack trace is lost here
+                                doRequest(request, body).then(resolve, reject)
+                            }, retryAfter)
+
+                            return
+                        }
+                    }
+
                     if (isJson && result) {
-                        const e = JSON.parse(decoded.toString('utf-8'))
+                        let e: any | undefined
+                        try {
+                            e = JSON.parse(decoded.toString('utf-8'))
+                        } catch (parseErr) {
+                            e = new Error(decoded.toString('utf-8'))
+                        }
 
                         err.message = e.message ?? `Received non-2xx status code: ${res.statusCode}`
                         const stack = `${e.name ?? 'Error'}: ${err.message}\n` + err.stack?.split('\n').slice(1).join('\n')

@@ -128,7 +128,7 @@ function createProviderRoutes(ctx: DeploymentContext) {
             if (pointerMappings) {
                 m[pointerMappings[0]] = pointerMappings[1]
             }
-            getLogger().debug('Registering import map parsed from resource plan:', handler, Object.keys(m))
+            //getLogger().debug('Registering import map parsed from resource plan:', handler, Object.keys(m))
             loader.registerMapping(m, getWorkingDir())
         }
 
@@ -955,7 +955,10 @@ function createAssetRoute(ctx: DeploymentContext, terraformWorkingDirectory: str
             if (extraFiles) {
                 for (const [k, v] of Object.entries(extraFiles)) {
                     const name = k.startsWith('file:./') ? k.slice('file:./'.length) : k
-                    const location = v.startsWith('pointer:') ? resolveArtifact(dir, v) : path.resolve(terraformWorkingDirectory, v)
+                    const location = v.startsWith('pointer:') 
+                        ? (await getArtifactFs()).resolveArtifact(v) 
+                        : path.resolve(terraformWorkingDirectory, v)
+
                     files[name] = await location
                 }
             }

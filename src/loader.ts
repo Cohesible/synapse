@@ -400,7 +400,7 @@ export function createrLoader(
             return proxy
         }
 
-        function wrapExports(spec: string, virtualId: string | undefined, exports: any, isInfra: boolean = false) {
+        function wrapExports(spec: string, virtualId: string | undefined, exports: any, isInfra: boolean = false, importer?: string) {
             const cached = proxyCache.get(exports)
             if (cached) {
                 return cached
@@ -415,8 +415,16 @@ export function createrLoader(
             }
 
             if (spec.startsWith(pointerPrefix)) {
-                proxyCache.set(exports, exports)
-                return exports
+                // Need to do this for `.zig` modules because their binding code isn't instrumented
+                if (!importer?.endsWith('.zig.js')) {
+                    proxyCache.set(exports, exports)
+                    return exports
+                }
+
+                const proxy = createModuleProxy(context, spec, undefined, exports, isInfra, undefined, solveHostPerms)
+                proxyCache.set(exports, proxy)
+
+                return proxy
             }
 
             const proxy = createModuleProxy(context, spec, virtualId, exports, isInfra, packageResolver, solveHostPerms)
@@ -479,6 +487,24 @@ export function createrLoader(
                 get Response() {
                     return Response
                 },
+                get URLSearchParams() {
+                    return URLSearchParams
+                },
+                get AbortSignal() {
+                    return AbortSignal
+                },
+                get Event() {
+                    return Event
+                },
+                get EventTarget() {
+                    return EventTarget
+                },
+                get TextDecoder() {
+                    return TextDecoder
+                },
+                get TextEncoder() {
+                    return TextEncoder
+                },
                 get console() {
                     return getWrappedIo().console
                 },
@@ -533,7 +559,7 @@ export function createrLoader(
                     if (!addWrap) {
                         return exports
                     }
-                    return wrapExports(spec, virtualId, exports, isInfra)
+                    return wrapExports(spec, virtualId, exports, isInfra, importer)
                 }
     
                 if (isBuiltin(spec)) {
@@ -922,8 +948,8 @@ function wrapPath(Fn: typeof terraform['Fn'], internalState: typeof terraform.in
     return exports
 }
 
-function patchModule(createRequire2: (origin: string) => (id: string) => any): typeof import('module') {
-    const exports = require('module') as typeof import('module')
+function patchModule(createRequire2: (origin: string) => (id: string) => any): typeof import('node:module') {
+    const exports = require('node:module') as typeof import('node:module')
     
     return new Proxy(exports, {
         get: (_, prop) => {

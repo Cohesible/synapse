@@ -1,10 +1,11 @@
+import * as path from 'node:path'
 import { getFs } from '../execution'
-import { tryReadJson, tryReadJsonSync } from '../utils'
+import { memoize, tryReadJson, tryReadJsonSync, makeRelative } from '../utils'
 import { getUserConfigFilePath } from '../workspaces'
 
 let config: Record<string, any>
-let pendingConfig: Promise<Record<string, any>>
-function _readConfig(): Promise<Record<string, any>> | Record<string, any> {
+let pendingConfig: Promise<Record<string, any>> | undefined
+function readConfig(): Promise<Record<string, any>> | Record<string, any> {
     if (config) {
         return config
     }
@@ -14,13 +15,22 @@ function _readConfig(): Promise<Record<string, any>> | Record<string, any> {
     }
 
     return pendingConfig = tryReadJson(getFs(), getUserConfigFilePath()).then(val => {
-        val ??= {}
-        return config = val as any
+        return config = (val ?? {}) as any
+    }).finally(() => {
+        pendingConfig = undefined
     })
 }
 
+function readConfigSync(): Record<string, any> {
+    if (config) {
+        return config
+    }
+
+    return config = (tryReadJsonSync(getFs(), getUserConfigFilePath()) ?? {})
+}
+
 let pendingWrite: Promise<void> | undefined
-function _writeConfig(conf: Record<string, any>) {
+function writeConfig(conf: Record<string, any>) {
     config = conf
 
     const write = () => getFs().writeFile(getUserConfigFilePath(), JSON.stringify(conf, undefined, 4))
@@ -43,19 +53,8 @@ function _writeConfig(conf: Record<string, any>) {
         }
         pendingWrite = undefined
     })
+
     return pendingWrite = tmp
-}
-
-async function readConfig(): Promise<Record<string, any>> {
-    return (await tryReadJson(getFs(), getUserConfigFilePath())) ?? {}
-}
-
-async function writeConfig(conf: Record<string, any>): Promise<void> {
-    await getFs().writeFile(getUserConfigFilePath(), JSON.stringify(conf, undefined, 4))
-}
-
-function readConfigSync(): Record<string, any> {
-    return tryReadJsonSync(getFs(), getUserConfigFilePath()) ?? {}
 }
 
 function getValue(val: any, key: string) {
@@ -96,6 +95,41 @@ export async function setKey(key: string, value: any) {
     await writeConfig(config)
 
     return oldValue
+}
+
+const getUserConfigDir = memoize(() => path.dirname(getUserConfigFilePath()))
+
+export function readPathKeySync(key: string): string | undefined {
+    const val = readKeySync<string>(key)
+
+    return val !== undefined ? path.resolve(getUserConfigDir(), val) : val
+}
+
+export async function readPathKey(key: string): Promise<string | undefined> {
+    const val = await readKey<string>(key)
+
+    return val !== undefined ? path.resolve(getUserConfigDir(), val) : val
+}
+
+export async function readPathMapKey(key: string): Promise<Record<string, string> | undefined> {
+    const val = await readKey<Record<string, string>>(key)
+    if (!val) {
+        return
+    }
+
+    const resolved: Record<string, string> = {}
+    for (const k of Object.keys(val)) {
+        resolved[k] = path.resolve(getUserConfigDir(), val[k])
+    }
+
+    return resolved
+}
+
+export async function setPathKey(key: string, value: string) {
+    const abs = path.resolve(getUserConfigDir(), value)
+    const rel = makeRelative(getUserConfigDir(), abs)
+
+    return setKey(key, rel)
 }
 
 // synapse.cli.suggestions -> false

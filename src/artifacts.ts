@@ -5,7 +5,7 @@ import type { ExternalValue, PackageInfo } from './runtime/modules/serdes'
 import { getLogger, runTask } from './logging'
 import { Mutable, acquireFsLock, createRwMutex, createTrie, deepClone, getHash, isNonNullable, keyedMemoize, memoize, sortRecord, throwIfNotFileNotFoundError, tryReadJson } from './utils'
 import type { TerraformPackageManifest, TfJson } from './runtime/modules/terraform'
-import { BuildTarget, Deployment, Program, getBuildDir, getProgramInfoFromDeployment, getRemoteProjectId, getRootDir, getRootDirectory, getTargetDeploymentIdOrThrow, getWorkingDir, resolveProgramBuildTarget, toProgramRef } from './workspaces'
+import { BuildTarget, isRemoteDisabled, getBuildDir, getProgramInfoFromDeployment, getRemoteProjectId, getRootDir, getRootDirectory, getTargetDeploymentIdOrThrow, getWorkingDir, resolveProgramBuildTarget, toProgramRef } from './workspaces'
 import {  NpmPackageInfo } from './pm/packages'
 import { TargetsFile, readPointersFile } from './compiler/host'
 import { TarballFile } from './utils/tar'
@@ -29,7 +29,6 @@ export interface GlobalMetadata {
 export interface LocalMetadata {
     readonly name?: string
     readonly source?: string
-    readonly moduleId?: string
     readonly sourcemaps?: Record<string, string>
     readonly publishName?: string
     readonly dependencies?: string[]
@@ -90,9 +89,18 @@ export interface CompiledChunk {
     readonly infra: string
 }
 
+export interface NativeModule {
+    readonly kind: 'native-module'
+    readonly binding: string // base64
+    readonly bindingLocation: string
+    readonly sourceName: string
+    // TODO: replace `sourceName` with a "source bundle"
+}
+
 export type Artifact = 
     | DeployedModule
     | CompiledChunk
+    | NativeModule
 
 const isPointer = (fileName: string) => fileName.startsWith(pointerPrefix)
 const hasMetadata = (fileName: string) => fileName.length === pointerPrefix.length + 129
@@ -122,12 +130,12 @@ interface BaseArtifactStore {
     resolveMetadata(metadata: LocalMetadata): ArtifactMetadata
 }
 
-export interface ClosedArtifactStore<T extends Record<string, any> = Record<string, any>> extends BaseArtifactStore {
+export interface ClosedArtifactStore extends BaseArtifactStore {
     readonly state: 'closed'
     readonly hash: string
 }
 
-export interface OpenedArtifactStore<T extends Record<string, any> = Record<string, any>> extends BaseArtifactStore {
+export interface OpenedArtifactStore extends BaseArtifactStore {
     readonly id: string
     readonly state: 'opened'
     setMetadata(hash: string, metadata: ArtifactMetadata): void
@@ -136,7 +144,7 @@ export interface OpenedArtifactStore<T extends Record<string, any> = Record<stri
     close(): string
 }
 
-export type ArtifactStore<T extends Record<string, any> = Record<string, any>> = OpenedArtifactStore<T> | ClosedArtifactStore<T>
+export type ArtifactStore = OpenedArtifactStore | ClosedArtifactStore
 
 interface DenormalizedStoreManifest {
     readonly type?: 'denormalized'
@@ -240,9 +248,9 @@ interface ResolveArtifactOpts {
 
 interface RootArtifactStore {
     commitStore(state: ArtifactStoreState): string
-    createStore<T extends Record<string, any>>(): OpenedArtifactStore<T>
-    getStore<T extends Record<string, any>>(hash: string): Promise<ClosedArtifactStore<T>>
-    getStoreSync<T extends Record<string, any>>(hash: string): ClosedArtifactStore<T>
+    createStore(): OpenedArtifactStore
+    getStore(hash: string): Promise<ClosedArtifactStore>
+    getStoreSync(hash: string): ClosedArtifactStore
 
     getBuildFs(hash: string): Promise<ReadonlyBuildFs>
 
@@ -255,6 +263,7 @@ interface RootArtifactStore {
     getMetadata(hash: string): Record<string, ArtifactMetadata> | undefined
     getMetadata(hash: string, source: string): ArtifactMetadata
     getMetadata2(pointer: string): Promise<ArtifactMetadata>
+    getMetadata2(hash: string, source: string): Promise<ArtifactMetadata>
 
     resolveArtifact(hash: string, opt: ResolveArtifactOpts & { sync: true }): string
     resolveArtifact(hash: string, opt?: ResolveArtifactOpts): Promise<string> | string
@@ -1161,9 +1170,15 @@ export function createBuildFsFragment(repo: DataRepository, index: BuildFsIndex,
                 throw err
             }
 
+            // A conflict implies that the same data was (or will be) written
+            // So we only need to worry about persisting the metadata
             _close(target.key)
             const newTarget = initStore(target.key)
-            newTarget.store.setMetadata(err.dataHash, resolved ?? {})
+
+            // We need to re-resolve metadata
+            const resolved = _resolveMetadata(newTarget, metadata)!
+            newTarget.store.setMetadata(err.dataHash, resolved)
+            opened[target.key].didChange = true
 
             return _getPointer(newTarget, err.dataHash)
         }
@@ -2227,10 +2242,6 @@ function createRootFs(fs: Fs & SyncFs, rootDir: string, defaultId: string, opt?:
 
         const fs = await repo.getRootBuildFs(r.fsId)
         const pointer = await fs.open(r.storeKey).writeData(data, options?.metadata)
-        // if (r.relative !== '') {
-        //     const arr = targetedWrites[`${r.fsId}:${r.storeKey}:${r.relative}`] ??= []
-        //     arr.push(pointer)
-        // }
 
         return pointer
     }
@@ -2276,19 +2287,13 @@ function createRootFs(fs: Fs & SyncFs, rootDir: string, defaultId: string, opt?:
         const encoding = typeof options === 'string' ? options : options?.encoding
         const buf = typeof data === 'string' ? Buffer.from(data, encoding) : data
         const opt = typeof options === 'string' ? undefined : options
-        // const checkChanged = opt?.checkChanged
 
         const root = await repo.getRootBuildFs(r.fsId)
-        // const previousFile = checkChanged ? root.findFile(fileName) : undefined
+
         const buildFs = root.open(r.storeKey)
         const dependencies = opt?.metadata?.dependencies
 
         await buildFs.writeFile(r.relative, buf, { ...opt?.metadata, dependencies })
-
-        // const p = await buildFs.writeFile(r.relative, buf, { ...opt?.metadata, dependencies })
-        // if (checkChanged && p.hash !== previousFile?.fileHash) {
-        //     changed.set(fileName, previousFile?.fileHash)
-        // }
     }
 
     async function readFile(fileName: string, options?: ReadFileOptions & { encoding: undefined }): Promise<Uint8Array>
@@ -2546,7 +2551,6 @@ function createRootFs(fs: Fs & SyncFs, rootDir: string, defaultId: string, opt?:
             return readFile(fileName, 'utf-8').then(JSON.parse)
         }
 
-        // const buildFs = (await repo.getRootBuildFs(r.fsId)).open(r.storeKey)
         const buildFs = await repo.getRootBuildFs(r.fsId)
         const pointer = buildFs.getPointer(r.relative)
         const [data, metadata] = await Promise.all([
@@ -2578,6 +2582,15 @@ function createRootFs(fs: Fs & SyncFs, rootDir: string, defaultId: string, opt?:
         return metadata as ArtifactMetadata & { pointer: string }
     }
 
+    function getPointerSync(fileName: string) {
+        const r = resolve(fileName)
+        if (r.type !== 'bfs-file') {
+            throw new Error(`Invalid target type: ${r.type} [fileName: ${fileName}]`)
+        }
+
+        return repo.getRootBuildFsSync(r.fsId).getPointer(r.relative)
+    }
+
     const _fs = {
         link,
         stat,
@@ -2603,6 +2616,7 @@ function createRootFs(fs: Fs & SyncFs, rootDir: string, defaultId: string, opt?:
         getMetadata,
         listStores,
         rename,
+        getPointerSync,
     }
 }
 
@@ -2995,7 +3009,7 @@ function createCopier(repo: DataRepository, normalizer = createNormalizer(repo))
         return copied
     }
 
-    return { copyData, getCopiedOrThrow }
+    return { copyData, getCopied, getCopiedOrThrow }
 }
 
 export async function consolidateBuild(repo: DataRepository, build: BuildFsIndex, toKeep: string[], opt?: NormalizerOptions) {
@@ -3630,7 +3644,14 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
         return getStoreSync(storeHash).getMetadata(hash, storeHash)
     }
 
-    async function getMetadata2(pointer: string) {
+    async function getMetadata2(pointer: string): Promise<ArtifactMetadata>
+    async function getMetadata2(hash: string, source: string): Promise<ArtifactMetadata>
+    async function getMetadata2(pointerOrHash: string, source?: string) {
+        if (source) {
+            return _getMetadata(pointerOrHash, source, true)
+        }
+
+        const pointer = pointerOrHash
         if (!isDataPointer(pointer)) {
             throw new Error('Not implemented')
         }
@@ -5012,10 +5033,8 @@ async function syncHeads(repo: DataRepository, remote: RemoteArtifactRepository,
     }
 }
 
-const shouldUseRemote = !!process.env['SYNAPSE_SHOULD_USE_REMOTE']
-
 export async function syncRemote(projectId: string, deploymentId: string) {
-    if (!shouldUseRemote) {
+    if (isRemoteDisabled()) {
         return
     }
 

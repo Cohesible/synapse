@@ -5,7 +5,6 @@ import { defineResource, asset, runCommand } from 'synapse:core'
 import { describe, it, expectEqual } from 'synapse:test'
 import { Function } from 'synapse:srl/compute'
 
-
 class MyData extends defineResource({
     create: async (asset: string) => {
         const data = await lib.readAsset(asset)

@@ -1,24 +1,26 @@
 import * as path from 'node:path'
 import * as zlib from 'node:zlib'
 import * as github from '../utils/github'
-import { getGlobalCacheDirectory, getUserSynapseDirectory, resolveProgramBuildTarget, toProgramRef } from '../workspaces'
-import { getBuildTargetOrThrow, getFs } from '../execution'
-import { createTarball, extractFileFromZip, extractTarball, hasBsdTar } from '../utils/tar'
+import { getGlobalCacheDirectory, getRootDirectory, getUserSynapseDirectory, getWorkingDir, resolveProgramBuildTarget, toProgramRef } from '../workspaces'
+import { getBuildTargetOrThrow, getFs, runWithContext } from '../execution'
+import { createTarball, extractFileFromZip, extractTarball, hasBsdTar, listFilesInZip } from '../utils/tar'
 import { PackageJson, getPackageJson } from '../pm/packageJson'
 import { downloadSource } from '../build/sources'
 import { buildGoProgram } from '../build/go'
-import { installModules } from '../pm/packages'
-import { createMergedView } from '../pm/publish'
-import { Snapshot, consolidateBuild, createSnapshot, dumpData, getDataRepository, getModuleMappings, getProgramFs, getSnapshotPath, linkFs, pruneBuild, writeSnapshotFile } from '../artifacts'
+import { getSynapseTarballs, installModules } from '../pm/packages'
+import { createMergedView, createSynapseTarball, publishToRemote } from '../pm/publish'
+import { Snapshot, consolidateBuild, createSnapshot, dumpData, getDataRepository, getDeploymentFs, getModuleMappings, getProgramFs, getSnapshotPath, linkFs, pruneBuild, writeSnapshotFile } from '../artifacts'
 import { QualifiedBuildTarget, resolveBuildTarget } from '../build/builder'
 import { runCommand } from '../utils/process'
 import { toAbsolute, toDataPointer } from '../build-fs/pointers'
 import { glob } from '../utils/glob'
-import { gzip, memoize, throwIfNotFileNotFoundError, tryReadJson } from '../utils'
+import { getCiType, gzip, makeExecutable, memoize, throwIfNotFileNotFoundError, tryReadJson } from '../utils'
 import { getLogger } from '../logging'
-import { randomUUID } from 'node:crypto'
 import { createZipFromDir } from '../deploy/deployment'
 import { tmpdir } from 'node:os'
+import { bundleExecutable, bundlePkg } from '../closures'
+import { buildWindowsShim } from '../zig/compile'
+import { makeSea, resolveAssets } from '../build/sea'
 
 
 const integrations = {
@@ -37,6 +39,18 @@ export async function copyIntegrations(rootDir: string, dest: string, included?:
         if (include && !include.has(k)) continue
         const integrationPkgPath = path.resolve(rootDir, v)
         await createPackageForRelease(integrationPkgPath, path.resolve(packagesDir, k), undefined, true)
+    }
+}
+
+export async function downloadIntegrations(dest: string, included?: string[]) {
+    const packagesDir = path.resolve(dest, 'packages')
+    const include = included ? new Set(included) : undefined
+
+    const deps = Object.keys(integrations).filter(k => !include || include.has(k))
+    const tarballs = await getSynapseTarballs(deps)
+
+    for (const [k, v] of Object.entries(tarballs)) {
+        await getFs().writeFile(path.resolve(packagesDir, k), v)
     }
 }
 
@@ -96,41 +110,6 @@ const doReq = (url: string) => new Promise<any>((resolve, reject) => {
     req.end()
 })
 
-async function listFilesInZip(zip: Buffer) {
-    if (!(await hasBsdTar())) {
-        const tmp = path.resolve(process.cwd(), 'dist', `tmp-${randomUUID()}.zip`)
-        await getFs().writeFile(tmp, zip)
-        const res = await runCommand('unzip', ['-l', tmp]).finally(async () => {
-            await getFs().deleteFile(tmp)
-        })
-
-        // first three lines and last two lines we don't care
-        const lines = res.trim().split('\n').slice(3, -2)
-        return lines.map(l => {
-            const [length, date, time, name] = l.trim().split(/\s+/)
-
-            return name
-        })
-    }
-
-    if (process.platform === 'win32') {
-        const tmp = path.resolve(process.cwd(), 'dist', `tmp-${randomUUID()}.zip`)
-        await getFs().writeFile(tmp, zip)
-        const res = await runCommand('tar', ['-tzf', tmp]).finally(async () => {
-            await getFs().deleteFile(tmp)
-        })
-    
-        return res.split(/\r?\n/).map(x => x.trim()).filter(x => !!x)
-    }
-
-    // Only works with `bsdtar`
-    const res = await runCommand('tar', ['-tzf-'], {
-        input: zip,
-    })
-
-    return res.split(/\r?\n/).map(x => x.trim()).filter(x => !!x)
-}
-
 async function getOrDownloadNode(version: string, target: QualifiedBuildTarget) {
     const p = path.resolve(getNodeBinCacheDir(), `${version}-${target.os}-${target.arch}${target.libc ? `-${target.libc}` : ''}`)
     if (await getFs().fileExists(p)) {
@@ -182,50 +161,6 @@ async function getNodeJsForPkg(pkgDir: string, target?: Partial<QualifiedBuildTa
         path.resolve(pkgDir, 'bin', target?.os === 'windows' ? 'node.exe' : 'node'),
         await getFs().readFile(nodePath)
     )
-}
-
-export async function downloadNodeLib(owner = 'Cohesible', repo = 'node') {
-    const dest = path.resolve('dist', 'node.lib')
-    if (await getFs().fileExists(dest)) {
-        return dest
-    }
-
-    const assetName = 'node-lib-windows-x64'
-
-    async function downloadAndExtract(url: string) {
-        const archive = await github.fetchData(url)
-        const files = await listFilesInZip(archive)
-        if (files.length === 0) {
-            throw new Error(`Archive contains no files: ${url}`)
-        }
-    
-        const file = await extractFileFromZip(archive, files[0])
-        await getFs().writeFile(path.resolve('dist', 'node.lib'), file)
-        getLogger().log('Downloaded node.lib to dist/node.lib')
-
-        return dest
-    }
-
-    if (repo === 'node') {
-        const release = await github.getRelease(owner, repo)
-        const asset = release.assets.find(a => a.name === `${assetName}.zip`)
-        if (!asset) {
-            throw new Error(`Failed to find "${assetName}" in release "${release.name} [tag: ${release.tag_name}]"`)
-        }
-
-        return downloadAndExtract(asset.browser_download_url)
-    }
-
-    const artifacts = (await github.listArtifacts(owner, repo)).sort(
-        (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
-    )
-
-    const match = artifacts.find(a => a.name === assetName)
-    if (!match) {
-        return
-    }
-
-    return downloadAndExtract(match.archive_download_url)
 }
 
 async function maybeUseGithubArtifact(ref: string, target: QualifiedBuildTarget, name: string) {
@@ -383,6 +318,7 @@ export async function buildBinaryDeps(pkgDir: string, target?: Partial<Qualified
             res[k] = dest
 
             await getFs().writeFile(dest, artifact)
+            await makeExecutable(dest)
 
             continue
         }
@@ -404,6 +340,7 @@ export async function buildBinaryDeps(pkgDir: string, target?: Partial<Qualified
                 path.resolve(binDir, outputName), 
                 await getFs().readFile(outpath)
             )
+            await makeExecutable(path.resolve(binDir, outputName))
             continue
         }
 
@@ -485,6 +422,8 @@ export async function createPackageForRelease(
         }
     }
 
+    // TODO: we need to preserve any pointers used by published files
+    // So we should search through all exported code and catalog the pointers
     const pruned = await createMergedView(programId, deploymentId)
 
     for (const f of Object.keys(pruned.files)) {
@@ -501,7 +440,13 @@ export async function createPackageForRelease(
     // Remap `pointers`
     for (const v of Object.values(snapshot.pointers)) {
         for (const [k, p] of Object.entries(v)) {
-            v[k] = toAbsolute(consolidated.copier!.getCopiedOrThrow(p))
+            // Only pointers that are referenced by exported symbols will exist
+            const copied = consolidated.copier!.getCopied(p)
+            if (copied) {
+                v[k] = toAbsolute(copied)
+            } else {
+                delete v[k]
+            }
         }
     }
 
@@ -594,6 +539,7 @@ export async function createPackageForRelease(
             if (target.snapshot) {
                 await getFs().writeFile(path.resolve(dest, 'tools', esbuildName), await getFs().readFile(esbuildBinPath))
                 await getFs().deleteFile(path.resolve(dest, 'node_modules', 'esbuild')).catch(throwIfNotFileNotFoundError)
+                await makeExecutable(path.resolve(dest, 'tools', esbuildName))
             } else {
                 await patchEsbuildMain(path.resolve(dest, 'node_modules', 'esbuild'), esbuildBinPath)
 
@@ -656,19 +602,6 @@ function stripComments(text: string) {
     return result.join('\n')
 }
 
-export async function createSynapseTarball(dir: string) {
-    const files = await glob(getFs(), dir, ['**/*', '**/.synapse'])    
-    const tarball = createTarball(await Promise.all(files.map(async f => ({
-        contents: Buffer.from(await getFs().readFile(f)),
-        mode: 0o755,
-        path: path.relative(dir, f),
-    }))))
-
-    const zipped = await gzip(tarball)
-
-    return zipped
-}
-
 export async function createArchive(dir: string, dest: string, sign?: boolean) {
     if (path.extname(dest) === '.tgz') {
         const zipped = await createSynapseTarball(dir)
@@ -692,7 +625,7 @@ export async function createArchive(dir: string, dest: string, sign?: boolean) {
 
 function pruneObject(obj: Record<string, any>, s: Set<string>) {
     for (const [k, v] of Object.entries(obj)) {
-        if (!s.has(k)) {
+        if (!s.has(k) && !s.has(k.replace(/\.infra\.js$/, '.js'))) {
             delete obj[k]
         }
     }
@@ -964,4 +897,230 @@ and limitations under the License.
     }
 
     return license.join('\n')
+}
+
+export const lazyNodeModules = [
+    'node:vm',
+    'node:http',
+    'node:https',
+    'node:repl',
+    'node:assert',
+    'node:stream',
+    'node:zlib',
+    'node:module',
+    'node:net',
+    'node:url',
+    'node:inspector',
+]
+
+export async function internalBundle(target?: string, opt: any = {}) {
+    const targetDouble = target?.split('-')
+    const resolved = resolveBuildTarget({ os: targetDouble?.[0] as any, arch: targetDouble?.[1] as any })
+    const os = resolved.os
+    const arch = resolved.arch
+
+    const libc = opt.libc
+    const external = ['esbuild', 'typescript', 'postject']
+    const isProdBuild = opt.production
+    const dirName = opt.stagingDir ?? `synapse-${os}-${arch}`
+    const outdir = path.resolve(getWorkingDir(), 'dist', dirName)
+
+    const isSea = opt.sea || opt.seaOnly
+    const hostTarget = resolveBuildTarget()
+    if (isSea && (hostTarget.os !== os || hostTarget.arch !== arch)) {
+        throw new Error(`Cross-platform builds are not supported for snapshots/SEAs`)
+    }
+
+    const shouldSign = false // opt.sign || isProdBuild
+    const bundledCliPath = path.resolve(outdir, 'dist/cli.js')
+
+    opt.lto ??= isProdBuild
+
+    const execPath = (name: string) => path.resolve(outdir, 'bin', `${name}${os === 'windows' ? '.exe' : ''}`)
+
+    if (opt.integrationsOnly) {
+        return copyIntegrations(getRootDirectory(), outdir, opt.integration)
+    }
+
+    const nodePath = execPath('node')
+    const seaDest = execPath('synapse')
+
+    async function bundleMain() {
+        const bundleOpt = {
+            external, 
+            minify: isProdBuild, 
+            lazyLoad: (isSea || opt.seaPrep) ? ['@cohesible/*', 'typescript', 'esbuild', ...lazyNodeModules] : [],
+            extraBuiltins: ['typescript', 'esbuild'],
+        }
+
+        if (isProdBuild && process.env.SKIP_SEA_MAIN) {
+            const bt = getBuildTargetOrThrow()
+            return bundleExecutable(
+                bt,
+                'dist/src/cli/index.js',
+                bundledCliPath,
+                bt.workingDirectory,
+                { sea: true, ...bundleOpt }
+            )
+        }
+
+        return bundlePkg(
+            'dist/src/cli/index.js',
+            getWorkingDir(), // TODO: we should bundle in an empty directory to prevent extraneous files from being used
+            bundledCliPath,
+            bundleOpt,
+        )
+    }
+
+    // TODO: external sourcemaps for the bundle/binary
+    async function createBundle() {
+        const res = await bundleMain()
+
+        // XXX: Patch the bundle
+        await getFs().writeFile(
+            bundledCliPath,
+            (await getFs().readFile(bundledCliPath, 'utf-8'))
+                .replace('#!/usr/bin/env node', 'var exports = {};')
+        )
+
+        const procFs = getDeploymentFs()
+
+        await getFs().writeFile(
+            path.resolve(outdir, 'dist', 'completions.sh'),
+            await procFs.readFile(path.resolve(getWorkingDir(), 'src', 'cli', 'completions', 'completion.sh'))
+        )
+
+        return res
+    }
+
+    async function bundleInstallScript() {
+        await bundleExecutable(
+            getBuildTargetOrThrow(),
+            'dist/src/cli/install.js',
+            path.resolve(outdir, 'dist', 'install.js')
+        )
+
+        // Used for uninstalling
+        if (resolved.os === 'windows') {
+            await getFs().writeFile(
+                path.resolve(outdir, 'dist', 'install.ps1'),
+                await getFs().readFile(path.resolve(getWorkingDir(), 'src', 'cli', 'install.ps1'))
+            )
+        }
+    }
+
+    await bundleInstallScript()
+
+    await createPackageForRelease(getWorkingDir(), outdir, { 
+        external, 
+        os, 
+        arch,
+        libc,
+        lto: opt.lto,
+        sign: shouldSign, 
+        snapshot: isSea || opt.seaPrep,
+        stripInternal: isProdBuild,
+        buildLicense: isProdBuild,
+        downloadOnly: opt.downloadOnly,
+    })
+
+    const bundle = await createBundle()
+    if (opt.pipelined) {
+        await downloadIntegrations(outdir, opt.integration)
+    } else {
+        await copyIntegrations(getRootDirectory(), outdir, opt.integration)
+    }
+
+    if (resolved.os === 'windows') {
+        const shimPath = await buildWindowsShim()
+        await getFs().writeFile(
+            path.resolve(outdir, 'dist', 'shim.exe'),
+            await getFs().readFile(shimPath)
+        )
+    }
+
+    const jsLibRelPath = path.join('zig', 'lib', 'js.zig')
+    const jsLib = await getFs().readFile(path.resolve('src', jsLibRelPath)).catch(throwIfNotFileNotFoundError)
+    if (jsLib) {
+        await getFs().writeFile(path.resolve(outdir, jsLibRelPath), jsLib)
+    }
+
+    if (isSea) {
+        await makeSea(bundledCliPath, nodePath, seaDest, bundle.assets, !shouldSign)
+        if (isProdBuild || opt.stagingDir || !!getCiType()) {
+            if (!opt.preserveSource) {
+                await getFs().deleteFile(bundledCliPath)
+            }
+            await getFs().deleteFile(nodePath)
+            await getFs().deleteFile(path.resolve(outdir, 'node_modules'))
+        }
+
+        if (shouldSign) {
+            await signWithDefaultEntitlements(seaDest)
+        }
+    } else {
+        await getFs().deleteFile(path.resolve(outdir, 'node_modules', '.bin')).catch(throwIfNotFileNotFoundError)
+    }
+
+    if (opt.seaPrep) {
+        const resolved = await resolveAssets(bundle.assets)
+        if (resolved) {
+            const assetsDest = path.resolve(outdir, 'assets')
+            for (const [k, v] of Object.entries(resolved)) {
+                await getFs().writeFile(
+                    path.resolve(assetsDest, k), 
+                    await getFs().readFile(v)
+                )
+            }
+        }
+    }
+
+    if (opt.pipelined) {
+        const tarballPath = `${outdir}.tgz`
+        await createArchive(outdir, tarballPath, shouldSign && !opt.seaPrep)
+
+        return publishToRemote({
+            ref: opt.pipelined,
+            tarballPath,
+        })
+    }
+
+    // darwin we use `.zip` for signing
+    const extname = opt.seaPrep || os === 'linux' ? '.tgz' : '.zip'
+    await createArchive(outdir, `${outdir}${extname}`, shouldSign && !opt.seaPrep)
+}
+
+export async function main(...args: string[]) {
+    function parseFlag(name: string) {
+        const index = args.indexOf(`--${name}`)
+        if (index !== -1) {
+            args.splice(index, 1)
+            return true
+        }
+    }
+
+    function parseOption(name: string) {
+        const index = args.indexOf(`--${name}`)
+        if (index === -1) {
+            return
+        }
+
+        if (!args[index+1]) {
+            throw new Error(`Bad option: ${name}`)
+        }
+
+        return args.splice(index, 2)[1]
+    }
+
+    const target = args[0]?.startsWith('--') ? undefined : args[0]
+    const buildTarget = await resolveProgramBuildTarget(process.cwd())
+
+    return runWithContext(
+        { buildTarget },
+        () => internalBundle(target, {
+            sea: parseFlag('sea'),
+            downloadOnly: parseFlag('downloadOnly'),
+            pipelined: parseOption('pipelined'),
+        }),
+    )
 }

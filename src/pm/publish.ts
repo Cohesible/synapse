@@ -1,10 +1,10 @@
 import * as path from 'node:path'
 import { StdioOptions } from 'node:child_process'
-import { mergeBuilds, pruneBuild, consolidateBuild, commitPackages, getInstallation, writeSnapshotFile, getProgramFs, getDataRepository, getModuleMappings, loadSnapshot, dumpData, getProgramFsIndex, getDeploymentFsIndex, toFsFromIndex, copyFs, createSnapshot, getOverlayedFs, Snapshot, ReadonlyBuildFs, getSnapshotPath } from '../artifacts'
+import { mergeBuilds, pruneBuild, getInstallation, writeSnapshotFile, getProgramFs, getDataRepository, getModuleMappings, loadSnapshot, dumpData, getProgramFsIndex, getDeploymentFsIndex, toFsFromIndex, copyFs, createSnapshot, getOverlayedFs, Snapshot, ReadonlyBuildFs, getSnapshotPath } from '../artifacts'
 import {  NpmPackageInfo, getDefaultPackageInstaller, installFromSnapshot, testResolveDeps } from './packages'
 import { getBinDirectory, getSynapseDir, getLinkedPackagesDirectory, getToolsDirectory, getUserEnvFileName, getWorkingDir, listPackages, resolveProgramBuildTarget, SynapseConfiguration, getUserSynapseDirectory, setPackage, BuildTarget, findDeployment, getOrCreateRemotePackage } from '../workspaces'
 import { gunzip, gzip, isNonNullable, keyedMemoize, linkBin, makeExecutable, memoize, throwIfNotFileNotFoundError, tryReadJson } from '../utils'
-import { Fs, ensureDir } from '../system'
+import { Fs, ensureDir, readFileWithStats } from '../system'
 import { glob } from '../utils/glob'
 import { getLogger, runTask } from '../logging'
 import { homedir } from 'node:os'
@@ -12,11 +12,11 @@ import { getBuildTargetOrThrow, getFs, getSelfPathOrThrow, isSelfSea } from '../
 import { ImportMap, expandImportMap, hoistImportMap } from '../runtime/importMaps'
 import { createCommandRunner, patchPath, runCommand } from '../utils/process'
 import { PackageJson, ResolvedPackage, getCompiledPkgJson, getCurrentPkg, getImmediatePackageJsonOrThrow, getPackageJson } from './packageJson'
-import { readKey, setKey } from '../cli/config'
+import { readPathMapKey, setPathKey } from '../cli/config'
 import { getEntrypointsFile } from '../compiler/programBuilder'
-import { createPackageForRelease, createSynapseTarball } from '../cli/buildInternal'
+import { createPackageForRelease } from '../cli/buildInternal'
 import * as registry from '@cohesible/resources/registry'
-import { extractTarball } from '../utils/tar'
+import { createTarball, extractTarball } from '../utils/tar'
 
 const getDependentsFilePath = () => path.resolve(getUserSynapseDirectory(), 'packageDependents.json')
 
@@ -228,9 +228,7 @@ export async function linkPackage(opt?: PublishOptions & { globalInstall?: boole
     }
 
     async function replaceIntegration(name: string) {
-        const overrides = await readKey<Record<string, string>>('projectOverrides') ?? {}
-        overrides[`synapse-${name}`] = resolvedDir
-        await setKey('projectOverrides', overrides)
+        await setPathKey(`projectOverrides.synapse-${name}`, resolvedDir)
     }
 
     if (pkgName.startsWith('synapse-')) {
@@ -337,7 +335,7 @@ async function getOverridesFromProject() {
 
 async function getMergedOverrides() {
     const [fromConfig, fromProject] = await Promise.all([
-        readKey<Record<string, string>>('projectOverrides'),
+        readPathMapKey('projectOverrides'),
         getOverridesFromProject()
     ])
 
@@ -396,7 +394,10 @@ async function findOwnSnapshot(currentDir: string) {
     return { pkg, snapshot }
 }
 
-export async function addImplicitPackages(packages: Record<string, string>, synapseConfig?: SynapseConfiguration) {
+export async function addImplicitPackages(
+    packages: Record<string, string>, 
+    synapseConfig?: SynapseConfiguration,
+) {
     const withTargets = synapseConfig?.target && !synapseConfig?.sharedLib 
         ? maybeAddTargetPackage(packages, synapseConfig.target) 
         : packages
@@ -954,3 +955,20 @@ export function createNpmLikeCommandRunner(pkgDir: string, env?: Record<string, 
     })
 }
 
+export async function createSynapseTarball(dir: string) {
+    const files = await glob(getFs(), dir, ['**/*', '**/.synapse'])
+    const tarball = createTarball(await Promise.all(files.map(async f => {
+        const { data, stats } = await readFileWithStats(f)
+
+        return {
+            contents: Buffer.from(data),
+            mode: 0o755,
+            path: path.relative(dir, f),
+            mtime: Math.round(stats.mtimeMs),
+        }
+    })))
+
+    const zipped = await gzip(tarball)
+
+    return zipped
+}

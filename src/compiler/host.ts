@@ -1,6 +1,6 @@
 import ts from 'typescript'
 import * as path from 'node:path'
-import { Mutable, makeRelative, memoize, resolveRelative, sortRecord, strcmp, tryReadJson } from '../utils'
+import { Mutable, makeRelative, memoize, resolveRelative, sortRecord, strcmp, throwIfNotFileNotFoundError, tryReadJson } from '../utils'
 import { createTranspiler } from '../bundler'
 import { createrLoader } from '../loader'
 import { ResourceTransformer, generateModuleStub, getFqnComponents } from './transformer'
@@ -18,7 +18,7 @@ import { ModuleResolver, createModuleResolver } from '../runtime/resolver'
 import { SourceMapV3 } from '../runtime/sourceMaps'
 import { DeclarationFileHost, createDeclarationFileHost } from './declarations'
 import { ResourceTypeChecker } from './resourceGraph'
-import { coerceToPointer, isDataPointer, pointerPrefix, toAbsolute } from '../build-fs/pointers'
+import { coerceToPointer, DataPointer, isDataPointer, pointerPrefix, toAbsolute } from '../build-fs/pointers'
 import { getBuildTargetOrThrow, getCurrentVersion, getFs } from '../execution'
 import { resolveValue } from '../runtime/modules/serdes'
 import type { TfJson } from '../runtime/modules/terraform'
@@ -73,11 +73,19 @@ function fixSourcemapSources(sourcemap: string, outFile: string, sourceFile: str
     })
 }
 
-interface RenderedFile {
+interface RenderedChunk {
     name: string
     runtime: { text: string; sourcemap?: Uint8Array }
     infra: { text: string; sourcemap?: Uint8Array }
+    infraDeps?: string[]
     sourceDelta?: { line: number; column: number }
+}
+
+interface EmittedChunk {
+    source: string,
+    name: string,
+    data: CompiledChunk,
+    pointer: DataPointer
 }
 
 export class CompilerHost {
@@ -196,50 +204,77 @@ export class CompilerHost {
         }
     }
 
-    private async emitArtifacts(fileName: string, moduleId?: string) {
+    private readonly chunks = new Map<string, Record<string, Promise<EmittedChunk>>>()
+
+    private async emitRenderedChunk(fileName: string, chunk: RenderedChunk) {
+        const bt = getBuildTargetOrThrow()
         const programFs = getProgramFs()
 
-        const compiled = this.renderedFiles.get(fileName)
-        if (!compiled) {
+        const source = makeRelative(bt.workingDirectory, fileName)
+        const key = `[#compile/${source}]`
+
+        const [runtime, infra] = await Promise.all([
+            chunk.runtime.sourcemap ? programFs.writeData(key, chunk.runtime.sourcemap) : undefined,
+            chunk.infra.sourcemap ? programFs.writeData(key, chunk.infra.sourcemap) : undefined,
+        ])
+
+        const sourcemaps = runtime && infra ? { runtime, infra } : undefined
+
+        const result: CompiledChunk = {
+            kind: 'compiled-chunk',
+            infra: chunk.infra.text,
+            runtime: chunk.runtime.text,
+        }
+
+        const getInfraDeps = (deps: string[]) => {
+            const chunks = this.chunks.get(fileName)
+            if (!chunks) {
+                throw new Error(`Missing chunks for ${fileName}`)
+            }
+
+            return Promise.all(deps.map(d => {
+                if (!chunks[d]) {
+                    throw new Error(`Missing chunk "${d}" from ${fileName}`)
+                }
+
+                return chunks[d].then(c => c.pointer)
+            }))
+        }
+
+        const dependencies = chunk.infraDeps ? await getInfraDeps(chunk.infraDeps) : undefined
+
+        const pointer = await programFs.writeData(
+            key,
+            Buffer.from(JSON.stringify(result), 'utf-8'),
+            { 
+                // TODO: add support for using pointer as metadata
+                metadata: { 
+                    name: chunk.name, 
+                    sourcemaps, 
+                    sourceDelta: chunk.sourceDelta,
+                    dependencies,
+                },
+            },
+        )
+
+        return {
+            source,
+            name: chunk.name,
+            data: result,
+            pointer,
+        }
+    }
+
+    private async emitArtifacts(fileName: string, moduleId?: string) {
+        const emitted = this.chunks.get(fileName)
+        if (!emitted) {
             // These files have no function/class declarations
             getLogger().warn(`Missing artifacts for file: ${fileName}`)
 
             return {}
         }
 
-        const bt = getBuildTargetOrThrow()
-        const source = path.relative(bt.workingDirectory, fileName)
-        const key = `[#compile/${source}]`
-
-        const rendered = await Promise.all(compiled)
-        
-        const artifacts = await Promise.all(rendered.map(async v => {
-            const [runtime, infra] = await Promise.all([
-                v.runtime.sourcemap ? programFs.writeData(key, v.runtime.sourcemap) : undefined,
-                v.infra.sourcemap ? programFs.writeData(key, v.infra.sourcemap) : undefined,
-            ])
-
-            const sourcemaps = runtime && infra ? { runtime, infra } : undefined
-
-            const result: CompiledChunk = {
-                kind: 'compiled-chunk',
-                infra: v.infra.text,
-                runtime: v.runtime.text,
-            }
-
-            const pointer = await programFs.writeData(
-                key,
-                Buffer.from(JSON.stringify(result), 'utf-8'),
-                { metadata: { name: v.name, sourcemaps, moduleId, sourceDelta: v.sourceDelta } }, // TODO: add support for using pointer as metadata
-            )
-
-            return {
-                source,
-                name: v.name,
-                data: result,
-                pointer,
-            }
-        }))
+        const artifacts = await Promise.all(Object.values(emitted))
 
         return Object.fromEntries(artifacts.sort((a, b) => strcmp(a.name, b.name)).map(a => [a.name, a] as const))
     }
@@ -340,8 +375,6 @@ export class CompilerHost {
     }
 
     private readonly program: Program
-
-    private readonly renderedFiles = new Map<string, Promise<RenderedFile>[]>()
     private createProgram(): Program {
         const resourceTransformer = this.resourceTransformer
         const outDir = this.compilerOptions.outDir ?? this.rootDir
@@ -351,23 +384,27 @@ export class CompilerHost {
             // Looks weird. Need to do this because TypeScript source maps assume it was emitted in the outdir
             const inputPath = path.resolve(outDir, path.relative(this.rootDir, f.path))
 
-            const [runtime, infra] = await Promise.all([
+            const [runtime, infra = runtime] = await Promise.all([
                 this.renderArtifact(inputPath, f.data, virtualOutfile, false, f.sourcesmaps?.runtime),
-                this.renderArtifact(inputPath, f.infraData, virtualOutfile, true, f.sourcesmaps?.infra),
+                f.data !== f.infraData 
+                    ? this.renderArtifact(inputPath, f.infraData, virtualOutfile, true, f.sourcesmaps?.infra)
+                    : undefined,
             ])
 
             return { 
                 name: f.name, 
                 runtime, 
-                infra, 
+                infra,
+                infraDeps: f.infraDeps,
                 sourceDelta: resourceTransformer.getDeltas(f.sourceNode),
             }
         }
 
         this.graphCompiler.onEmitFile(f => {
-            const arr = this.renderedFiles.get(f.source) ?? []
-            arr.push(render(f))
-            this.renderedFiles.set(f.source, arr)
+            const chunks = this.chunks.get(f.source) ?? {}
+            this.chunks.set(f.source, chunks)
+
+            chunks[f.name] = render(f).then(chunk => this.emitRenderedChunk(f.source, chunk))
         })
 
         return {
@@ -588,14 +625,8 @@ async function writePointersFile(fs: Pick<JsonFs, 'writeJson'>, pointers: Record
     await fs.writeJson(pointersFileName, pointers)
 }
 
-export async function readPointersFile(fs: Pick<JsonFs, 'readJson'>): Promise<Record<string, Record<string, string>> | undefined> {
-    try {
-        return await fs.readJson(pointersFileName)
-    } catch (e) {
-        if ((e as any).code !== 'ENOENT') {
-            throw e
-        }
-    }
+export function readPointersFile(fs: Pick<JsonFs, 'readJson'>): Promise<Record<string, Record<string, string>> | undefined> {
+    return fs.readJson(pointersFileName).catch(throwIfNotFileNotFoundError)
 }
 
 export interface CompiledSource {
@@ -680,6 +711,9 @@ export async function synth(entrypoints: string[], deployables: string[], opt: S
                     artifact.table,
                     runtime.globals
                 )
+            // FIXME: this won't work if the user tries to use the native module _during_ synthesis
+            case 'native-module':
+                return Buffer.from(artifact.binding, 'base64').toString('utf-8')
             default:
                 throw new Error(`Unknown object kind: ${(artifact as any).kind}`)
         }

@@ -2,6 +2,7 @@ import { getLogger } from '../logging'
 import { createEventEmitter } from '../events'
 import { memoize } from '../utils'
 import * as nodeUtil from 'node:util'
+import { pushDisposable } from '../execution'
 
 const esc = '\x1b'
 
@@ -115,7 +116,13 @@ export function stripAnsi(s: string) {
 
 let display: ReturnType<typeof createDisplay>
 export function getDisplay() {
-    return display ??= createDisplay()
+    if (display) {
+        return display
+    }
+
+    display = createDisplay()
+
+    return pushDisposable(display)
 }
 
 function swap(arr: any[], i: number, j: number) {
@@ -1272,7 +1279,13 @@ export function createDisplay() {
         writer.tty?.dispose()
     }
 
+    let disposed = false
     async function dispose() {
+        if (disposed) {
+            return
+        }
+
+        disposed = true
         if (!process.stdout.isTTY) {
             return
         }
@@ -1280,7 +1293,14 @@ export function createDisplay() {
         await releaseTty(true)
     }
 
-    return { createView, getOverlayedView, dispose, releaseTty, writer }
+    return { 
+        createView, 
+        getOverlayedView, 
+        dispose, 
+        releaseTty, 
+        writer,
+        [Symbol.asyncDispose]: dispose,
+    }
 }
 
 export interface TreeItem {

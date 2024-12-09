@@ -15,9 +15,13 @@ pub const Tag = enum {
     field_access,
     error_union,
     call_exp,
-    comptime_block,
+    comptime_node,
     test_decl,
-    parse_error_node,
+    catch_node,
+    unary_node,
+    return_node,
+    switch_case,
+    unparsed_node,
 };
 
 pub const Node = union(Tag) {
@@ -33,23 +37,37 @@ pub const Node = union(Tag) {
     field_access: FieldAccess,
     error_union: ErrorUnion,
     call_exp: CallExp,
-    comptime_block: ComptimeBlock,
+    comptime_node: ComptimeNode,
     test_decl: TestDeclNode,
-    parse_error_node: ParseErrorNode,
+    catch_node: CatchNode,
+    unary_node: UnaryNode,
+    return_node: ReturnNode,
+    switch_case: SwitchCase,
+    unparsed_node: UnparsedNode,
 };
 
 pub const LiteralSubtype = enum {
     number,
     string,
+    // @"enum",
+    // @"error",
+    // @"unreachable",
 };
 
-pub const Literal = struct { subtype: LiteralSubtype, value: []const u8 };
+pub const Literal = struct {
+    subtype: LiteralSubtype, 
+    value: []const u8,
+};
 
 pub const Identifier = struct {
     name: []const u8,
 };
 
-pub const FieldAccess = struct { exp: *Node, member: []const u8 };
+pub const FieldAccess = struct { 
+    exp: *Node, 
+    member: []const u8 
+};
+
 pub const ErrorUnion = struct {
     lhs: ?*Node,
     rhs: *Node,
@@ -130,21 +148,44 @@ pub const FieldDecl = struct {
 };
 
 pub const BlockNode = struct {
-    lhs: ?*Node,
-    rhs: ?*Node,
+    statements: []*Node,
 };
 
-pub const ComptimeBlock = struct {
-    block: ?*Node,
+pub const ComptimeNode = struct {
+    node: ?*Node,
 };
 
-pub const ParseErrorNode = struct {
+pub const UnparsedNode = struct {
+    index: u32,
     tag: zig.Ast.Node.Tag,
 };
 
 pub const TestDeclNode = struct {
     name: ?*Node, // string literal or identifier
     body: *Node, // block
+};
+
+pub const CatchNode = struct {
+    lhs: *Node,
+    rhs: *Node,
+    payload: ?*Node, // payload is next token after main_token if not rhs
+};
+
+pub const UnaryNode = struct {
+    op: []const u8,
+    exp: *Node,
+    payload: ?*Node,
+};
+
+pub const ReturnNode = struct {
+    expression: ?*Node,
+};
+
+pub const SwitchCase = struct {
+    is_inline: bool,
+    payload: ?*Node,
+    values: []*Node,
+    exp: *Node,
 };
 
 const NodeConverter = struct {
@@ -160,36 +201,30 @@ const NodeConverter = struct {
         const x = tree.containerDeclRoot();
         const p = try gpa.create(Node);
 
-        p.* = Node{ .container = ContainerDecl{
+        p.* = .{ .container = .{
             .subtype = "root",
             .layout_token = null,
             .enum_token = null,
             .arg = null,
-            .members = try converter.convert_array(x.ast.members),
-            .docs = try converter.maybe_get_docs(0, true),
+            .members = try converter.convertArray(x.ast.members),
+            .docs = try converter.maybeGetDocs(0, true),
         } };
 
         return p;
     }
 
-    const ConversionError = error{
-        NullMember,
-    };
-
-    const Error = ConversionError || std.mem.Allocator.Error || error{NoSpaceLeft};
-
-    fn convert_array(self: @This(), arr: []const u32) Error![]*Node {
+    fn convertArray(self: @This(), arr: []const u32) anyerror![]*Node {
         const new_arr = try self.gpa.alloc(*Node, arr.len);
         for (0..new_arr.len) |i| {
-            const el = try self.convert_node(arr[i]) orelse return Error.NullMember;
+            const el = try self.convertNode(arr[i]) orelse return error.NullMember;
             new_arr[i] = el;
         }
         return new_arr;
     }
 
-    fn convert_node_strict(self: @This(), index: u32) Error!*Node {
-        return try self.convert_node(index) orelse {
-            if (index == 0) return Error.NullMember;
+    fn convertNodeStrict(self: @This(), index: u32) anyerror!*Node {
+        return try self.convertNode(index) orelse {
+            if (index == 0) return error.NullMember;
 
             var buf: [256]u8 = undefined;
             const n: zig.Ast.Node = self.tree.nodes.get(index);
@@ -198,7 +233,7 @@ const NodeConverter = struct {
         };
     }
 
-    fn maybe_get_docs(self: @This(), token_index: u32, is_root: bool) !?[]const u8 {
+    fn maybeGetDocs(self: @This(), token_index: u32, is_root: bool) !?[]const u8 {
         const tags = self.tree.tokens.items(.tag);
         var j: u32 = token_index;
         if (is_root) j += 1 else j -= 1;
@@ -238,226 +273,305 @@ const NodeConverter = struct {
         return buf;
     }
 
-    fn create_parse_error(self: @This(), tag: zig.Ast.Node.Tag) !*Node {
-        const p = try self.gpa.create(Node);
-        p.* = Node{ .parse_error_node = ParseErrorNode{
-            .tag = tag,
-        } };
-        return p;
+    fn convertContainer(self: @This(), index: u32) !ContainerDecl {
+        var b: [2]zig.Ast.Node.Index = undefined;
+        const decl = self.tree.fullContainerDecl(&b, index) orelse return error.NotAContainer;
+
+        const members = try self.convertArray(decl.ast.members);
+
+        return .{
+            .subtype = self.tree.tokenSlice(decl.ast.main_token),
+            .layout_token = if (decl.layout_token) |t| self.tree.tokenSlice(t) else null,
+            .enum_token = if (decl.ast.enum_token) |t| self.tree.tokenSlice(t) else null,
+            .arg = try self.convertNode(decl.ast.arg),
+            .members = members,
+            .docs = null,
+        };
     }
 
-    fn convert_node(self: @This(), index: u32) !?*Node {
-        if (index == 0) {
-            return null;
+    fn convertVarDecl(self: @This(), index: u32) !VarDecl {
+        const varDecl = self.tree.fullVarDecl(index) orelse return error.NotAVarDecl;
+
+        return .{
+            .name = self.tree.tokenSlice(varDecl.ast.mut_token + 1),
+            .mutability = self.tree.tokenSlice(varDecl.ast.mut_token),
+            .visibility = if (varDecl.visib_token) |t| self.tree.tokenSlice(t) else null,
+            .initializer = try self.convertNode(varDecl.ast.init_node),
+            .qualifier = null,
+            .thread_local = false,
+            .type_expr = null,
+            .is_comptime = false,
+            .lib_name = null,
+        };
+    }
+
+    fn convertFieldDecl(self: @This(), index: u32) !FieldDecl {
+        const field = self.tree.fullContainerField(index) orelse return error.NotAFieldDecl;
+
+        return .{
+            .name = self.tree.tokenSlice(field.ast.main_token),
+            .initializer = try self.convertNode(field.ast.value_expr),
+            .type_expr = try self.convertNode(field.ast.type_expr),
+            .is_comptime = field.comptime_token != null,
+            .align_expr = null, // TODO
+            .tuple_like = field.ast.tuple_like,
+        };
+    }
+
+    fn convertFnDecl(self: @This(), index: u32) !FnDecl {
+        var b: [1]zig.Ast.Node.Index = undefined;
+        const proto = self.tree.fullFnProto(&b, index) orelse return error.NotAFnDecl;
+
+        // `anytype` params aren't included in `ast.params.len`
+        var params = try std.ArrayList(ParamDecl).initCapacity(self.gpa, proto.ast.params.len);
+        var iter = proto.iterate(&self.tree);
+        while (iter.next()) |param| {
+            try params.append(.{
+                .name = if (param.name_token) |t| self.tree.tokenSlice(t) else null,
+                .type_expr = try self.convertNode(param.type_expr),
+                .is_comptime = false, // TODO
+                .is_noalias = false, // TODO
+                .is_variadic = param.anytype_ellipsis3 != null,
+            });
         }
 
         const n: zig.Ast.Node = self.tree.nodes.get(index);
+
+        return .{
+            .name = if (proto.name_token) |t| self.tree.tokenSlice(t) else null,
+            .lib_name = null,
+            .body = if (n.tag == .fn_decl and n.data.rhs != 0) try self.convertNode(n.data.rhs) else null,
+            .visibility = if (proto.visib_token) |t| self.tree.tokenSlice(t) else null,
+            .qualifier = if (proto.extern_export_inline_token) |t| self.tree.tokenSlice(t) else null,
+            .return_type = try self.convertNode(proto.ast.return_type),
+            .params = params.items,
+        };
+    }
+
+    fn convertPtrType(self: @This(), index: u32) !PtrType {
+        const x = self.tree.fullPtrType(index) orelse return error.NotAPtrType;
+
+        return .{
+            .size = x.size,
+            .sentinel = try self.convertNode(x.ast.sentinel),
+            .is_const = x.const_token != null,
+            .child_type = try self.convertNodeStrict(x.ast.child_type),
+        };
+    }
+
+    fn convertBlock(self: @This(), index: u32) !BlockNode {
+        const n: zig.Ast.Node = self.tree.nodes.get(index);
+
         switch (n.tag) {
-            .identifier => {
-                const p = try self.gpa.create(Node);
-                p.* = Node{ .ident = Identifier{
-                    .name = self.tree.tokenSlice(n.main_token),
-                } };
+            .block, .block_semicolon => {
+                const statements = self.tree.extra_data[n.data.lhs..n.data.rhs];
 
-                return p;
-            },
-            .root, .container_decl_trailing, .container_decl_arg, .container_decl_arg_trailing, .container_decl_two, .container_decl_two_trailing, .tagged_union, .tagged_union_trailing, .tagged_union_enum_tag, .tagged_union_enum_tag_trailing, .tagged_union_two, .tagged_union_two_trailing, .container_decl => {
-                var b: [2]zig.Ast.Node.Index = undefined;
-                const x = self.tree.fullContainerDecl(&b, index) orelse return null;
-
-                const members = try self.convert_array(x.ast.members);
-
-                const p = try self.gpa.create(Node);
-                p.* = Node{ .container = ContainerDecl{
-                    .subtype = self.tree.tokenSlice(x.ast.main_token),
-                    .layout_token = if (x.layout_token) |t| self.tree.tokenSlice(t) else null,
-                    .enum_token = if (x.ast.enum_token) |t| self.tree.tokenSlice(t) else null,
-                    .arg = try self.convert_node(x.ast.arg),
-                    .members = members,
-                    .docs = null,
-                } };
-
-                return p;
-            },
-            .global_var_decl, .local_var_decl, .aligned_var_decl, .simple_var_decl => {
-                const varDecl = self.tree.fullVarDecl(index) orelse return null;
-                const p = try self.gpa.create(Node);
-                p.* = Node{ .vardecl = VarDecl{
-                    .name = self.tree.tokenSlice(varDecl.ast.mut_token + 1),
-                    .mutability = self.tree.tokenSlice(varDecl.ast.mut_token),
-                    .visibility = if (varDecl.visib_token) |t| self.tree.tokenSlice(t) else null,
-                    .initializer = try self.convert_node(varDecl.ast.init_node),
-                    .qualifier = null,
-                    .thread_local = false,
-                    .type_expr = null,
-                    .is_comptime = false,
-                    .lib_name = null,
-                } };
-
-                return p;
-            },
-            .container_field_init, .container_field_align, .container_field => {
-                const x = self.tree.fullContainerField(index) orelse return null;
-                const p = try self.gpa.create(Node);
-                p.* = Node{
-                    .field_decl = FieldDecl{
-                        .name = self.tree.tokenSlice(x.ast.main_token),
-                        .initializer = try self.convert_node(x.ast.value_expr),
-                        .type_expr = try self.convert_node(x.ast.type_expr),
-                        .is_comptime = x.comptime_token != null,
-                        .align_expr = null, // TODO
-                        .tuple_like = x.ast.tuple_like,
-                    },
+                return .{
+                    .statements = try self.convertArray(statements),
                 };
-
-                return p;
-            },
-            .fn_proto, .fn_proto_multi, .fn_proto_one, .fn_proto_simple, .fn_decl => {
-                var b: [1]zig.Ast.Node.Index = undefined;
-                const x = self.tree.fullFnProto(&b, index) orelse return null;
-                const p = try self.gpa.create(Node);
-
-                // `anytype` params aren't included in `ast.params.len`
-                var params = try std.ArrayList(ParamDecl).initCapacity(self.gpa, x.ast.params.len);
-                var iter = x.iterate(&self.tree);
-                while (iter.next()) |param| {
-                    try params.append(.{
-                        .name = if (param.name_token) |t| self.tree.tokenSlice(t) else null,
-                        .type_expr = try self.convert_node(param.type_expr),
-                        .is_comptime = false, // TODO
-                        .is_noalias = false, // TODO
-                        .is_variadic = param.anytype_ellipsis3 != null,
-                    });
-                }
-
-                p.* = Node{
-                    .fndecl = FnDecl{
-                        .name = if (x.name_token) |t| self.tree.tokenSlice(t) else null,
-                        .lib_name = null,
-                        .body = if (n.tag == .fn_decl and n.data.rhs != 0) try self.convert_node(n.data.rhs) else null,
-                        .visibility = if (x.visib_token) |t| self.tree.tokenSlice(t) else null,
-                        .qualifier = if (x.extern_export_inline_token) |t| self.tree.tokenSlice(t) else null,
-                        .return_type = try self.convert_node(x.ast.return_type),
-                        .params = params.items,
-                    },
+             },
+            .block_two, .block_two_semicolon => {
+                var statements_buf: [2]zig.Ast.Node.Index = undefined;
+                const statements = b: {
+                    statements_buf = .{ n.data.lhs, n.data.rhs };
+                    if (statements_buf[0] == 0) {
+                        break :b statements_buf[0..0];
+                    } else if (statements_buf[1] == 0) {
+                        break :b statements_buf[0..1];
+                    } else {
+                        break :b statements_buf[0..2];
+                    }
                 };
+                
+                return .{
+                    .statements = try self.convertArray(statements),
+                };
+            },
+            else => return error.NotABlock,
+        }
+    }
 
-                return p;
-            },
-            .ptr_type_aligned, .ptr_type_sentinel, .ptr_type, .ptr_type_bit_range => {
-                const x = self.tree.fullPtrType(index) orelse return null;
-                const p = try self.gpa.create(Node);
-                p.* = Node{ .ptr_type = PtrType{
-                    .size = x.size,
-                    .sentinel = try self.convert_node(x.ast.sentinel),
-                    .is_const = x.const_token != null,
-                    .child_type = try self.convert_node_strict(x.ast.child_type),
-                } };
-                return p;
-            },
-            .optional_type => {
-                const p = try self.gpa.create(Node);
-                p.* = Node{ .optional_type = OptionalType{
-                    .child_type = try self.convert_node_strict(n.data.lhs),
-                } };
-                return p;
-            },
-            .number_literal => {
-                const p = try self.gpa.create(Node);
-                p.* = Node{ .literal = Literal{
-                    .subtype = .number,
-                    .value = self.tree.tokenSlice(n.main_token),
-                } };
-                return p;
-            },
-            .string_literal => {
-                const p = try self.gpa.create(Node);
-                const token = self.tree.tokenSlice(n.main_token);
-                p.* = Node{ .literal = Literal{
-                    .subtype = .string,
-                    .value = token[1..token.len-1], // assumes single/double quotes
-                } };
-                return p;
-            },
-            .field_access => {
-                const p = try self.gpa.create(Node);
-                p.* = Node{ .field_access = FieldAccess{
-                    .exp = try self.convert_node_strict(n.data.lhs),
-                    .member = self.tree.tokenSlice(n.data.rhs),
-                } };
-                return p;
-            },
-            .error_union => {
-                const p = try self.gpa.create(Node);
-                p.* = Node{ .error_union = ErrorUnion{
-                    .lhs = try self.convert_node(n.data.lhs),
-                    .rhs = try self.convert_node_strict(n.data.rhs),
-                } };
-                return p;
-            },
+    fn convertCallExp(self: @This(), index: u32) !CallExp {
+        const n: zig.Ast.Node = self.tree.nodes.get(index);
+
+        switch (n.tag) {
             .builtin_call_two, .builtin_call_two_comma => {
                 const ident = try self.gpa.create(Node);
                 ident.* = Node{ .ident = Identifier{
                     .name = self.tree.tokenSlice(n.main_token),
                 } };
 
-                const args = if (n.data.lhs != 0) try self.convert_array(&[_]u32{ n.data.lhs }) else try self.convert_array(&[_]u32{});
-                const p = try self.gpa.create(Node);
-                p.* = Node{
-                    .call_exp = CallExp{
-                        .exp = ident,
-                        .args = args,
-                    },
+                const args = if (n.data.lhs != 0) 
+                    try self.convertArray(&[_]u32{ n.data.lhs }) 
+                else 
+                    try self.convertArray(&[_]u32{});
+
+                return .{
+                    .exp = ident,
+                    .args = args,
                 };
-                return p;
             },
             .call, .call_one, .call_comma, .call_one_comma => {
                 var buf: [1]zig.Ast.Node.Index = undefined;
-                const fullCall = self.tree.fullCall(&buf, index) orelse return null;
-                const args = try self.convert_array(fullCall.ast.params);
+                const fullCall = self.tree.fullCall(&buf, index) orelse return error.NotACallExp;
+                const args = try self.convertArray(fullCall.ast.params);
 
-                const p = try self.gpa.create(Node);
-                p.* = Node{
-                    .call_exp = CallExp{
-                        .exp = try self.convert_node_strict(fullCall.ast.fn_expr),
-                        .args = args,
-                    },
+                return .{
+                    .exp = try self.convertNodeStrict(fullCall.ast.fn_expr),
+                    .args = args,
                 };
-                return p;
             },
-            .block, .block_semicolon => {
-                // Statements are in tree.extra_data
-                return null;
-             },
-            .block_two, .block_two_semicolon => {
-                const p = try self.gpa.create(Node);
-                p.* = Node{ .block = BlockNode{
-                    .lhs = try self.convert_node(n.data.lhs),
-                    .rhs = try self.convert_node(n.data.rhs),
-                } };
-                return p;
+            else => return error.NotACallExp,
+        }
+    }
+
+    fn convertLiteral(self: @This(), index: u32) !Literal {
+        const n: zig.Ast.Node = self.tree.nodes.get(index);
+
+        switch (n.tag) {
+            .number_literal => {
+                return .{
+                    .subtype = .number,
+                    .value = self.tree.tokenSlice(n.main_token),
+                };
             },
-            .test_decl => {
-                const p = try self.gpa.create(Node);
-                p.* = Node{ .test_decl = TestDeclNode{
-                    .name = try self.convert_node(n.data.lhs),
-                    .body = try self.convert_node_strict(n.data.rhs),
-                } };
-                return p;
+            .string_literal => {
+                const token = self.tree.tokenSlice(n.main_token);
+
+                return .{
+                    .subtype = .string,
+                    .value = token[1..token.len-1], // assumes single/double quotes
+                };
             },
-            .@"comptime" => {
-                const p = try self.gpa.create(Node);
-                p.* = Node{ .comptime_block = ComptimeBlock{
-                    .block = try self.convert_node(n.data.lhs),
-                } };
-                return p;
-            },
-            else => {
-                return try self.create_parse_error(n.tag);
-            },
+        //    .enum_literal => {
+        //         return .{
+        //             .subtype = .@"enum",
+        //             .value = self.tree.tokenSlice(n.main_token),
+        //         };
+        //     },
+        //     .error_value => {
+        //         return .{
+        //             .subtype = .@"error",
+        //             .value = self.tree.tokenSlice(n.main_token),
+        //         };
+        //     },
+        //     .unreachable_literal => {
+        //         return .{
+        //             .subtype = .@"unreachable",
+        //             .value = self.tree.tokenSlice(n.main_token),
+        //         };
+        //     },
+            else => return error.NotALiteral,
+        }
+    }
+
+    fn convertSwitchCase(self: @This(), index: u32) !SwitchCase {
+        const switchCase = self.tree.fullSwitchCase(index) orelse return error.NotASwitchCase;
+
+        return .{
+            .values = try self.convertArray(switchCase.ast.values),
+            .exp = try self.convertNodeStrict(switchCase.ast.target_expr),
+            .is_inline = switchCase.inline_token != null,
+            .payload = if (switchCase.payload_token) |t| try self.convertNode(t) else null,
+        };
+    }
+
+    fn convertNode(self: @This(), index: u32) anyerror!?*Node {
+        if (index == 0) {
+            return null;
         }
 
-        return null;
+        const n: zig.Ast.Node = self.tree.nodes.get(index);
+        const p = try self.gpa.create(Node);
+        p.* = switch (n.tag) {
+            .identifier => .{ .ident = .{
+                .name = self.tree.tokenSlice(n.main_token),
+            } },
+            .root, .container_decl_trailing, .container_decl_arg, 
+            .container_decl_arg_trailing, .container_decl_two, .container_decl_two_trailing,
+            .tagged_union, .tagged_union_trailing, .tagged_union_enum_tag, 
+            .tagged_union_enum_tag_trailing, .tagged_union_two, .tagged_union_two_trailing, 
+            .container_decl => .{ 
+                .container = try self.convertContainer(index) 
+            },
+            .global_var_decl, .local_var_decl, .aligned_var_decl, .simple_var_decl => .{ 
+                .vardecl = try self.convertVarDecl(index) 
+            },
+            .container_field_init, .container_field_align, .container_field => .{
+                .field_decl = try self.convertFieldDecl(index),
+            },
+            .fn_proto, .fn_proto_multi, .fn_proto_one, .fn_proto_simple, .fn_decl => .{ 
+                .fndecl = try self.convertFnDecl(index) 
+            },
+            .ptr_type_aligned, .ptr_type_sentinel, .ptr_type, .ptr_type_bit_range => .{ 
+                .ptr_type = try self.convertPtrType(index) 
+            },
+            .optional_type => .{ .optional_type = .{
+                .child_type = try self.convertNodeStrict(n.data.lhs),
+            } },
+            // .number_literal, .string_literal, .enum_literal, .error_value, .unreachable_literal => .{ 
+            .number_literal, .string_literal => .{ 
+                .literal = try self.convertLiteral(index) 
+            },
+            .field_access => .{ .field_access = .{
+                .exp = try self.convertNodeStrict(n.data.lhs),
+                .member = self.tree.tokenSlice(n.data.rhs),
+            } },
+            .error_union => .{ .error_union = .{
+                .lhs = try self.convertNode(n.data.lhs),
+                .rhs = try self.convertNodeStrict(n.data.rhs),
+            } },
+            .builtin_call_two, .builtin_call_two_comma, .call, .call_one, .call_comma, .call_one_comma => .{
+                .call_exp = try self.convertCallExp(index),
+            },
+            .block, .block_semicolon, .block_two, .block_two_semicolon => .{ 
+                .block = try self.convertBlock(index) 
+            },
+            .test_decl => .{ .test_decl = .{
+                .name = try self.convertNode(n.data.lhs),
+                .body = try self.convertNodeStrict(n.data.rhs),
+            } },
+            .@"comptime" => .{ .comptime_node = .{
+                .node = try self.convertNode(n.data.lhs),
+            } },
+            // .switch_case_one, .switch_case_inline_one,
+            // .switch_case, .switch_case_inline => .{
+            //     .switch_case = try self.convertSwitchCase(index),
+            // },
+
+            // .negation_wrap, .bit_not, .negation, 
+            // .bool_not, .address_of, .@"try" => .{ .unary_node = .{
+            //     .op = self.tree.tokenSlice(n.main_token),
+            //     .exp = try self.convertNode(n.data.lhs),
+            // } },
+
+            // .@"defer", .@"errdefer" => .{ .unary_node = .{
+            //     .op = self.tree.tokenSlice(n.main_token),
+            //     .exp = try self.convertNode(n.data.rhs),
+            //     .payload = try self.convertNode(n.data.lhs),
+            // } },
+
+            // .error_set_decl => {
+
+            // },
+            // .merge_error_sets => {
+
+            // },
+            // .@"catch" => {
+
+            // },
+            // .@"return" => {
+
+            // },
+            else => .{ 
+                .unparsed_node = .{ 
+                    .index = index, 
+                    .tag = n.tag,
+                } 
+            },
+        };
+
+        return p;
     }
 };
 
@@ -525,9 +639,130 @@ fn parse_ast(source: [:0]const u8) ![:0]const u8 {
     return try writer.toString();
 }
 
+pub const Ast = struct {
+    tokens: []RawToken,
+    nodes: []RawNode,
+    extra_data: []u32,
+};
+
+pub const RawToken = struct {
+    tag: zig.Token.Tag,
+    text: []const u8,
+};
+
+pub const NodeData = struct {
+    lhs: u32,
+    rhs: u32,
+};
+
+pub const RawNode = struct {
+    tag: zig.Ast.Node.Tag,
+    main_token: u32,
+    data: NodeData,
+};
+
+fn parse_ast_raw(source: [:0]const u8) ![:0]const u8 {
+    const gpa = mem.allocator;
+    const tree = try zig.Ast.parse(gpa, source, .zig);
+
+    var tokens = try gpa.alloc(RawToken, tree.tokens.len);
+
+    for (0..tokens.len) |i| {
+        const text = tree.tokenSlice(i);
+        tokens[i] = .{
+            .tag = tree.tokens.get(i).tag,
+            .text = text,
+        };
+    }
+
+    var nodes = try gpa.alloc(RawNode, tree.nodes.len);
+
+    for (0..nodes.len) |i| {
+        const n = tree.nodes.get(i);
+        // These are copied to make type generation easier
+        nodes[i] = .{
+            .tag = n.tag,
+            .main_token = n.main_token,
+            .data = .{
+                .lhs = n.data.lhs,
+                .rhs = n.data.rhs,
+            },
+        };
+    }
+
+    var writer = try WasmStreamWriter.init(gpa, 1024);
+
+    const ast: Ast = .{
+        .tokens = tokens,
+        .nodes = nodes,
+        .extra_data = tree.extra_data,
+    };
+    try std.json.stringify(ast, .{ .emit_null_optional_fields = false }, writer.toWriter());
+
+    return try writer.toString();
+}
+
 export fn parse(source: [*:0]const u8) [*:0]const u8 {
     const len = mem.strlen(source);
     return parse_ast(source[0..len :0]) catch @panic("Failed to parse");
+}
+
+export fn parse_raw(source: [*:0]const u8) [*:0]const u8 {
+    const len = mem.strlen(source);
+    return parse_ast_raw(source[0..len :0]) catch @panic("Failed to parse");
+}
+
+export fn render_ast(astStr: [*:0]const u8) [*:0]const u8 {
+    const len = mem.strlen(astStr);
+    const parsed = std.json.parseFromSlice(Ast, mem.allocator, astStr[0..len], .{}) catch @panic("Failed to parse");
+
+    var tokens = zig.Ast.TokenList{};
+    var nodes = zig.Ast.NodeList{};
+
+    var source = std.ArrayList(u8).init(mem.allocator);
+
+    for (0..parsed.value.tokens.len) |i| {
+        const start = source.items.len;
+        const token = parsed.value.tokens[i];
+        source.appendSlice(token.text) catch @panic("");
+        source.append(" "[0]) catch @panic("");
+
+        tokens.append(mem.allocator, .{
+            .start = start,
+            .tag = token.tag,
+        }) catch @panic("");
+    }
+
+    source.append(0) catch @panic("");
+
+    for (0..parsed.value.nodes.len) |i| {
+        const node = parsed.value.nodes[i];
+
+        nodes.append(mem.allocator, .{
+            .data = .{
+                .lhs = node.data.lhs,
+                .rhs = node.data.rhs,
+            },
+            .main_token = node.main_token,
+            .tag = node.tag,
+        }) catch @panic("");
+    }
+
+
+    const ast: zig.Ast = .{
+        .source = source.items[0..source.items.len :0],
+        .nodes = nodes.slice(),
+        .tokens = tokens.slice(),
+        .errors = &.{},
+        .extra_data = parsed.value.extra_data,
+    };
+
+    const res = zig.Ast.render(ast, mem.allocator) catch @panic("");
+    var buf = mem.allocator.alloc(u8, res.len+1) catch @panic("");
+    @memcpy(buf, res);
+    buf[res.len] = 0;
+
+    return buf[0..res.len :0];
 }
 
 export fn alloc(size: usize) [*]u8 {
@@ -536,17 +771,3 @@ export fn alloc(size: usize) [*]u8 {
     return b.ptr;
 }
 
-// const js = @import("js");
-
-// pub fn parse(source: js.UTF8String) js.UTF8String {
-//     const data = parse_ast(source.data) catch |e| {
-//         std.debug.print("parse error {?}\n", .{e});
-
-//         return .{ .data = @constCast("{}") };
-//     };
-//     return .{ .data = @constCast(data) };
-// }
-
-// comptime {
-//     js.registerModule(@This());
-// }

@@ -9,7 +9,7 @@ import { PackageJson, getPreviousPkg } from '../pm/packageJson'
 import { getProgramFs } from '../artifacts'
 import { getWorkingDir } from '../workspaces'
 import { getHash, isWindows, makeRelative, memoize, resolveRelative, throwIfNotFileNotFoundError } from '../utils'
-import { readKeySync } from '../cli/config'
+import { readPathKeySync } from '../cli/config'
 
 interface ParsedConfig {
     readonly cmd: Pick<ts.ParsedCommandLine, 'options' | 'fileNames' | 'raw'>
@@ -85,7 +85,6 @@ function getTsConfigFromText(configText: string | void, fileName: string, target
 // Settings that affect the interpretation of source code need to be directly
 // supported by us, otherwise things just break. Best to fail early.
 const notSupportedOptions = [
-    'paths',
     'baseUrl',
     'rootDirs',
 ]
@@ -133,9 +132,17 @@ async function getTsConfig(
             // TODO: warning
         }
     
-        const notSupported = notSupportedOptions.filter(k => !!cmd.options[k])
+        const notSupported = notSupportedOptions.filter(k => {
+            const val = cmd.options[k]
+            // We only support `baseUrl` when it's equal to the `tsconfig.json` directory
+            if (k === 'baseUrl' && typeof val === 'string') {
+                return path.resolve(val) !== path.dirname(fileName)
+            }
+
+            return val !== undefined
+        })
         if (notSupported.length > 0) {
-            throw new Error(`The following tsconfig.json options are not supported (yet): ${notSupported.join(', ')}`)
+            throw new Error(`The following tsconfig.json options are not supported: ${notSupported.join(', ')}`)
         }
     
         const rootDir = cmd.options.rootDir
@@ -544,20 +551,28 @@ function resolveObjRelative<T extends Record<string, any>>(from: string, obj: T,
     return mut
 }
 
+const cachedConfigs = new Map<Pick<JsonFs, 'readJson'>, ResolvedTsConfig | Promise<ResolvedTsConfig | undefined>>()
 
-async function saveResolvedConfig(workingDir: string, config: ResolvedProgramConfig) {
+function saveResolvedConfig(workingDir: string, config: ResolvedProgramConfig) {
     const resolved: ResolvedTsConfig = {
         version: ts.version,
-        options: makeObjRelative(workingDir, config.tsc.cmd.options, tsOptionsPathKeys),
+        options: config.tsc.cmd.options,
         sourceHash: config.tsc.sourceHash,
         include: config.tsc.include,
         exclude: config.tsc.exclude,
     }
 
-    await getProgramFs().writeJson(tsOptionsFileName, resolved)
+    cachedConfigs.set(getProgramFs(), resolved)
+
+    const relative: ResolvedTsConfig = {
+        ...resolved,
+        options: makeObjRelative(workingDir, config.tsc.cmd.options, tsOptionsPathKeys),
+    }
+
+    return getProgramFs().writeJson(tsOptionsFileName, relative)
 }
 
-export async function getResolvedTsConfig(fs: Pick<JsonFs, 'readJson'> = getProgramFs(), workingDir = getWorkingDir()): Promise<ResolvedTsConfig | undefined> {
+async function _getResolvedTsConfig(fs: Pick<JsonFs, 'readJson'>, workingDir: string): Promise<ResolvedTsConfig | undefined> {
     const unresolved: ResolvedTsConfig | undefined = await fs.readJson(tsOptionsFileName).catch(throwIfNotFileNotFoundError)
     if (!unresolved) {
         return
@@ -570,6 +585,17 @@ export async function getResolvedTsConfig(fs: Pick<JsonFs, 'readJson'> = getProg
         include: unresolved.include,
         exclude: unresolved.exclude,
     }
+}
+
+export function getResolvedTsConfig(fs: Pick<JsonFs, 'readJson'> = getProgramFs()): ResolvedTsConfig | Promise<ResolvedTsConfig | undefined> {
+    if (cachedConfigs.has(fs)) {
+        return cachedConfigs.get(fs)!
+    }
+    
+    const p = _getResolvedTsConfig(fs, getWorkingDir())
+    cachedConfigs.set(fs, p)
+
+    return p
 }
 
 // Only returns different keys
@@ -666,7 +692,7 @@ function libFromTarget(target: ts.ScriptTarget) {
 
 const patchTsSys = memoize(() => {
     // The filepath returned by `getExecutingFilePath` doesn't need to exist
-    const libDir = readKeySync('typescript.libDir')
+    const libDir = readPathKeySync('typescript.libDir')
     if (typeof libDir === 'string') {
         ts.sys.getExecutingFilePath = () => path.resolve(libDir, 'cli.js')
 

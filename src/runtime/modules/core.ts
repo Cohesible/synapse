@@ -531,6 +531,10 @@ export function move(from: string, to?: string) {
     return terraform.move(from, to)
 }
 
+export function fixupScope(name: string) {
+    return terraform.fixupScope(name)
+}
+
 /**
  * @internal
  * 
@@ -701,6 +705,7 @@ interface ClosureProps {
 interface ClosureOutput {
     readonly destination: string
     readonly extname?: string
+    readonly assets?: Record<string, string>
 }
 
 /** @internal */

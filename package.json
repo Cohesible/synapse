@@ -1,10 +1,10 @@
 {
     "name": "synapse",
-    "version": "0.0.11",
+    "version": "0.0.12",
     "bin": "./src/cli/index.ts",
     "dependencies": {
         "esbuild": "^0.20.2",
-        "typescript": "~5.4.5",
+        "typescript": "~5.5.4",
         "postject": "github:Cohesible/postject"
     },
     "devDependencies": {
@@ -23,12 +23,7 @@
     "synapse": {
         "config": {
             "exposeInternal": true,
-            "target": "local",
-            "zigFiles": [
-                "src/zig/ast.zig",
-                "src/zig/fs-ext.zig",
-                "src/zig/util.zig"
-            ]
+            "target": "local"
         },
         "binaryDependencies": {
             "node": "https://github.com/Cohesible/node.git",

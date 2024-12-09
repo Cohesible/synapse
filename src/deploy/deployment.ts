@@ -14,7 +14,7 @@ import { TfState } from './state'
 import { randomUUID } from 'node:crypto'
 import { getFsFromHash, getDeploymentFs, getProgramFs, getProgramHash, getResourceProgramHashes, getTemplate, putState, setResourceProgramHashes } from '../artifacts'
 import { runCommand } from '../utils/process'
-import { readKey } from '../cli/config'
+import { readPathKey } from '../cli/config'
 import { getDisplay, spinners } from '../cli/ui'
 import { readDirRecursive } from '../system'
 
@@ -388,9 +388,6 @@ interface DeployResult {
     readonly error?: Error
     readonly state: TfState
 }
-
-// [{"subject":"data.synapse_resource.bar","{"type":"property","value":"foo"}]}],"type":"result"}
-//expressions":[{"type":"property","value":"output"},
 
 type TfExp = { type: 'property', value: string } | { type: 'element', value: number }
 export interface TfRef {
@@ -790,30 +787,6 @@ export interface TfStateResource {
     readonly provider: string
     readonly values: Record<string, any>
 }
-
-// export async function handleErrorState(platform: Platform, opt?: DeployOptions) {
-//     const templateService = platform.getTemplateService()
-//     const templateFile = await templateService.getTemplateFilePath()
-//     const errorFilename = path.resolve(path.dirname(templateFile), 'errored.tfstate')
-
-//     try {
-//         await Promise.all([
-//             fs.access(errorFilename, fs.constants.R_OK),
-//             fs.access(path.dirname(errorFilename), fs.constants.R_OK | fs.constants.W_OK | fs.constants.X_OK),
-//         ])
-
-//         getLogger().log('Restoring error state:', errorFilename)
-//         await runTerraformCommand(platform, 'state', ['push', path.basename(errorFilename)], opt)
-
-//         getLogger().log('Error state restored! Deleting the file.')
-//         await fs.unlink(errorFilename)
-//     } catch (e) {
-//         if ((e as any).code !== 'ENOENT') {
-//             throw e
-//         }
-//     }
-// }
-
 
 // TODO: after successful destroy, delete these files
 // .terraform/terraform.tfstate
@@ -1226,7 +1199,7 @@ export function renderPlan(plan: TfPlan) {
 
 export async function getTerraformPath() {
     // This is configured on installation.
-    const configuredPath = await readKey<string>('terraform.path')
+    const configuredPath = await readPathKey('terraform.path')
     if (configuredPath) {
         return configuredPath
     }

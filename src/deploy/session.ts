@@ -32,7 +32,7 @@ export async function loadBuildState(bt: BuildTarget, repo = getDataRepository()
     const mountedFs = createTempMountedFs(mergedFs, bt.workingDirectory)
     const resolver = createModuleResolverForBundling(mountedFs, bt.workingDirectory)
     const pkgService = await createPackageService(resolver, repo)
-    const { stores } = await pkgService.loadIndex() // 5ms on simple hello world no infra
+    const { stores } = await pkgService.loadIndex()
     mountedFs.addMounts(stores)
     
     await setupPublished()
@@ -132,6 +132,7 @@ export async function getModuleLoader(wrapConsole = true, useThisContext = false
                 // it prevents it from being used as a fast-call receiver
                 // in another context
                 useThisContext,
+                registerPointerDependencies,
             }            
         )
 
@@ -268,7 +269,7 @@ export async function createSessionContext(programHash?: string): Promise<Sessio
         const dataDir = repo.getDataDir()
         const codeCache = createCodeCache(fs, getV8CacheDirectory())
         const dataRepository = createBasicDataRepo(repo)
-        // dataRepository.getDiskPath = tmpMountedFs.getDiskPath
+        dataRepository.getDiskPath = tmpMountedFs.getDiskPath
 
         const loader = createModuleLoader(
             mountedFs, 
@@ -281,6 +282,7 @@ export async function createSessionContext(programHash?: string): Promise<Sessio
                 codeCache,
                 deserializer: resolveValue,
                 dataRepository,
+                registerPointerDependencies: pkgService.registerPointerDependencies,
             }            
         )
 

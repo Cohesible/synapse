@@ -356,45 +356,42 @@ export function resolveValue(
             return val
 
             function resolveValueType() {
-                if (payload.valueType === 'resource') {
-                    const value = (payload as any).value!
-                    const normalized = normalizeTerraform(value)
-                    // XXX: do not re-hydrate captured values in a bundle
-                    if (typeof normalized === 'object' && !!normalized && 'id' in normalized && 'location' in normalized && 'source' in normalized && 'state' in normalized && 'captured' in normalized) {
-                        normalized.captured = ''
+                switch (payload.valueType) {
+                    case 'resource': {
+                        const value = (payload as any).value!
+                        const normalized = normalizeTerraform(value)
+                        // XXX: do not re-hydrate captured values in a bundle
+                        if (typeof normalized === 'object' && !!normalized && 'id' in normalized && 'location' in normalized && 'source' in normalized && 'state' in normalized && 'captured' in normalized) {
+                            normalized.captured = ''
+                        }
+        
+                        return resolve(normalized)
                     }
+
+                    case 'regexp': {
+                        const desc = payload as RegExpValue
     
-                    return resolve(normalized)
-                }
-    
-                if (payload.valueType === 'regexp') {
-                    const desc = payload as RegExpValue
-    
-                    return new RegExp(desc.source, desc.flags)
-                }
-    
-                if (payload.valueType === 'object') {
-                    return loadObject(payload as SerializedObject)
-                }
-    
-                if (payload.valueType === 'reflection') {
-                    return handleReflection(payload.operations!)
+                        return new RegExp(desc.source, desc.flags)
+                    }
+
+                    case 'object':
+                        return loadObject(payload as SerializedObject)
+
+                    case 'reflection':
+                        return handleReflection(payload.operations!)
+
+                    case 'binding':
+                        lateBindings.set(payload.id!, { key: payload.key!, value: payload.value! })
+
+                        return {}
+
+                    case 'data-pointer':
+                        return createPointer((payload as DataPointerValue).hash, (payload as DataPointerValue).storeHash)
+
+                    case 'bound-function':
+                        return payload.boundTarget!.bind(payload.boundThisArg, ...payload.boundArgs!)
                 }
 
-                if (payload.valueType === 'binding') {
-                    lateBindings.set(payload.id!, { key: payload.key!, value: payload.value! })
-
-                    return {}
-                }
-
-                if (payload.valueType === 'data-pointer') {
-                    return createPointer((payload as DataPointerValue).hash, (payload as DataPointerValue).storeHash)
-                }
-
-                if (payload.valueType === 'bound-function') {
-                    return payload.boundTarget!.bind(payload.boundThisArg, ...payload.boundArgs!)
-                }
-    
                 const module = typeof payload.module === 'object' || payload.module.startsWith(pointerPrefix)
                     ? payload.module 
                     : `${pointerPrefix}${payload.module}`

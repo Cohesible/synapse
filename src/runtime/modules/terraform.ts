@@ -152,7 +152,7 @@ export function isOriginalProxy(o: any) {
     return (o as any)[originalSym]
 }
 
-const knownSymbols: symbol[] = [Symbol.iterator]
+const knownSymbols: symbol[] = [Symbol.iterator, Symbol.asyncIterator]
 if (Symbol.dispose) {
     knownSymbols.push(Symbol.dispose)
 }
@@ -1324,12 +1324,18 @@ interface ResolvedDependency {
     readonly versionConstraint: string
 }
 
+interface MoveCommand {
+    scope: string
+    name: string
+    type?: 'fixup'
+}
+
 // These are embedded as comments into the Terraform format
 interface Extensions {
     deployTarget?: string
     secrets?: Record<string, string> // TODO: make secrets into a proper data source
     sourceMap?: TerraformSourceMap
-    moveCommands?: { scope: string; name: string }[]
+    moveCommands?: MoveCommand[]
     synapseVersion?: string
 }
 
@@ -1727,7 +1733,7 @@ export function addIndirectRefs<T extends Record<PropertyKey, any> | Function>(d
     return dst
 }
 
-const moveCommands: { scope: string; name: string }[] = []
+const moveCommands: MoveCommand[] = []
 export function move(from: string, to?: string): void {
     const scope = getScopedId()
     if (!scope) {
@@ -1746,6 +1752,19 @@ export function move(from: string, to?: string): void {
     moveCommands.push({
         name: from,
         scope,
+    })
+}
+
+export function fixupScope(name: string): void {
+    const scope = getScopedId()
+    if (!scope) {
+        throw new Error(`Failed to fixup with name "${name}": not within a scope`)
+    }
+
+    moveCommands.push({
+        name,
+        scope,
+        type: 'fixup',
     })
 }
 

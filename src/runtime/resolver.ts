@@ -5,7 +5,8 @@ import { getSpecifierComponents, resolveBareSpecifier, resolvePrivateImport } fr
 import { createTrie, isRelativeSpecifier, keyedMemoize, throwIfNotFileNotFoundError } from '../utils'
 import { ImportMap, SourceInfo } from './importMaps'
 import { PackageJson } from '../pm/packageJson'
-import { isDataPointer, toAbsolute } from '../build-fs/pointers'
+import { isDataPointer } from '../build-fs/pointers'
+import { getLogger } from '../logging'
 
 const pointerPrefix = 'pointer:'
 export const synapsePrefix = 'synapse:'
@@ -101,11 +102,7 @@ function createLookupTable<T = unknown>() {
         }
     }
 
-    function resolve(location: string | Mapping) {
-        if (typeof location === 'object' && 'physicalLocation' in location) {
-            return location.physicalLocation
-        }
-
+    function resolve(location: string) {
         const key = getLocationKey(location)
         const stack: (MapNode | undefined)[] = []
         for (const [k, v] of trie.traverse(key)) {
@@ -156,7 +153,7 @@ function createLookupTable<T = unknown>() {
     }
 
     return { lookup, resolve, registerMapping, getSource, inspect }
-} 
+}
 
 export interface PatchedPackage {
     readonly name: string
@@ -209,7 +206,7 @@ export function createModuleResolver(fs: Pick<SyncFs, 'readFileSync' | 'fileExis
             throw new Error(`Failed to resolve provider: ${specifier} [${importer ?? workingDirectory}]`)
         }
 
-        const resolved = lookupTable.resolve(res)
+        const resolved = res.physicalLocation
         const pkg = path.resolve(resolved, 'package.json')
         const pkgData = JSON.parse(fs.readFileSync(pkg, 'utf-8'))
 
@@ -287,13 +284,13 @@ export function createModuleResolver(fs: Pick<SyncFs, 'readFileSync' | 'fileExis
         }
 
         if (specifier.startsWith(pointerPrefix)) {
+            if (isDataPointer(specifier)) {
+                return [specifier, 'pointer']
+            }
+
             const res = lookupTable.lookup(specifier, importer ?? workingDirectory)
             if (res !== undefined) {
                 return res.virtualLocation
-            }
-
-            if (isDataPointer(specifier)) {
-                return [specifier, 'pointer']
             }
 
             return specifier
@@ -302,13 +299,14 @@ export function createModuleResolver(fs: Pick<SyncFs, 'readFileSync' | 'fileExis
         const getLocation = () => importer ? path.dirname(lookupTable.resolve(importer)) : workingDirectory
 
         if (specifier.startsWith(providerPrefix)) {
-            // FIXME: need to call `registerPointerDependencies` from `dynamicImport` to remove the fallback
+            // FIXME: there _might_ be a really weird race condition where metadata is lost on pointers when coming from TF (?)
+            // Looking up the specifier inside the working dir means we failed to resolve specifiers from metadata
             const res = lookupTable.lookup(specifier, importer ?? workingDirectory) ?? lookupTable.lookup(specifier, workingDirectory)
             if (!res) {
                 throw new Error(`Failed to resolve provider: ${specifier} [${importer ?? workingDirectory}]`)
             }
 
-            const resolved = lookupTable.resolve(res)
+            const resolved = res.physicalLocation
             const pkg = path.resolve(resolved, 'package.json')
             const pkgData = JSON.parse(fs.readFileSync(pkg, 'utf-8'))
 
@@ -336,8 +334,8 @@ export function createModuleResolver(fs: Pick<SyncFs, 'readFileSync' | 'fileExis
         const key = components.scheme ? `${components.scheme}:${components.name}` : components.name
         const res = lookupTable.lookup(key, importer ?? workingDirectory)
         if (res !== undefined) {
-            const filePath = lookupTable.resolve(res)
-            if (specifier.startsWith(synapsePrefix)) {
+            const filePath = res.physicalLocation
+            if (res.locationType === 'module') {
                 return filePath
             }
 
@@ -369,10 +367,10 @@ export function createModuleResolver(fs: Pick<SyncFs, 'readFileSync' | 'fileExis
             return specifier
         }
 
-        // FIXME: need to call `registerPointerDependencies` from `dynamicImport` to remove the fallback
+        getLogger().debug(`failed to resolve ${specifier} from ${importer}`)
+
         if (importer?.startsWith(pointerPrefix)) {
             return nodeModulesResolve(workingDirectory, specifier, components, mode)
-            // throw new Error(`Failed to resolve module: ${specifier} [${importer}]`)
         }
 
         return nodeModulesResolve(getLocation(), specifier, components, mode)

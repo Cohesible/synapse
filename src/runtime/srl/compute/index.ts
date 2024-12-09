@@ -169,3 +169,21 @@ export declare class Website {
 export declare class Schedule {
     public constructor(expression: string, fn: () => Promise<void> | void)
 }
+
+type PromisifyFunction<T> = T extends (...args: infer A) => Promise<infer _> 
+        ? T : T extends (...args: infer A) => infer U 
+        ? (...args: A) => Promise<U> : T
+
+type Promisify<T> = { [P in keyof T]: PromisifyFunction<T[P]> }
+
+//# resource = true
+/**
+ * @internal Used internally for registering environment-agnostic API handlers
+ */
+export declare class SecureService<T> {
+    public constructor(obj: T)
+
+    public serialize(): string & { __type?: T }
+
+    public static deserialize<T>(encoded: string & { __type?: T }): Promisify<T>
+}

@@ -15,7 +15,7 @@ import { getWorkingDir } from '../workspaces'
 import { getArtifactFs, getProgramFs } from '../artifacts'
 import { getBuildTargetOrThrow } from '../execution'
 import { compileAllZig, getZigCompilationGraph } from '../zig/compile'
-import { hasMainFunction, getZigImports } from './entrypoints'
+import { hasMainFunction } from './entrypoints'
 import { isWindows, makeRelative, resolveRelative } from '../utils'
 
 export interface ProgramBuilder {
@@ -81,7 +81,7 @@ export function createProgramBuilder(
         }
 
         if (!program) {
-            program = await runTask('compile', 'init program', async () => {
+            program = await runTask('compile', `init program${incremental ? ' (incremental)' : ''}`, async () => {
                 if (incremental) {
                     const res = await incrementalHost.getProgram(config.tsc.cmd.fileNames, oldHashes)
 
@@ -128,7 +128,7 @@ export function createProgramBuilder(
             if (!config.tsc.cmd.options.allowArbitraryExtensions) {
                 throw new Error('Compiling with Zig modules requires adding "allowArbitraryExtensions" to your tsconfig.json "compilerOptions" section')
             }
-            await compileAllZig([...zigGraph.changed], config)
+            await runTask('zig', 'compile', () => compileAllZig([...zigGraph.changed], config), 100)
         }
 
         const changed = compilation.changed

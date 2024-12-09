@@ -249,7 +249,7 @@ function showSimplePlanSummary(template: TfJson, target: string, entrypoints: st
         const byType: Record<string, number> = {}
         for (const r of sym.resources) {
             if (r.subtype === 'Closure' && r.name.endsWith('--definition')) continue
-            if (r.subtype === 'Closure' && sym.name === 'describe') continue
+            if (r.subtype === 'Closure' && (sym.name === 'describe' || sym.name === 'suite')) continue
 
             const ty = graph.getResourceType(`${r.type}.${r.name}`)
             if (ty.kind === 'custom') {
@@ -311,7 +311,9 @@ function showSimplePlanSummary(template: TfJson, target: string, entrypoints: st
     if (previousData?.state) {
         const moves = evaluateMoveCommands(template, previousData?.state)
         if (moves && moves.length > 0) {
-            printLine(`Detected possible refactors. Run ${renderCmdSuggestion('migrate')} to proceed.`)
+            getLogger().debug('Evaluated moves', moves)
+            printLine(colorize('yellow', 'Detected possible refactors.'))
+            printLine(`Run ${renderCmdSuggestion('migrate')} to proceed.`)
         }
     }
 }

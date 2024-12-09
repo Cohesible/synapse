@@ -1,6 +1,6 @@
 import ts from 'typescript'
 import * as path from 'node:path'
-import { escapeRegExp, failOnNode, isRelativeSpecifier, keyedMemoize, memoize, throwIfNotFileNotFoundError } from '../utils'
+import { escapeRegExp, failOnNode, isRelativeSpecifier, keyedMemoize, makeRelative, memoize, resolveRelative, throwIfNotFileNotFoundError } from '../utils'
 import { ResolvedProgramConfig } from './config'
 import { getFs } from '../execution'
 import { getLogger } from '../logging'
@@ -221,7 +221,7 @@ function createSpecifierResolver(cmd: Pick<ts.ParsedCommandLine, 'options' | 'fi
     }
 
     const getResolvedPaths = memoize(() => paths ? resolvePaths(paths) : [])
-    const perfile = new Set<string>()
+    const perFile = new Set<string>()
     const mappings = new Map<string, string | undefined>()
 
     function resolveBareSpecifier(spec: string) {
@@ -232,7 +232,7 @@ function createSpecifierResolver(cmd: Pick<ts.ParsedCommandLine, 'options' | 'fi
         if (mappings.has(spec)) {
             const m = mappings.get(spec)
             if (m) {
-                perfile.add(spec)
+                perFile.add(spec)
             }
             return m
         }
@@ -241,7 +241,7 @@ function createSpecifierResolver(cmd: Pick<ts.ParsedCommandLine, 'options' | 'fi
             const p = path.resolve(baseUrl, spec)
             const withExt = path.extname(p) === '' ? `${p}.ts` : p // FIXME
             if (files.has(withExt)) {
-                perfile.add(spec)
+                perFile.add(spec)
                 mappings.set(spec, withExt)
                 return withExt
             }
@@ -254,7 +254,7 @@ function createSpecifierResolver(cmd: Pick<ts.ParsedCommandLine, 'options' | 'fi
                 for (const l of locations) {
                     const withExt = path.extname(l) === '' ? `${l}.ts` : l // FIXME
                     if (files.has(withExt) || fs.fileExistsSync(withExt)) {
-                        perfile.add(spec)
+                        perFile.add(spec)
                         mappings.set(spec, withExt)
                         return withExt
                     }
@@ -270,7 +270,7 @@ function createSpecifierResolver(cmd: Pick<ts.ParsedCommandLine, 'options' | 'fi
                 const p = l.replace('*', wildcard)
                 const withExt = path.extname(p) === '' ? `${p}.ts` : p // FIXME
                 if (files.has(withExt) || fs.fileExistsSync(withExt)) {
-                    perfile.add(spec)
+                    perFile.add(spec)
                     mappings.set(spec, withExt)
                     return withExt
                 }
@@ -281,14 +281,14 @@ function createSpecifierResolver(cmd: Pick<ts.ParsedCommandLine, 'options' | 'fi
     }
 
     function getPerFileMappings() {
-        if (perfile.size === 0) {
+        if (perFile.size === 0) {
             return
         }
 
-        const keys = [...perfile]
-        perfile.clear()
+        const keys = [...perFile]
+        perFile.clear()
 
-        return Object.fromEntries(keys.map(k => [k, mappings.get(k)!]))
+        return Object.fromEntries(keys.map(k => [k, makeRelative(resolveDir, mappings.get(k)!)]))
     }
 
     return { mappings, resolveBareSpecifier, getPerFileMappings }
@@ -310,7 +310,7 @@ export async function findAllBareSpecifiers(config: ResolvedProgramConfig, host:
 
     const specs = previousSpecs ?? {}
     for (const [f, h] of hashes) {
-        const relPath = path.relative(workingDir, f)
+        const relPath = makeRelative(workingDir, f)
         if (specs[relPath]?.hash === h) {
             specs[relPath].specs.forEach(s => bare.add(s))
             continue
@@ -373,6 +373,42 @@ const _getSpecData = memoize(() => {
 
 export async function getZigImports(relPath: string) {
     return (await _getSpecData())?.[relPath]?.zigImports
+}
+
+function getPerFilePathMappings(data: Record<string, SpecDataElement>, workingDir: string, resolveDir: string) {
+    const result: Record<string, Record<string, string>> = {}
+    for (const [k, v] of Object.entries(data)) {
+        if (!v.mappings) continue
+
+        const perFile: Record<string, string> = result[resolveRelative(workingDir, k)] = {}
+        for (const [spec, relPath] of Object.entries(v.mappings)) {
+            perFile[spec] = resolveRelative(resolveDir, relPath)
+        }
+    }
+
+    return result
+}
+
+function getDedupedPathMappings(data: Record<string, SpecDataElement>, resolveDir: string) {
+    const result: Record<string, string> = {}
+    for (const v of Object.values(data)) {
+        if (!v.mappings) continue
+
+        for (const spec of Object.keys(v.mappings)) {
+            result[spec] ??= path.resolve(resolveDir, v.mappings[spec])
+        }
+    }
+
+    return result
+}
+
+export async function getTsPathMappings(resolveDir: string) {
+    const data = await _getSpecData()
+    if (!data) {
+        return
+    }
+
+    return getDedupedPathMappings(data, resolveDir)
 }
 
 // export async function getAllBareSpecifiers() {

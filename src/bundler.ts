@@ -16,7 +16,7 @@ import { createModuleResolverForBundling } from './runtime/rootLoader'
 import { getWorkingDir } from './workspaces'
 import { pointerPrefix, createPointer, isDataPointer, toAbsolute, DataPointer, coerceToPointer, isNullHash, applyPointers } from './build-fs/pointers'
 import { getModuleType } from './static-solver'
-import { readKeySync } from './cli/config'
+import { readPathKeySync } from './cli/config'
 import { isSelfSea } from './execution'
 
 // Note: `//!` or `/*!` are considered "legal comments"
@@ -71,7 +71,7 @@ export function createProgram(
 }
 
 export const setupEsbuild = memoize(() => {
-    const esbuildPath = readKeySync<string>('esbuild.path')
+    const esbuildPath = readPathKeySync('esbuild.path')
     if (!esbuildPath) {
         if (!process.env.ESBUILD_BINARY_PATH && isSelfSea()) {
             throw new Error(`Missing esbuild binary`)
@@ -119,6 +119,8 @@ function mapTarget(target: ts.ScriptTarget | undefined) {
             return 'es2021'
         case ts.ScriptTarget.ES2022:
             return 'es2022'
+        case ts.ScriptTarget.ES2023:
+            return 'es2023'
         case ts.ScriptTarget.ESNext:
             return 'esnext'
         case ts.ScriptTarget.JSON:
@@ -545,7 +547,7 @@ function createFsPlugin(fs: Fs & SyncFs, resolver: ModuleResolver, opt: BundleOp
                     return data
                 }
             
-                return applyPointers(data, m.pointers)
+                return applyPointers(data, m.pointers) as Artifact
             }
 
             async function loadPointer(args: esbuild.OnLoadArgs): Promise<esbuild.OnLoadResult> {
@@ -566,6 +568,29 @@ function createFsPlugin(fs: Fs & SyncFs, resolver: ModuleResolver, opt: BundleOp
                             contents: renderFile(deserializePointers(data), opt.platform, undefined, undefined, false, undefined, serializerHost),
                             resolveDir: opt.workingDirectory,
                             pluginData: { virtualId: args.pluginData?.virtualId }
+                        }
+                    case 'native-module':
+                        const compiler = serializerHost?.nativeCompiler
+                        if (!compiler) {
+                            return {
+                                loader: 'js',
+                                contents: Buffer.from(data.binding, 'base64'),
+                            }
+                        }
+
+                        if (!serializerHost.addRawAsset) {
+                            throw new Error(`Missing ability to add raw asset: ${data.sourceName}`)
+                        }
+
+                        const resolved = path.resolve(getWorkingDir(), data.sourceName)
+                        const compiled = await compiler(resolved)
+                        const asset = serializerHost.addRawAsset(compiled.compiled)
+                        const relPath = serializerHost.addAsset!(asset).slice('file:'.length)
+                        const contents = compiled.stub.replace(`'${path.basename(resolved).replace(/\.zig$/, '.node')}'`, `'${relPath}'`)
+
+                        return {
+                            loader: 'js',
+                            contents,
                         }
                     default:
                         throw new Error(`Unknown object kind: ${(data as any).kind}`)
@@ -672,7 +697,6 @@ function createCompilerHost(options: ts.CompilerOptions, fs: SyncFs): ts.Compile
         getCanonicalFileName: fileName => ts.sys.useCaseSensitiveFileNames ? fileName : fileName.toLowerCase(),
         getNewLine: () => ts.sys.newLine,
         useCaseSensitiveFileNames: () => ts.sys.useCaseSensitiveFileNames,
-        // resolveModuleNames
     }
 
     function fileExists(fileName: string): boolean {
@@ -1136,12 +1160,16 @@ function deserializePointers(obj: any): any {
     return res
 }
 
-interface SerializerHost {
+export interface SerializerHost {
     addAsset?: (p: DataPointer) => string
     addRawAsset?: (data: ArrayBuffer) => DataPointer
     getMappedPointer?: (p: string) => string
     getUnmappedPointer?: (p: string) => string
     optimize?: Optimizer
+    nativeCompiler?: (fileName: string) => Promise<{
+        compiled: Uint8Array
+        stub: string
+    }>
 }
 
 export function renderFile(

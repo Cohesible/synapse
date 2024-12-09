@@ -699,7 +699,7 @@ export function createResourceGraph(
                         if (s.elseStatement) {
                             visitNode(s.elseStatement)
                         }
-                    } else if (ts.isForStatement(s)) {
+                    } else if (ts.isForStatement(s) || ts.isForOfStatement(s)) {
                         visitNode(s.statement)
                     } else if (!ts.isFunctionDeclaration(s) && !ts.isClassDeclaration(s)) {
                         visitNode(s)

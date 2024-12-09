@@ -5,7 +5,7 @@ import { fetchData, fetchJson } from '../utils/http'
 import { getPackageCacheDirectory, getUserSynapseDirectory, getWorkingDir } from '../workspaces'
 import { runCommand } from '../utils/process'
 import { ensureDir, isNonNullable, isWindows, memoize } from '../utils'
-import { readKey, setKey } from '../cli/config'
+import { readPathKey, setPathKey } from '../cli/config'
 import { extractToDir } from '../utils/tar'
 import { registerToolProvider } from '../pm/tools'
 import { getFs } from '../execution'
@@ -209,7 +209,7 @@ export async function getZigPath() {
         return fromNodeModules
     }
 
-    const fromConfig = await readKey<string>('zig.path')
+    const fromConfig = await readPathKey('zig.path')
     if (fromConfig) {
         return fromConfig
     }
@@ -223,13 +223,13 @@ export async function getZigPath() {
         throw new Error(`Unexpected zig version install: found ${v}, expected: ${expected}`)
     }
 
-    await setKey('zig.path', zigPath)
+    await setPathKey('zig.path', zigPath)
 
     return zigPath
 }
 
 function getSynapseZigLibDir() {
-    return readKey<string>('zig.synapseLibDir')
+    return readPathKey('zig.synapseLibDir')
 }
 
 export async function getJsLibPath() {

@@ -1,8 +1,10 @@
 import ts from 'typescript'
 import * as path from 'node:path'
-import { Optimizer, createPointerMapper, createSerializerHost, createTranspiler, getModuleDeps, getNpmDeps, renderFile } from './bundler'
+import { Optimizer, SerializerHost, createPointerMapper, createSerializerHost, createTranspiler, getModuleDeps, getNpmDeps, renderFile } from './bundler'
 
 import type { ExternalValue } from './runtime/modules/serdes'
+import type { BundleOptions } from './runtime/modules/lib'
+
 import { getLogger } from './logging'
 import { BuildFsFragment, toFs } from './artifacts'
 import { DeploymentContext } from './deploy/server'
@@ -13,6 +15,8 @@ import { loadBuildState } from './deploy/session'
 import { Mutable, getHash, makeExecutable, memoize } from './utils'
 import { optimizeSerializedData } from './optimizer'
 import { which } from './utils/process'
+import { compileZigDirect } from './zig/compile'
+import { resolveBuildTarget } from './build/builder'
 
 function replaceGlobals(captured: any, globals: any) {
     if (typeof globals !== 'object' || globals === null) {
@@ -61,15 +65,10 @@ function replaceGlobals(captured: any, globals: any) {
 
 const moveableStr = '@@__moveable__'
 
-interface BundleOptions { 
-    readonly external?: string[]
-    readonly destination?: string
+export interface InternalBundleOptions extends BundleOptions { 
     readonly bundled?: boolean
-    readonly platform?: 'node' | 'browser'
-    readonly immediatelyInvoke?: boolean // This should _only_ be set if bundling a function with no parameters
     readonly moduleTarget?: 'esm' | 'cjs'
 
-    readonly publishName?: string
     readonly isModule?: boolean
     readonly lazyLoad?: string[]
     // TODO: combine with `lazyLoad`
@@ -77,10 +76,18 @@ interface BundleOptions {
 
     readonly includeAssets?: boolean
 
+
+    readonly minify?: boolean
+    readonly minifyKeepWhitespace?: boolean
+    readonly runtimeExecutable?: string
+    readonly sea?: boolean
+
     /** 
      * @experimental not well tested
      */
     readonly useOptimizer?: boolean
+
+    readonly extraBuiltins?: string[]
 }
 
 // TODO: compiler options should be stored in the template
@@ -314,7 +321,7 @@ export async function bundleExecutable(
     target: string,
     outfile = target,
     workingDirectory = bt.workingDirectory,
-    opt?: BundleOptions & { minify?: boolean; minifyKeepWhitespace?: boolean; useOptimizer?: boolean; runtimeExecutable?: string; sea?: boolean }
+    opt?: InternalBundleOptions
 ) {
     const { mountedFs, resolver, repo } = await loadBuildState(bt)
 
@@ -370,7 +377,7 @@ export async function bundlePkg(
     target: string,
     workingDirectory: string,
     outfile: string,
-    opt?: BundleOptions & { minifyKeepWhitespace?: boolean }
+    opt?: InternalBundleOptions
 ) {
     const bt = getBuildTargetOrThrow()
     const { mountedFs, repo, resolver } = await loadBuildState(bt)
@@ -410,6 +417,23 @@ function createOptimizer(fs: { readDataSync: (hash: string) => Uint8Array; write
     }
 }
 
+function createNativeCompiler(workingDirectory: string, tsOptions: ts.CompilerOptions, opt?: BundleOptions) {
+    const systemTarget = resolveBuildTarget()
+            
+    return (fileName: string) => {
+        return compileZigDirect(fileName, {
+            rootDir: tsOptions.rootDir ?? workingDirectory,
+            outDir: tsOptions.outDir,
+            hostTarget: {
+                arch: opt?.arch ?? systemTarget.arch,
+                os: opt?.os ?? systemTarget.os,
+                libc: opt?.libc ?? systemTarget.libc,
+                endianness: opt?.endianness ?? systemTarget.endianness,
+            }
+        })
+    }
+}
+
 export async function bundleClosure(
     ctx: DeploymentContext,
     buildFs: BuildFsFragment,
@@ -418,7 +442,7 @@ export async function bundleClosure(
     globals: any, 
     workingDirectory: string,
     outputDirectory: string,
-    opt?: BundleOptions
+    opt?: InternalBundleOptions
 ) {
     if (opt?.platform !== 'browser') {
         captured = replaceGlobals(captured, globals)
@@ -456,9 +480,9 @@ export async function bundleClosure(
 
     const dependencies = Array.from(new Set(artifacts))
     const packageDependencies = !bundled ? getPackageDependencies(ctx, data.table) : undefined
-    if (packageDependencies) {
-        getLogger().debug(`Found package dependencies for target "${target}"`, Object.values(packageDependencies.packages).map(p => `${p.name}@${p.version}`))
-    }
+    // if (packageDependencies) {
+    //     getLogger().debug(`Found package dependencies for target "${target}"`, Object.values(packageDependencies.packages).map(p => `${p.name}@${p.version}`))
+    // }
 
     const ambientDependencies = getAmbientDependencies(ctx, data.table)
 
@@ -545,6 +569,10 @@ export async function bundleClosure(
 
     const optimizer = opt?.useOptimizer ? createOptimizer(buildFs) : undefined
     const serializerHost = opt?.includeAssets ? createSerializerHost(buildFs, 'backend-bundle', optimizer) : createPointerMapper()
+    if (opt?.includeAssets) {
+        (serializerHost as SerializerHost).nativeCompiler = createNativeCompiler(workingDirectory, compilerOptions, opt)
+    }
+
     const sourceFile = renderFile(data, opt?.platform, bundled, opt?.immediatelyInvoke, undefined, isArtifact, serializerHost)
     const sourceFileName = outfile.replace(/\.(?:m)?j(sx?)$/, '.t$1')
 

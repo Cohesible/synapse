@@ -12,6 +12,7 @@ describe('a test suite', () => {
     })
 })
 ```
+
 Creates a test suite named "a test suite" and a test within that suite called "runs a test", following the BDD-style of naming.
 
 You can also create tests outside of a suite:
@@ -23,13 +24,40 @@ test('console.log("hi")', () => {
 })
 ```
 
-Note that `it` is an alias for `test`. Both can be used interchangeably.
+Note that some functions are aliases and can be used interchangeably:
+* `describe` <---> `suite`
+* `it` <---> `test`
 
 ## Running tests
 
 Use the command `synapse test` to run all tests. You can provide specific filenames to only run tests in those files as well.
 
 Note that tests are considered a "resource" (albeit a local one). That means a "deploy" operation is required to create/update tests. This happens automatically when you run `synapse test`. Any resources that your tests depend on could be updated which might not be wanted. A future release may include ways to control this behavior. 
+
+## Test isolation
+
+In contrast to many JS test frameworks, `synapse:test` executes each test in isolation.
+
+For example, these two tests will both pass:
+```ts
+import { test, expectEqual } from 'synapse:test'
+
+let c = 0
+
+test('one', () => {
+    expectEqual(++c, 1)
+})
+
+test('two', () => {
+    expectEqual(++c, 1)
+})
+```
+
+Not everything is isolated between tests. The following are still shared for performance reasons:
+* Code not compiled with Synapse, such as from `npm` packages
+* The global context i.e `globalThis`
+
+This should not cause problems in the vast majority of cases. If you run into any problems, please create an issue and we can figure out a solution.
 
 ## Assertion functions
 
@@ -38,7 +66,15 @@ Note that tests are considered a "resource" (albeit a local one). That means a "
 * `expectEqual` - deep comparison, equivalent to `assertDeepStrictEqual`
 * `expectReferenceEqual` - shallow comparison, equivalent to `assertStrictEqual`
 
-One thing that should stand out is the swapping of deep equal and shallow equal. This was done because structural equality is far more useful and common for distributed systems.
+Something that should stand out is the swapping of deep equal and shallow equal. This was done because structural equality is far more useful and common for distributed systems.
+
+## Hooks
+
+Per-test lifecycle hooks can be registered using `before` and `after` which run before and after each test, respectively. Nested suites inherit the hooks of their parents.
+
+The order of execution for "inherited" hooks is different between `before` and `after`:
+`before` - top-down execution, start with the hooks in the top-most suite and work down
+`after`- bottom-up execution, start with the hooks in the bottom-most suite and work up
 
 ## Using other testing frameworks
 

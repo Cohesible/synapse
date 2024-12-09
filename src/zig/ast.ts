@@ -1,7 +1,7 @@
 import ts from 'typescript'
 import * as zig from './ast.zig'
 import * as path from 'node:path'
-import { isNonNullable, isRelativeSpecifier, keyedMemoize } from '../utils'
+import { isNonNullable, keyedMemoize } from '../utils'
 import { emitChunk } from '../static-solver/utils'
 import { getFs } from '../execution'
 
@@ -162,6 +162,17 @@ function toTsTypeNode(node: zig.Node): ts.TypeNode {
                 return ts.factory.createTypeReferenceNode(n.name)
             }
 
+            if (converted.type === 'integer') {
+                const bigintWidth = converted.signed ? 54 : 53
+
+                if (converted.width >= bigintWidth) {
+                    return ts.factory.createUnionTypeNode([
+                        ts.factory.createTypeReferenceNode('number'),
+                        ts.factory.createTypeReferenceNode('bigint'),
+                    ])
+                }
+            }
+
             return ts.factory.createTypeReferenceNode('number')
         case 'field_access':
             if (isUtf8String(node)) {
@@ -295,7 +306,9 @@ function toTsNode(node: zig.Node, treatPubAsExport?: boolean): ts.Node | undefin
                         return
                     }
 
-                    return ts.factory.createEnumMember(mm.name, ts.factory.createStringLiteral(mm.name))
+                    const name = mm.name.startsWith('@"') ? mm.name.slice(2, -1) : mm.name
+
+                    return ts.factory.createEnumMember(name, ts.factory.createStringLiteral(name))
                 }).filter(isNonNullable)
 
                 return ts.factory.createEnumDeclaration(mod, n.name, members)
@@ -444,29 +457,33 @@ function toSimpleType(node: zig.Node): string {
 function isNativeModule(ast: AstRoot) {
     return !!ast.members.map(createSyntheticUnion)
         .find(m => {
-            if (m.$type !== 'comptime_block' || !m.block) return 
-            const b = createSyntheticUnion(m.block)
-            if (b.$type !== 'block' || !b.lhs) {
+            if (m.$type !== 'comptime_node' || !m.node) {
                 return
             }
 
-            const lhs = createSyntheticUnion(b.lhs)
-            if (lhs.$type !== 'call_exp') {
+            const b = createSyntheticUnion(m.node)
+            if (b.$type !== 'block') {
                 return
             }
 
-            const exp = createSyntheticUnion(lhs.exp)
-            if (exp.$type === 'ident') {
-                return exp.name === 'registerModule'
-            } else if (exp.$type === 'field_access') {
-                // TODO: check that target is `js` module
-                return exp.member === 'registerModule'
+            for (const s of b.statements.map(createSyntheticUnion)) {
+                if (s.$type !== 'call_exp') continue
+
+                const exp = createSyntheticUnion(s.exp)
+
+                if (exp.$type === 'ident') {
+                    return exp.name === 'registerModule'
+                } else if (exp.$type === 'field_access') {
+                    // TODO: check that target is `js` module
+                    return exp.member === 'registerModule'
+                }
             }
         })
 }
 
 function getVarDecls(nodes: zig.Node[]): zig.VarDecl[] {
-    return nodes.map(createSyntheticUnion).filter(n => n.$type === 'vardecl')
+    return nodes.map(createSyntheticUnion)
+        .filter(n => n.$type === 'vardecl')
         .map(n => n as any as zig.VarDecl)
 }
 
@@ -556,4 +573,3 @@ export async function generateTsZigBindings(target: string) {
         typeDefinition: { name: outfile, text: text },
     }
 }
-

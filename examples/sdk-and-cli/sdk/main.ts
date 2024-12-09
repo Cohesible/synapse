@@ -1,13 +1,18 @@
 import { HttpService } from 'synapse:srl/compute'
 import { Bucket } from 'synapse:srl/storage'
-import { fetch } from 'synapse:http'
+import { fetch, HttpError } from 'synapse:http'
 
 const bucket = new Bucket()
 const service = new HttpService({ auth: 'none' })
 
 const getRoute = service.route('GET', '/{key+}', async req => {
     const { key } = req.pathParameters
-    return bucket.get(key, 'utf-8')
+    const data = await bucket.get(key, 'utf-8')
+    if (data === undefined) {
+        throw new HttpError(`Key not found: ${key}`, { status: 404 })
+    }
+
+    return data
 })
 
 const putRoute = service.route('PUT', '/{key+}', async (req, body: string) => {

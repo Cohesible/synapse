@@ -109,6 +109,26 @@ export function getSelfPathOrThrow() {
 
 export class CancelError extends Error {}
 
+// These are global for now
+const disposables: (Disposable | AsyncDisposable)[] = []
+export function pushDisposable<T extends Disposable | AsyncDisposable>(disposable: T): T {
+    disposables.push(disposable)
+    return disposable
+}
+
+export async function dispose() {
+    const promises: PromiseLike<void>[] = []
+    for (const d of disposables) {
+        if (Symbol.dispose in d) {
+            d[Symbol.dispose]()
+        } else {
+            promises.push(d[Symbol.asyncDispose]())
+        }
+    }
+
+    disposables.length = 0
+    await Promise.all(promises)
+}
 
 // This is mutable and may be set at build-time
 let semver = '0.0.1'

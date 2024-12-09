@@ -491,7 +491,7 @@ function createConfigurationClass(
 }
 
 function isAsync(node: ts.Node): boolean {
-    // Most common case
+    // Most common case   
     if (node.kind === ts.SyntaxKind.CallExpression || node.kind === ts.SyntaxKind.NewExpression) {
         const exp = node as ts.CallExpression | ts.NewExpression
         if (isAsync(exp.expression)) {

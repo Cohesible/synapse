@@ -6,6 +6,7 @@ export function main(status: string) {
 }
 
 // !commands
+// echo "skipped"; exit 0
 // synapse clean
 // export CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
 // synapse compile

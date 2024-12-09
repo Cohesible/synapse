@@ -1249,7 +1249,6 @@ export function createTrie<T, K extends Iterable<string> = string>() {
 
     function* traverse(key: K) {
         let node = root
-        // yield ['', node.value] as const
 
         for (const k of key) {
             node = node.children[k]
@@ -1610,7 +1609,7 @@ interface FileHasherCacheWithTime {
 // This is should ideally only be used for source files
 export function createFileHasher(fs: Pick<Fs, 'readFile' | 'writeFile' | 'deleteFile' | 'stat'>, cacheLocation: string) {
     // We use a single timestamp to represent the entire session
-    const checkTime = Date.now()
+    let checkTime = Date.now()
     const location = path.resolve(cacheLocation, 'files.json')
 
     async function loadCache(): Promise<FileHasherCache> {
@@ -1664,15 +1663,18 @@ export function createFileHasher(fs: Pick<Fs, 'readFile' | 'writeFile' | 'delete
     }
 
     async function checkFile(fileName: string) {
-        const cachePromise = getCache()
+        const cache = await getCache()
+        const cached = cache[fileName]
+        if (cached?.checkTime === checkTime) {
+            return { hash: cached.hash }
+        }
+
         const stat = await fs.stat(fileName).catch(async e => {
-            delete (await cachePromise)[fileName]
+            delete cache[fileName]
             throw e
         })
 
         // TODO: try rounding `mtime`?
-        const cache = await cachePromise
-        const cached = cache[fileName]
         if (cached && cached.mtime === stat.mtimeMs) {
             cached.checkTime = checkTime
 
@@ -1687,15 +1689,20 @@ export function createFileHasher(fs: Pick<Fs, 'readFile' | 'writeFile' | 'delete
     }
 
     async function flush() {
-        if (!getCache.cached) {
-            return
+        if (getCache.cached) {
+            await saveCache(await getCache())
+            getCache.clear()
         }
 
-        await saveCache(await getCache())
-        getCache.clear()
+        checkTime = Date.now()
     }
 
-    return { getHash: _getHash, checkFile, flush }
+    return { 
+        getHash: _getHash, 
+        checkFile, 
+        flush,
+        [Symbol.asyncDispose]: flush,
+    }
 }
 
 export async function makeExecutable(fileName: string) {
