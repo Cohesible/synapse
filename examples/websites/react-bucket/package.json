@@ -1,5 +1,6 @@
 {
     "dependencies": {
-        "@cohesible/synapse-react": "spr:#synapse-react"
+        "@cohesible/synapse-react": "spr:#synapse-react",
+        "react": "18.3.1"
     }
 }
