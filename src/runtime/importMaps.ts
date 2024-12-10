@@ -2,8 +2,8 @@ import { getLogger } from '../logging'
 import { Mutable } from '../utils'
 import { PackageInfo } from './modules/serdes'
 
-function _showImportMap<T>(m: ImportMap<T>, printSourceInfo?: (source: T) => string) {
-    function render(map: ImportMap<T>, depth = 0) {
+function _showImportMap(m: ImportMap, printSourceInfo?: (source: SourceInfo) => string) {
+    function render(map: ImportMap, depth = 0) {
         for (const [k, v] of Object.entries(map)) {
             const source = v.source ? printSourceInfo?.(v.source) : undefined
             getLogger().log(`${'  '.repeat(depth)}${depth ? '|__ ' : ''}${k}${source ? ` - ${source}` : ''}`)
@@ -16,7 +16,7 @@ function _showImportMap<T>(m: ImportMap<T>, printSourceInfo?: (source: T) => str
 }
 
 
-export function showImportMap(m: ImportMap<SourceInfo>) {
+export function showImportMap(m: ImportMap) {
     _showImportMap(m, printSource)
 }
 
@@ -32,30 +32,35 @@ function printSource(info: SourceInfo) {
     throw new Error(`Unsupported source type: ${type}`)
 }
 
+interface PointerInfo {
+    hash: string
+    metadataHash: string
+}
+
 export type SourceInfo = {
     readonly type: 'package'
     readonly data: PackageInfo
 } | {
     readonly type: 'artifact'
-    readonly data: { hash: string; metadataHash: string }
+    readonly data: PointerInfo
 }
 
-export interface ImportMap<T = unknown> {
+export interface ImportMap {
     [specifier: string]: {
-        readonly source?: T
-        readonly mapping?: ImportMap<T>
+        readonly source?: SourceInfo
+        readonly mapping?: ImportMap
         readonly location: string
         readonly locationType?: 'module' | 'package'
     }
 }
 
-function _hoistImportMap<T>(mapping: ImportMap<T>, getKey: (source: T) => string, stack: ImportMap<T>[] = []): ImportMap<T> {
+function _hoistImportMap(mapping: ImportMap, getKey: (source: SourceInfo) => string, stack: ImportMap[] = []): ImportMap {
     // Import maps can include cycles which we can simply ignore
     //
     // Hoisting is applied bottom-up, guaranteeing we'll visit any 
     // detected cycles after visiting all non-cyclical dependencies
 
-    const shouldSkip = new Set<ImportMap<T>>()
+    const shouldSkip = new Set<ImportMap>()
     for (const [k, v] of Object.entries(mapping)) {
         if (!v.mapping) continue
 
@@ -67,7 +72,7 @@ function _hoistImportMap<T>(mapping: ImportMap<T>, getKey: (source: T) => string
     }
 
     const roots = new Set<string>(Object.keys(mapping))
-    const candidates = new Map<string, ImportMap<T>[]>()
+    const candidates = new Map<string, ImportMap[]>()
 
     for (const [k, v] of Object.entries(mapping)) {
         if (!v.mapping || shouldSkip.has(v.mapping)) continue
@@ -84,7 +89,7 @@ function _hoistImportMap<T>(mapping: ImportMap<T>, getKey: (source: T) => string
     }
 
     for (const [k, v] of candidates.entries()) {
-        const groups: Record<string, ImportMap<T>[]> = {}
+        const groups: Record<string, ImportMap[]> = {}
         for (const m of v) {
             const source = m[k].source
             if (source) {
@@ -114,8 +119,8 @@ function getKeyFromSource(source: SourceInfo) {
     }
 }
 
-export function hoistImportMap(mapping: ImportMap<SourceInfo>): ImportMap<SourceInfo> {
-    function pruneDuplicates(mapping: ImportMap<SourceInfo>) {
+export function hoistImportMap(mapping: ImportMap): ImportMap {
+    function pruneDuplicates(mapping: ImportMap) {
         const roots = new Set(Object.keys(mapping))
         for (const k of roots) {
             const v = mapping[k]
@@ -137,8 +142,8 @@ export function hoistImportMap(mapping: ImportMap<SourceInfo>): ImportMap<Source
     return pruneDuplicates(_hoistImportMap(mapping, getKeyFromSource))
 }
 
-export interface FlatImportMap<T = unknown> {
-    readonly sources: Record<string, T | undefined>             // ID -> T
+export interface FlatImportMap {
+    readonly sources: Record<string, SourceInfo | undefined>    // ID -> SourceInfo
     readonly mappings: Record<string, Record<string, string> >  // ID -> (spec -> ID)
     readonly locations: Record<string, {                        // ID -> file(s)
         readonly location: string
@@ -146,15 +151,15 @@ export interface FlatImportMap<T = unknown> {
     }> 
 }
 
-function _flattenImportMap<T>(mapping: ImportMap<T>, getKey: (source: T) => string, collapse?: boolean): FlatImportMap<T> {
-    const sources: FlatImportMap<T>['sources'] = {}
-    const mappings: FlatImportMap<T>['mappings'] = {}
-    const locations: FlatImportMap<T>['locations'] = {}
+function _flattenImportMap(mapping: ImportMap, getKey: (source: SourceInfo) => string, collapse?: boolean): FlatImportMap {
+    const sources: FlatImportMap['sources'] = {}
+    const mappings: FlatImportMap['mappings'] = {}
+    const locations: FlatImportMap['locations'] = {}
 
-    const unknowns = new Map<ImportMap<T>[string], string>()
+    const unknowns = new Map<ImportMap[string], string>()
     const encodedIds = new Map<string, string>()
 
-    function getUnknownSourceId(n: ImportMap<T>[string]) {
+    function getUnknownSourceId(n: ImportMap[string]) {
         if (unknowns.has(n)) {
             return unknowns.get(n)!
         }
@@ -166,7 +171,7 @@ function _flattenImportMap<T>(mapping: ImportMap<T>, getKey: (source: T) => stri
     }
 
     const uniqueIds = new Map<any, string>()
-    function getId(n: ImportMap<T>[string]) {
+    function getId(n: ImportMap[string]) {
         if (!collapse) {
             if (uniqueIds.has(n)) {
                 return uniqueIds.get(n)!
@@ -183,7 +188,7 @@ function _flattenImportMap<T>(mapping: ImportMap<T>, getKey: (source: T) => stri
     }
     
     // Makes the import map smaller on disk
-    function getEncodedId(n: ImportMap<T>[string]) {
+    function getEncodedId(n: ImportMap[string]) {
         const id = getId(n)
         if (encodedIds.has(id)) {
             return encodedIds.get(id)!
@@ -200,7 +205,7 @@ function _flattenImportMap<T>(mapping: ImportMap<T>, getKey: (source: T) => stri
         m[spec] = id
     }
 
-    function visit(mapping: ImportMap<T>, currentId: string) {
+    function visit(mapping: ImportMap, currentId: string) {
         for (const [k, v] of Object.entries(mapping)) {
             const id = getEncodedId(v)
             addMapping(currentId, k, id)
@@ -221,14 +226,14 @@ function _flattenImportMap<T>(mapping: ImportMap<T>, getKey: (source: T) => stri
     return { sources, mappings, locations }
 }
 
-function _expandImportMap<T>(mapping: FlatImportMap<T>): ImportMap<T> {
+function _expandImportMap(mapping: FlatImportMap): ImportMap {
     if (Object.keys(mapping.mappings).length === 0) {
         return {}
     }
 
-    const expanded = new Map<string, ImportMap<T>[string]>()
+    const expanded = new Map<string, ImportMap[string]>()
 
-    function expand(id: string): ImportMap<T>[string] {
+    function expand(id: string): ImportMap[string] {
         if (expanded.has(id)) {
             return expanded.get(id)!
         }
@@ -238,7 +243,7 @@ function _expandImportMap<T>(mapping: FlatImportMap<T>): ImportMap<T> {
             throw new Error(`Missing import: ${id}`)
         }
 
-        const r: Mutable<ImportMap<T>[string]> = {
+        const r: Mutable<ImportMap[string]> = {
             location: l.location,
             locationType: l.locationType,
             source: mapping.sources[id],
@@ -248,7 +253,7 @@ function _expandImportMap<T>(mapping: FlatImportMap<T>): ImportMap<T> {
 
         const m = mapping.mappings[id]
         if (m) {
-            const inner: ImportMap<T> = r.mapping = {}
+            const inner: ImportMap = r.mapping = {}
             for (const [k, v] of Object.entries(m)) {
                 inner[k] = expand(v)
             }
@@ -262,7 +267,7 @@ function _expandImportMap<T>(mapping: FlatImportMap<T>): ImportMap<T> {
         throw new Error(`Missing root mapping`)
     }
 
-    const res: ImportMap<T> = {}
+    const res: ImportMap = {}
     for (const [k, v] of Object.entries(root)) {
         res[k] = expand(v)
     }
@@ -270,10 +275,10 @@ function _expandImportMap<T>(mapping: FlatImportMap<T>): ImportMap<T> {
     return res
 }
 
-export function flattenImportMap(mapping: ImportMap<SourceInfo>, collapse = true) {
+export function flattenImportMap(mapping: ImportMap, collapse = true) {
     return _flattenImportMap(mapping, getKeyFromSource, collapse)
 }
 
-export function expandImportMap(mapping: FlatImportMap<SourceInfo>) {
+export function expandImportMap(mapping: FlatImportMap) {
     return _expandImportMap(mapping)
 }

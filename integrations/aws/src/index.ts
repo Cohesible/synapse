@@ -60,9 +60,6 @@ export class Provider extends aws.AwsProvider {
     }
 }
 
-// TODO: is this still needed?
-Object.assign(Provider, { [core.contextType]: 'aws' })
-
 core.addTarget(srl.Provider, Provider, 'aws')
 
 export function getManagementRoleArn(account: Account, partition = 'aws') {

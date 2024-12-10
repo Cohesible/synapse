@@ -1,11 +1,10 @@
 import ts from 'typescript'
-import { Fn, isElement, isGeneratedClassConstructor, isOriginalProxy, isRegExp } from './runtime/modules/terraform'
 import { createStaticSolver, createUnknown, isUnion, isUnknown, isInternalFunction, getSourceCode, evaluate as evaluateUnion } from './static-solver'
-import { getLogger } from './logging'
+import { getLogger, LogLevel } from './logging'
 import { dedupe, memoize, wrapWithProxy } from './utils'
 import { getArtifactOriginalLocation } from './runtime/loader'
 import { ExternalValue } from './runtime/modules/serdes'
-import type { LogLevel } from './cli/logger'
+import { isProxy } from './loader'
 
 export function isModuleExport(node: ts.Node): node is ts.ExpressionStatement & { expression: ts.BinaryExpression } {
     if (!ts.isExpressionStatement(node)) {
@@ -184,11 +183,11 @@ export function createSolver(substitute?: (node: ts.Node) => any) {
         const m = (level: LogLevel) => (...args: any[]) => logEvent(level, args)
 
         const logMethods = {
-            log: m('info'),
-            warn: m('warn'),
-            error: m('error'),
-            debug: m('debug'),
-            trace: m('trace'),
+            log: m(LogLevel.Info),
+            warn: m(LogLevel.Warn),
+            error: m(LogLevel.Error),
+            debug: m(LogLevel.Debug),
+            trace: m(LogLevel.Trace),
         }
 
         return wrapWithProxy(console, logMethods)
@@ -267,10 +266,6 @@ const permissions = Symbol.for('synapse.permissions')
 const unproxyParent = Symbol.for('unproxyParent')
 const expressionSym = Symbol.for('expression')
 
-function isProxy(o: any, checkPrototype = false) {
-    return !!o && ((checkPrototype && unproxy in o) || !!Reflect.getOwnPropertyDescriptor(o, moveable2))
-}
-
 function createCachedSubstitute(getCacheKey: (template: any, args: any[], thisArg?: any) => string) {
     const cachedEvals = new Map<string, any>()
 
@@ -310,7 +305,7 @@ function createCachedSubstitute(getCacheKey: (template: any, args: any[], thisAr
     }
 }
 
-function getModel(o: any): PermissionsBinding | undefined {
+function getModel(o: any): SymEvalBinding | undefined {
     if (!o) return
 
     if (Object.prototype.hasOwnProperty.call(o, permissions)) {
@@ -322,7 +317,8 @@ function getModel(o: any): PermissionsBinding | undefined {
 }
 
 export function createCapturedSolver(
-    getSourceFile: (fileName: string) => ts.SourceFile
+    getSourceFile: (fileName: string) => ts.SourceFile,
+    getTerraform: () => typeof import('./runtime/modules/terraform')
 ) {
     const resolveCache = new Map<any, any>()
 
@@ -382,13 +378,13 @@ export function createCapturedSolver(
     function evaluate(target: any, globals?: { console?: any }, args: any[] = [], thisArg?: any) {
         clearCache()
 
-        function createFunction(model: FunctionPermissionsBinding['call'], t: any) {
+        function createFunction(model: FunctionSymEvalBinding['call'], t: any) {
             return function (this: any, ...args: any[]) {
                 return substitute(model, args, t)
             }
         }
 
-        function createInstance(model: ObjectPermissionsBinding['methods'] | ClassPermissionsBinding['methods'], t: any) {
+        function createInstance(model: ObjectSymEvalBinding['methods'] | ClassSymEvalBinding['methods'], t: any) {
             const proto = {} as Record<string, any>
             for (const [k, v] of Object.entries(model)) {
                 proto[k] = function (this: any, ...args: any[]) {
@@ -422,7 +418,7 @@ export function createCapturedSolver(
             return Object.assign(resolveObject(t), res)
         }
 
-        function createStubFromModel(model: PermissionsBinding, obj: any) {
+        function createStubFromModel(model: SymEvalBinding, obj: any) {
             if (model.type === 'class') {
                 return function (this: any, ...args: any[]) { 
                     if (model.$constructor) {
@@ -499,6 +495,8 @@ export function createCapturedSolver(
                 }    
             }
         }
+
+        const { isOriginalProxy, isGeneratedClassConstructor, isRegExp } = getTerraform()
 
         function resolve(o: any): any {
             if ((typeof o !== 'object' && typeof o !== 'function') || !o) {
@@ -687,7 +685,8 @@ export function createCapturedSolver(
 
         try {
             const fn = resolve(target)
-            call(fn, args, thisArg)
+
+            return call(fn, args, thisArg)
         } catch (e) {
             const location = getLocation(target)
             if (location) {
@@ -696,8 +695,6 @@ export function createCapturedSolver(
 
             throw new Error(`Failed to solve permissions for target: ${require('node:util').inspect(target)}`, { cause: e })
         }
-
-        return [] // XXX: legacy return value
     }
 
     return { evaluate }
@@ -705,9 +702,10 @@ export function createCapturedSolver(
 
 function call(fn: any, args: any[], thisArg?: any) {
     if (isUnknown(fn)) {
-        return
+        return fn
     }
 
+    // TODO: return a union, need to expose an API for working with unions
     if (isUnion(fn)) {
         for (const f of fn) {
             call(f, args, thisArg)
@@ -716,30 +714,26 @@ function call(fn: any, args: any[], thisArg?: any) {
         return
     }
 
-    fn.call(thisArg, ...args)
+    return fn.call(thisArg, ...args)
 }
 
 // STUB
 type Model = any
 
-// TODO: come up with better name
-// The logic is being used for permissions but is perfectly usuable for any kind of binding
-
-
-interface ObjectPermissionsBinding {
+interface ObjectSymEvalBinding {
     type: 'object'
     methods: Record<string, Model>
 }
 
-interface ClassPermissionsBinding {
+interface ClassSymEvalBinding {
     type: 'class'
     methods: Record<string, Model>
     $constructor?: Model
 }
 
-interface FunctionPermissionsBinding {
+interface FunctionSymEvalBinding {
     type: 'function'
     call: Model
 }
 
-type PermissionsBinding = ObjectPermissionsBinding | ClassPermissionsBinding | FunctionPermissionsBinding
+type SymEvalBinding = ObjectSymEvalBinding | ClassSymEvalBinding | FunctionSymEvalBinding

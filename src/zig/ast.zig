@@ -1,3 +1,4 @@
+// @wasm
 const std = @import("std");
 const zig = std.zig;
 const mem = @import("./lib/mem.zig");
@@ -69,7 +70,7 @@ pub const FieldAccess = struct {
 };
 
 pub const ErrorUnion = struct {
-    lhs: ?*Node,
+    lhs: ?*Node = null,
     rhs: *Node,
 };
 
@@ -337,13 +338,27 @@ const NodeConverter = struct {
 
         const n: zig.Ast.Node = self.tree.nodes.get(index);
 
+        const maybe_error_union = self.tree.firstToken(proto.ast.return_type) - 1;
+
+        const rt: ?*Node = blk: {
+            const maybe_rt = try self.convertNode(proto.ast.return_type) orelse break :blk null;
+            if (self.tree.tokens.items(.tag)[maybe_error_union] != .bang) {
+                break :blk maybe_rt;
+            }
+
+            const p = try self.gpa.create(Node);
+            p.* = .{ .error_union = .{ .rhs = maybe_rt } };
+
+            break :blk p;
+        };
+
         return .{
             .name = if (proto.name_token) |t| self.tree.tokenSlice(t) else null,
             .lib_name = null,
             .body = if (n.tag == .fn_decl and n.data.rhs != 0) try self.convertNode(n.data.rhs) else null,
             .visibility = if (proto.visib_token) |t| self.tree.tokenSlice(t) else null,
             .qualifier = if (proto.extern_export_inline_token) |t| self.tree.tokenSlice(t) else null,
-            .return_type = try self.convertNode(proto.ast.return_type),
+            .return_type = rt,
             .params = params.items,
         };
     }

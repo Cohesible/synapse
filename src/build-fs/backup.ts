@@ -2,7 +2,7 @@ import * as path from 'node:path'
 import { DataRepository, getDataRepository, readJsonRaw, Head } from '../artifacts'
 import { getFs, runWithContext, throwIfCancelled } from '../execution'
 import { createBlock } from './block'
-import { collectStats, mergeRepoStats } from './stats'
+import { collectAllStats, mergeRepoStats } from './stats'
 
 export async function createIndexBackup(dest: string) {
     const repo = getDataRepository(getFs())
@@ -24,7 +24,7 @@ export async function createIndexBackup(dest: string) {
         }
     }
 
-    const stats = await collectStats(repo)
+    const stats = await collectAllStats(repo)
     const merged = mergeRepoStats(stats)
 
     const allObjects = new Set([

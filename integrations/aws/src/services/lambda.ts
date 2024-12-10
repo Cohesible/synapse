@@ -2,6 +2,7 @@ import * as assert from 'node:assert'
 import * as path from 'node:path'
 import * as core from 'synapse:core'
 import * as lib from 'synapse:lib'
+import * as crypto from 'node:crypto'
 import * as Lambda from '@aws-sdk/client-lambda'
 import * as aws from 'synapse-provider:aws'
 import * as net from 'synapse:srl/net'
@@ -19,7 +20,7 @@ interface LambdaOptions {
     timeout?: number
     name?: string
     createImage?: boolean
-    arch?: 'aarch64' | 'amd64'
+    arch?: 'aarch64' | 'x64'
     baseImage?: string
     imageCommands?: string[]
     /** Used for bundling */
@@ -39,10 +40,16 @@ export class LambdaFunction<T extends any[] = any[], U = unknown> implements com
     public readonly principal: Role
 
     public constructor(target: (...args: T) => Promise<U> | U, opt?: LambdaOptions) {
+        const arch = opt?.arch ?? 'aarch64'
         const entryPoint = new lib.Bundle(wrap(target), {
             // Bundling the SDK clients results in much better cold-start performance
             external: opt?.external,
             moduleTarget: !opt?.createImage ? 'esm' : undefined,
+            includeAssets: true,
+
+            // Only relevant for native code
+            os: 'linux',
+            arch,
         })
 
         const handler = `handler.default` // XXX: this name is hard-coded in `src/server.ts`
@@ -69,6 +76,8 @@ export class LambdaFunction<T extends any[] = any[], U = unknown> implements com
             size: opt?.ephemeralStorage,
         } : undefined
 
+        const architectures = arch === 'aarch64' ? ['arm64'] : arch === 'x64' ? ['x86_64'] : undefined
+
         if (opt?.createImage) {
             const { repo, deployment } = createImage(handler, entryPoint, opt.imageCommands, opt.baseImage, opt.name)
             const imageUri = `${repo.repositoryUrl}:${deployment.tagName}`
@@ -77,7 +86,7 @@ export class LambdaFunction<T extends any[] = any[], U = unknown> implements com
                 timeout: opt?.timeout ?? 900,
                 memorySize: opt?.memory ?? 1024,
                 packageType: 'Image',
-                architectures: opt.arch === 'aarch64' ? ['arm64'] : undefined,
+                architectures,
                 role: role.resource.arn,
                 environment: {
                     variables: {
@@ -113,6 +122,7 @@ export class LambdaFunction<T extends any[] = any[], U = unknown> implements com
                 s3Bucket: obj.bucket,
                 s3Key: obj.key,
                 handler,
+                architectures,
                 timeout: opt?.timeout ?? 900,
                 memorySize: opt?.memory ?? 1024,
                 packageType: 'Zip',
@@ -171,7 +181,7 @@ export class LambdaFunction<T extends any[] = any[], U = unknown> implements com
         }
 
         const respObj = JSON.parse(resultString)
-        if (typeof respObj === 'object' && !!respObj && 'val' in respObj) {
+        if (isSynapseResponse(respObj)) {
             return deserialize(respObj.val, respObj.type)
         }
 
@@ -230,23 +240,32 @@ export interface LambdaContext {
 const TypedArray = Object.getPrototypeOf(Uint8Array)
 
 interface SynapseEvent {
-    readonly isSynapseEvent: true
+    readonly __synapse: true
     readonly args: any[]
     readonly types?: any[]
 }
 
 function isSynapseEvent(ev: any): ev is SynapseEvent {
-    return typeof ev === 'object' && !!ev && ev.isSynapseEvent
+    return typeof ev === 'object' && !!ev && ev.__synapse
 }
 
 interface SynapseResponse {
+    readonly __synapse: true
     readonly val: any
     readonly type?: any
+}
+
+function isSynapseResponse(ev: any): ev is SynapseResponse {
+    return typeof ev === 'object' && !!ev && ev.__synapse
 }
 
 function serialize(val: any): [v: any, type: any] | undefined {
     if (val instanceof TypedArray) {
         return [Buffer.from(val).toString('base64'), val.constructor.name]
+    }
+
+    if (typeof val === 'undefined') {
+        return [undefined, 'undefined']
     }
 }
 
@@ -256,6 +275,9 @@ function deserialize(val: any, type?: any): any {
         case 'Buffer':
         case 'Uint8Array':
             return Buffer.from(val, 'base64')
+
+        case 'undefined':
+            return undefined
 
         // TODO: everything else
         // It'll be easier to focus on refining a single serdes library
@@ -285,7 +307,7 @@ function toEvent(args: any[]): SynapseEvent {
     }
 
     return {
-        isSynapseEvent: true,
+        __synapse: true,
         types,
         args: args2,
     }
@@ -326,10 +348,10 @@ function wrap<T, U extends any[]>(fn: (...args: U) => T): LambdaHandler {
             const resp = await withContext(ctx, fromEvent(event))
             const serialized = serialize(resp)
             if (serialized) {
-                return { val: serialized[0], type: serialized[1] } satisfies SynapseResponse
+                return { val: serialized[0], type: serialized[1], __synapse: true } satisfies SynapseResponse
             }
 
-            return { val: resp } satisfies SynapseResponse
+            return { val: resp, __synapse: true } satisfies SynapseResponse
         } catch (err) {
             if (typeof err === 'object') {
                 console.error({
@@ -379,7 +401,7 @@ function createImage(handler: string, entrypoint: lib.Bundle, extraCommands?: st
     const dockerfile = new GeneratedDockerfile(entrypoint, { 
         baseImage: baseImage ?? '--platform=linux/amd64 public.ecr.aws/lambda/nodejs:18', // This base image already has `@aws-sdk`
         entrypoint: handler,
-        workingDirectory: '$${LAMBDA_TASK_ROOT}', // Need to escape ${}
+        workingDirectory: '${LAMBDA_TASK_ROOT}',
         postCopyCommands: extraCommands,
     })
 
@@ -420,6 +442,7 @@ core.registerLogProvider(
         return events.map(ev => {
             const msg = ev.message!
             // TODO: parse out JSON from the message
+            // TODO: I think this swallows init failures??
             const sourceType = !!msg.match(/^[A-Z]/) ? 'system' : 'user'
             if (sourceType === 'user') {
                 const columns = msg.split('\t')

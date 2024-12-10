@@ -30,7 +30,7 @@ import { cleanDir, fastCopyDir, removeDir } from '../zig/fs-ext'
 import { colorize, printLine } from '../cli/ui'
 import { OptimizedPackageManifest, PackageManifest, PublishedPackageJson, createManifestRepo, createMultiRegistryClient, createNpmRegistryClient } from './manifests'
 import { createGitHubPackageRepo, downloadGitHubPackage, githubPrefix } from './repos/github'
-import { createSynapsePackageRepo, downloadSynapsePackage, downloadSynapsePackageTarball, getPipelineDeps, sprPrefix } from './repos/spr'
+import { createSynapsePackageRepo, downloadSynapsePackage, getPipelineDeps, sprPrefix } from './repos/spr'
 import { getTsPathMappings } from '../compiler/entrypoints'
 import { getOutputFilename, getResolvedTsConfig } from '../compiler/config'
 import { execCommand } from '../utils/process'
@@ -461,8 +461,6 @@ async function extractPackage(tarball: Buffer, dest: string, requirePkgJson = tr
         }
     }))
 }
-
-type ImportMap2 = ImportMap<SourceInfo>
 
 const getNpmPackageRepo = memoize(() => {
     return createNpmPackageRepo()
@@ -1313,6 +1311,10 @@ function rebuildTree(data: ReturnType<typeof flattenImportMap>): RebuiltRootTree
                     return `file:${data.name}`
                 case 'spr':
                     return `${sprPrefix}${data.name}`
+                case 'github':
+                    return `${githubPrefix}${data.name}`
+                case 'synapse-tool':
+                    return `${toolPrefix}${data.name}`
                 case 'synapse-provider':
                     return `${providerPrefix}${data.name}`
             }
@@ -1875,24 +1877,29 @@ function getNameAndScheme(name: string) {
     }
 }
 
-export async function getSynapseTarballs(deps: string[]) {
+export async function downloadSynapsePackages(dest: string, deps: string[]) {
     const fs = getFs()
     const repo = createSprRepoWrapper(fs, getBuildTargetOrThrow().projectId, getWorkingDir())
-    const specs = Object.fromEntries(deps.map(d => [d, `spr:#${d}`]))
+    const specs = Object.fromEntries(deps.map(d => [d, `${sprPrefix}#${d}`]))
     const result = await resolveDepsGreedy(specs, repo)
     const manifest = await toPackageManifestFromTree(repo, result)
 
-    const promises: Promise<[k: string, v: Buffer]>[] = []
+    const promises: Promise<unknown>[] = []
     for (const [k, v] of Object.entries(manifest.roots)) {
+        if (!deps.includes(k)) continue
+
         const info = manifest.packages[v.package]
         if (info.type !== 'spr') {
             throw new Error(`"${k}" is not a Synapse package: ${info.type}`)
         }
 
-        promises.push(downloadSynapsePackageTarball(info).then(b => [k, b]))
+        const pkgDir = path.resolve(dest, k)
+        getLogger().log(`Downloading specifier "${k}" [integrity: ${info.resolved?.integrity}] to ${pkgDir}`)
+
+        promises.push(downloadSynapsePackage(info, pkgDir))
     }
 
-    return Object.fromEntries(await Promise.all(promises))
+    await Promise.all(promises)
 }
 
 export async function installModules(dir: string, deps: Record<string, string>, target?: Partial<QualifiedBuildTarget>) {
@@ -1906,6 +1913,7 @@ export async function installModules(dir: string, deps: Record<string, string>, 
 
     const res = await writeToNodeModules(fs, mapping, dir, undefined, { mode: 'all', hoist: false })
     await repo.close()
+    getNpmPackageRepo.clear()
 
     return { res, mapping }
 }
@@ -1957,7 +1965,7 @@ const postinstallAllowlist = new Set(['puppeteer'])
 
 export async function writeToNodeModules(
     fs: Fs, 
-    mapping: ImportMap2, 
+    mapping: ImportMap, 
     installDir: string,
     oldPackages?: Record<string, NpmPackageInfo>,
     opt: WriteToNodeModulesOptions = {},
@@ -2011,10 +2019,10 @@ export async function writeToNodeModules(
         await Promise.all(p)
     }
 
-    function visit2(m: ImportMap2, dir: string) {
+    function visit2(m: ImportMap, dir: string) {
         const nodeModules = path.resolve(dir, 'node_modules')
 
-        async function visitInner(k: string, v: ImportMap2[string]) {
+        async function visitInner(k: string, v: ImportMap[string]) {
             if (v.source?.type === 'artifact') {
                 return
             }
@@ -2061,10 +2069,10 @@ export async function writeToNodeModules(
     if (await getFs().fileExists(path.resolve(installDir, 'node_modules'))) {
         await visit2(hoisted, installDir)
     } else {
-        function visit2(m: ImportMap2, dir: string) {
+        function visit2(m: ImportMap, dir: string) {
             const nodeModules = path.resolve(dir, 'node_modules')
     
-            function visitInner(k: string, v: ImportMap2[string]) {
+            function visitInner(k: string, v: ImportMap[string]) {
                 if (v.source?.type === 'artifact') {
                     return
                 }
@@ -2744,7 +2752,7 @@ export async function downloadAndInstall(
 
 async function createSummary(
     deps: Record<string, string>,
-    mapping: ImportMap2,
+    mapping: ImportMap,
     writeResult: Awaited<ReturnType<typeof writeToNodeModules>>,
     oldMapping?: ReturnType<typeof flattenImportMap>,
     repo: PackageRepository = getNpmPackageRepo()
@@ -2819,6 +2827,10 @@ export async function getLatestVersion(pkgName: string) {
     const resolved = await repo.resolvePattern(pkgName, 'latest')
 
     return resolved.version
+}
+
+export async function closeNpmRepo() {
+    await getNpmPackageRepo().close()
 }
 
 // TODO: lifecycle hooks
@@ -3610,12 +3622,12 @@ export function createPackageInstaller(params?: PackageInstallerParams) {
         return maps
     }
 
-    async function createImportMap(manifest: TerraformPackageManifest, maps?: Record<number, FlatImportMap>): Promise<ImportMap2> {
+    async function createImportMap(manifest: TerraformPackageManifest, maps?: Record<number, FlatImportMap>): Promise<ImportMap> {
         const resolved = maps ?? await resolvePackageManifest(manifest)
-        const trees = new Map<string, ImportMap2[string]>()
-        const maps2: Record<number, ImportMap2> = {}
-        function resolveTree(tree = manifest.roots, id = -1): ImportMap2 {
-            const map: ImportMap2 = maps2[id] ??= {}
+        const trees = new Map<string, ImportMap[string]>()
+        const maps2: Record<number, ImportMap> = {}
+        function resolveTree(tree = manifest.roots, id = -1): ImportMap {
+            const map: ImportMap = maps2[id] ??= {}
             const m = resolved[id]
             for (const [k, v] of Object.entries(tree)) {
                 const o = m[k]
@@ -3637,7 +3649,7 @@ export function createPackageInstaller(params?: PackageInstallerParams) {
 
                     const deps = manifest.dependencies[pkgId]
                     if (deps) {
-                        (map[k] as Mutable<ImportMap2[string]>).mapping = resolveTree(deps, o.mapping)
+                        (map[k] as Mutable<ImportMap[string]>).mapping = resolveTree(deps, o.mapping)
                     }
                 }
             }
@@ -3647,7 +3659,7 @@ export function createPackageInstaller(params?: PackageInstallerParams) {
     }
 
     const hasher = createHasher()
-    const importMaps = new Map<string, Promise<ImportMap2>>()
+    const importMaps = new Map<string, Promise<ImportMap>>()
     const getCachedMap = keyedMemoize(async (fileName: string) => JSON.parse(await fs.readFile(fileName, 'utf-8')))
 
     function getImportMap(deps: TerraformPackageManifest) {
@@ -3662,7 +3674,7 @@ export function createPackageInstaller(params?: PackageInstallerParams) {
 
         return result
 
-        async function worker(): Promise<ImportMap2> {
+        async function worker(): Promise<ImportMap> {
             try {
                 const data = await getCachedMap(dest)
 
@@ -3728,7 +3740,7 @@ export function createPackageInstaller(params?: PackageInstallerParams) {
         }
     }
 
-    async function getPublishedMappings(name: string, pointer: string): Promise<[string, ImportMap2[string]] | undefined> {
+    async function getPublishedMappings(name: string, pointer: string): Promise<[string, ImportMap[string]] | undefined> {
         const { hash, storeHash } = getPointerComponents(pointer)
         if (!storeHash) {
             getLogger().warn(`Ignoring old published file: ${name}`)            
@@ -3743,7 +3755,7 @@ export function createPackageInstaller(params?: PackageInstallerParams) {
         }]
     }
     
-    async function getPublishedMappings2(name: string, pointer: string): Promise<[string, ImportMap2[string]] | undefined> {
+    async function getPublishedMappings2(name: string, pointer: string): Promise<[string, ImportMap[string]] | undefined> {
         const { hash, storeHash } = getPointerComponents(pointer)
         if (!storeHash) {
             getLogger().warn(`Ignoring old published file: ${name}`)            
@@ -3758,7 +3770,7 @@ export function createPackageInstaller(params?: PackageInstallerParams) {
         return Object.entries(m)[0]
     }
 
-    async function getPointerEntry(hash: string, storeHash: string): Promise<ImportMap<SourceInfo>[string]> {
+    async function getPointerEntry(hash: string, storeHash: string): Promise<ImportMap[string]> {
         return {
             source: { type: 'artifact', data: { hash, metadataHash: storeHash } },
             location: `${pointerPrefix}${storeHash}:${hash}`,
@@ -3767,7 +3779,7 @@ export function createPackageInstaller(params?: PackageInstallerParams) {
         }
     }
 
-    const pointerMappings = new Map<string, ImportMap<SourceInfo> | undefined | Promise<ImportMap<SourceInfo> | undefined>>()
+    const pointerMappings = new Map<string, ImportMap | undefined | Promise<ImportMap | undefined>>()
     function getPointerMappings(hash: string, storeHash: string) {
         const cacheKey = `${storeHash}:${hash}`
         if (pointerMappings.has(cacheKey)) {
@@ -3789,10 +3801,10 @@ export function createPackageInstaller(params?: PackageInstallerParams) {
             return
         }
 
-        const mapping: ImportMap2 = {}
+        const mapping: ImportMap = {}
         pointerMappings.set(cacheKey, mapping)
 
-        const deps: Promise<[k: string, v: ImportMap<SourceInfo>[string]]>[] = []
+        const deps: Promise<[k: string, v: ImportMap[string]]>[] = []
         if (m.dependencies) {
             for (const [k, v] of Object.entries(m.dependencies)) {
                 for (const k2 of v) {
@@ -3829,24 +3841,30 @@ export function createPackageInstaller(params?: PackageInstallerParams) {
         return mapping
     }
 
-    const hashedPointers = new Map<string, string>()
-    function getHashWithDeps(target: string) {
-        if (hashedPointers.has(target)) {
-            return hashedPointers.get(target)!
-        }
-
+    // It's a bit complex because some metadata is relevant for caching and some isn't.
+    // This "composite" hash describes the relevant data using which does not always exist. 
+    // The nature of these hashes means that we can cache the result using the pair of 
+    // `storeHash` and `hash` as a key in `hashes`. An empty string in the cache means 
+    // the derived hash is equivalent to the data hash.
+    async function getHashWithDeps(target: string, hashes: Record<string, string>, shouldCache = true): Promise<string> {
         const pointer = coerceToPointer(target)
         const { storeHash, hash } = pointer.resolve()
         if (isNullHash(storeHash)) {
-            hashedPointers.set(target, hash)
             return hash
         }
 
         const key = `${storeHash}:${hash}`
+        if (shouldCache && hashes[key] !== undefined) {
+            return hashes[key] || hash
+        }
+
         const ambient = repo.getMetadata(hash, storeHash).ambientDependencies
-        const mappings = pointerMappings.get(key)
+        const mappings = await getPointerMappings(hash, storeHash)
         if (!mappings && !ambient) {
-            hashedPointers.set(target, hash)
+            if (shouldCache) {
+                hashes[key] = ''
+            }
+
             return hash
         }
 
@@ -3858,9 +3876,13 @@ export function createPackageInstaller(params?: PackageInstallerParams) {
                         deps[k] = v.source.data.packageHash
                     }
                 } else {
-                    deps[k] = getHashWithDeps(v.location)
+                    // We don't bother caching transitive deps because if the test
+                    // changes, we're probably going to execute the test again anyway.
+                    // This means loading all pointers, removing much of the cost
+                    // for calculating the hash.
+                    deps[k] = await getHashWithDeps(v.location, hashes, false)
                 }
-            }    
+            }
         }
 
         if (ambient && getGlobalsHash) {
@@ -3871,14 +3893,13 @@ export function createPackageInstaller(params?: PackageInstallerParams) {
                 }
             }
         }
-
-        // TODO: we need to add something to certain objects (e.g. API route refs)
-        // in order to track indirect dependencies
     
         const sorted = sortRecord(deps)
         const hashed = getHash(JSON.stringify(sorted) + hash)
-        hashedPointers.set(target, hashed)
-    
+        if (shouldCache) {
+            hashes[key] = hashed
+        }
+
         return hashed
     }    
 
@@ -3901,6 +3922,7 @@ async function loadSynapsePackage(repo: DataRepository, pkgDir: string, snapshot
     const published: Record<string, string> = {}
     const runtimeModules: Snapshot['moduleManifest'] = {}
     const pointers: Record<string, Record<string, string>> = {}
+    const modules: Record<string, string> = {}
 
     if (snapshot.targets) {
         for (const [k2, v2] of Object.entries(snapshot.targets)) {
@@ -3935,6 +3957,12 @@ async function loadSynapsePackage(repo: DataRepository, pkgDir: string, snapshot
         }
     }
 
+    if (snapshot.modules) {
+        for (const [k, v] of Object.entries(snapshot.modules)) {
+            modules[path.resolve(pkgDir, k)] = v
+        }
+    }
+
     // We apply the mount _relative_ to the target directory
     const store = snapshot.store ?? (await repo.getBuildFs(snapshot.storeHash))
     const spec = v.specifier ?? v.name
@@ -3944,6 +3972,7 @@ async function loadSynapsePackage(repo: DataRepository, pkgDir: string, snapshot
         store,
         targets,
         pointers,
+        modules,
         published,
         runtimeModules,
     }
@@ -4142,7 +4171,7 @@ export async function createPackageService(moduleResolver: ModuleResolver, repo 
 
         const rootDir = tsConfig.options.rootDir || workingDirectory
 
-        const importMap: ImportMap2 = {}
+        const importMap: ImportMap = {}
         for (const [k, v] of Object.entries(mappings)) {
             importMap[k] = {
                 locationType: 'module',
@@ -4198,6 +4227,7 @@ export async function createPackageService(moduleResolver: ModuleResolver, repo 
         const packages = runTask('get', 'packages (index)', () => getPackages(installation), 1)
         const stores: Record<string, ReadonlyBuildFs> = {}
         const pointers: Record<string, Record<string, string>> = {}
+        const sourceMapping: Record<string, { module: string }> = {}
 
         const deferredTargets: DeferredTargets[] = []
 
@@ -4264,7 +4294,7 @@ export async function createPackageService(moduleResolver: ModuleResolver, repo 
                 // We need to bind the original pointer mappings to any exported objects
                 if (mappings) {
                     const sourcePointers = pointers[k.replace(/.js$/, '.infra.js')]
-                    function bindMappings(mappings: ImportMap2) {
+                    function bindMappings(mappings: ImportMap) {
                         for (const [k, v] of Object.entries(mappings)) {
                             const source = v.source
                             if (source?.type === 'artifact' && sourcePointers) {
@@ -4288,6 +4318,11 @@ export async function createPackageService(moduleResolver: ModuleResolver, repo 
                 } else {
                     runtimeModules[k] = v as any
                 }
+            }
+
+            // Only used for synthesis
+            for (const [k, v] of Object.entries(res.modules)) {
+                sourceMapping[k] = { module: v }
             }
 
             deferredTargets.push({
@@ -4320,7 +4355,7 @@ export async function createPackageService(moduleResolver: ModuleResolver, repo 
 
         const runtimeMappings = Object.fromEntries(Object.entries(runtimeModules).map(([k, v]) => [k, path.resolve(workingDirectory, v.path)]))
 
-        return { stores, packages, infraFiles, pkgResolver, pointers, runtimeMappings, deferredTargets, importMap: installation.importMap }
+        return { stores, packages, infraFiles, pkgResolver, pointers, runtimeMappings, deferredTargets, importMap: installation.importMap, sourceMapping }
     }
 
     async function registerPointerDependencies(pointer: string, name?: string) {

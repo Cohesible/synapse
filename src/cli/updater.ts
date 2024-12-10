@@ -16,8 +16,8 @@ import { rename } from '../system'
 // 2. No auto-updates by default
 //      * The CLI for `fly.io` has auto-updates and I've found it to be annoying as an occasional user
 
-export async function checkForUpdates(opt?: { force?: boolean }) {
-    const latestRelease = await github.getRelease('Cohesible', 'synapse')
+export async function checkForUpdates(opt?: { force?: boolean; tag?: string }) {
+    const latestRelease = await github.getRelease('Cohesible', 'synapse', opt?.tag)
     const latest = latestRelease.tag_name.slice(1)
     const current = getCurrentVersion().semver
     if (compareVersions(latest, current) <= 0 && !opt?.force) {
@@ -38,7 +38,7 @@ export async function checkForUpdates(opt?: { force?: boolean }) {
     }
 }
 
-export async function tryUpgrade(opt?: { force?: boolean }) {
+export async function tryUpgrade(opt?: { force?: boolean; tag?: string }) {
     const updateInfo = await checkForUpdates(opt)
     if (!updateInfo) {
         return printLine(colorize('green', 'Already on the latest version'))

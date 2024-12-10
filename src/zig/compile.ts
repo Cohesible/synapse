@@ -8,12 +8,13 @@ import { getFs } from '../execution'
 import { ensureDir, getHash, keyedMemoize, makeRelative, memoize, sortRecord, throwIfNotFileNotFoundError } from '../utils'
 import { ResolvedProgramConfig, getOutputFilename } from '../compiler/config'
 import { getProgramFs, NativeModule } from '../artifacts'
-import { ExportedFn, generateTsZigBindings, getImportedModulesFromFile } from './ast'
+import { AstRoot, ExportedFn, generateTsZigBindings, getExportedFunctions, getImportedModulesFromFile, hasModuleRegistration, renderNode } from './ast'
 import { getFileHasher } from '../compiler/incremental'
 import { getJsLibPath, getZigPath, registerZigProvider } from './installer'
 import { getZigImports } from '../compiler/entrypoints'
 import { toAbsolute } from '../build-fs/pointers'
 import { extractFileFromZip, listFilesInZip } from '../utils/tar'
+import { getCurrentPkg } from '../pm/packageJson'
 
 // FIXME: ReferenceError: Cannot access 'synDirName' before initialization
 const getZigCacheDir = () => path.resolve(getGlobalCacheDirectory(), 'zig')
@@ -76,13 +77,14 @@ module.exports.main = function main(...args) {
 }
 
 interface CompileCache {
-    files: Record<string, { hash: string; deps?: string[] }>
+    files: Record<string, { hash: string; deps?: string[]; isJsImported?: boolean; needsRegistration?: boolean }>
 }
 
 const cacheName = `[#compile-zig]__zig-cache__.json`
 
-async function getCache(): Promise<CompileCache> {
-    return getProgramFs().readJson(cacheName).catch(e => {
+let compileCache: Promise<CompileCache>|  CompileCache | undefined
+function getCache(): Promise<CompileCache> | CompileCache {
+    return compileCache ??= getProgramFs().readJson(cacheName).catch(e => {
         throwIfNotFileNotFoundError(e)
 
         return { files: {} }
@@ -90,6 +92,7 @@ async function getCache(): Promise<CompileCache> {
 }
 
 async function setCache(data: CompileCache): Promise<void> {
+    compileCache = data
     await getProgramFs().writeJson(cacheName, data)
 }
 
@@ -134,7 +137,7 @@ async function _getZigCompilationGraph(roots: string[], workingDir: string) {
 
     async function _visit(f: string) {
         const absPath = path.resolve(workingDir, f)
-        const relPath = path.relative(workingDir, absPath)
+        const relPath = makeRelative(workingDir, absPath)
 
         const hash = await hasher.getHash(absPath)
         if (cache.files[relPath]?.hash === hash) {
@@ -148,7 +151,7 @@ async function _getZigCompilationGraph(roots: string[], workingDir: string) {
             return didChange
         }
 
-        const deps = await getImportedModulesFromFile(absPath)
+        const { ast, deps } = await getImportedModulesFromFile(absPath)
         for (const d of deps) {
             await visit(d)
         }
@@ -159,14 +162,27 @@ async function _getZigCompilationGraph(roots: string[], workingDir: string) {
             cache.files[relPath].hash = hash
         }
 
-        cache.files[relPath].deps = deps.size > 0 ? [...deps] : undefined
+        cache.files[relPath].deps = deps.size > 0 
+            ? [...deps].map(d => makeRelative(workingDir, d)) 
+            : undefined
+
+        cache.files[relPath].isJsImported = zigFiles.has(f) ? true : undefined
+
+        if (cache.files[relPath].isJsImported && getExportedFunctions(ast).filter(x => x.isModuleExport).length > 0 && !hasModuleRegistration(ast)) {
+            cache.files[relPath].needsRegistration = true
+        } else {
+            cache.files[relPath].needsRegistration = undefined
+        }
+
+        asts.set(absPath, ast)
 
         return true
     }
 
     const visit = keyedMemoize(_visit)
-
     const changed = new Set<string>()
+    const asts = new Map<string, AstRoot>()
+
     for (const f of zigFiles) {
         if (await visit(f)) {
             changed.add(f)
@@ -178,6 +194,8 @@ async function _getZigCompilationGraph(roots: string[], workingDir: string) {
     }
 
     return {
+        asts,
+        files: cache.files,
         changed,
         zigImportingFiles,
     }
@@ -361,7 +379,7 @@ export function ${b.name}(${b.params.map(mapParamName).join(', ')}) {
 
 registerZigProvider()
 
-async function runZig(file: string, outfile: string, args: string[]) {
+async function runZig(sourcefile: string, outfile: string, args: string[]) {
     args.push(`-femit-bin=${outfile}`)
     args.push('--global-cache-dir', getZigCacheDir())
 
@@ -378,7 +396,7 @@ async function runZig(file: string, outfile: string, args: string[]) {
 
         const errors: string[] = (e as any).stderr.split('\n')
         const msg = [
-            `Failed to compile "${file}"`,
+            `Failed to compile "${sourcefile}"`,
             ...errors.map(e => `  ${e}`)
         ].join('\n')
         throw new Error(msg)
@@ -461,7 +479,15 @@ function toZigTarget(target: builder.QualifiedBuildTarget) {
     return parts.join('-')
 }
 
-const getJsLibPathCached = memoize(getJsLibPath)
+const getJsLibPathCached = memoize(async () => {
+    // XXX: use a file in the source tree when building `synapse`
+    const pkg = await getCurrentPkg()
+    if (pkg?.data.name === 'synapse') {
+        return path.resolve(pkg.directory, 'src/zig/lib/js.zig')
+    }
+
+    return getJsLibPath()
+})
 
 // TODO: compile test binaries using `--test-no-exec`
 
@@ -476,20 +502,26 @@ export async function passthroughZig(args: string[]) {
     await runCommand(zigPath, args, { stdio: 'inherit' })
 }
 
-async function getPerModuleArgs(target: 'wasm' | 'dylib' | 'exe', exported: string[], hostTarget: builder.QualifiedBuildTarget, debug?: boolean, canAddNodeLib = true) {
+async function getPerModuleArgs(
+    target: 'wasm' | 'dylib' | 'exe', 
+    exported: string[], 
+    hostTarget: builder.QualifiedBuildTarget, 
+    optimizationMode?: ZigCompileOptions['optimizationMode'], 
+    canAddNodeLib = true
+) {
     const args: string[] = []
     if (target === 'wasm') {
         args.push('-target', 'wasm32-freestanding-musl')
-        if (!debug) {
-            args.push('-O', 'ReleaseFast')
+        if (optimizationMode) {
+            args.push('-O', optimizationMode)
         }
         args.push('-fno-entry', ...exported)
     }
 
     if (target === 'dylib') {
         args.push('-dynamic', '-fallow-shlib-undefined')
-        if (!debug) {
-            args.push('-O', 'ReleaseFast')
+        if (optimizationMode) {
+            args.push('-O', optimizationMode)
         }
 
         args.push('-target', toZigTarget(hostTarget))
@@ -509,15 +541,120 @@ async function getPerModuleArgs(target: 'wasm' | 'dylib' | 'exe', exported: stri
     return args
 }
 
+function getFastFnName(name: string) {
+    const isQuoted = name.startsWith('@"') && name.endsWith('"')
+    const rawName = isQuoted ? name.slice(2, -1) : name
+
+    return isQuoted ? `@"${rawName}__fast"` : `${rawName}__fast`
+}
+
+function isFastFnName(name: string) {
+    const isQuoted = name.startsWith('@"') && name.endsWith('"')
+    const rawName = isQuoted ? name.slice(2, -1) : name
+
+    return rawName.endsWith('__fast')
+}
+
+function createFastFnDecl(fn: ExportedFn) {
+    const params = fn.params.map(p => `${p.name}: ${renderNode(p.typeNode)}`)
+    const recv = `__recv: *@import("js").Receiver`
+    params.unshift(recv)
+
+    return `
+pub fn ${getFastFnName(fn.name)}(${params.join(', ')}) ${renderNode(fn.returnTypeNode)} {
+    _ = __recv;
+    return ${fn.name}(${fn.params.map(p => p.name).join(', ')});
+}
+`.trim()
+}
+
+export async function preprocessZigModules(roots: string[], workingDir = getWorkingDir()) {
+    const graph = await getZigCompilationGraph(roots, workingDir)
+    if (!graph) {
+        return
+    }
+
+    const tmpdir = getTempZigBuildDir()
+
+    async function doCopy(f: string, needsRegistration = false) {
+        const absPath = path.resolve(workingDir, f)
+        const dest = path.resolve(tmpdir, f)
+
+        if (!needsRegistration) {
+            const data = await getFs().readFile(absPath, 'utf-8')
+
+            return await getFs().writeFile(dest, data)
+        }
+
+        function getGeneratedCode() {
+            const registration = `comptime { @import("js").registerModule(@This()); }`
+            const ast = graph!.asts.get(absPath)
+            if (!ast) {
+                throw new Error(`Missing ast for file: ${f}`)
+            }
+
+            const exported = getExportedFunctions(ast)
+            const funcNames = new Set(exported.map(x => x.name))
+            const decls = exported
+                .filter(fn => !isFastFnName(fn.name) && !funcNames.has(getFastFnName(fn.name)))
+                .map(fn => createFastFnDecl(fn))
+
+            return [
+                ...decls,
+                registration,
+            ].join('\n')
+        }
+
+        const data = await getFs().readFile(absPath, 'utf-8')
+        const withCodegen = `${data}\n${getGeneratedCode()}`
+        await getFs().writeFile(dest, withCodegen)
+    }
+
+    const visited = new Set<string>()
+    const promises: Promise<void>[] = []
+
+    function visit(f: string) {
+        if (visited.has(f)) return
+        visited.add(f)
+
+        const relPath = makeRelative(workingDir, f)
+        const info = graph!.files[relPath]
+        promises.push(doCopy(relPath, info?.needsRegistration))
+
+        if (info?.deps) {
+            for (const d of info.deps) {
+                visit(path.resolve(workingDir, d))
+            }
+        }
+    }
+
+    for (const f of graph.changed) {
+        visit(f)
+    }
+
+    await Promise.all(promises)
+
+    return graph
+}
+
 interface ZigCompileOptions {
-    readonly debug?: boolean
     readonly outDir?: string
     readonly rootDir?: string
+    readonly isSea?: boolean
     readonly hostTarget?: builder.QualifiedBuildTarget
+    readonly optimizationMode?: 'Debug' | 'ReleaseSafe' | 'ReleaseFast' | 'ReleaseSmall'
 }
 
 export async function compileZigDirect(file: string, opt?: ZigCompileOptions) {    
     const bindings = await generateTsZigBindings(file)
+
+    const exportedModuleFunctions = bindings.exportedFunctions.filter(x => x.isModuleExport)
+    const isInternalModule = !!bindings.importedModules.find(x => x.specifier === './lib/js.zig') // XXX: temporary
+    const needsRegistration = exportedModuleFunctions.length > 0 && !bindings.isModule && !isInternalModule
+    if (needsRegistration) {
+        bindings.isModule = true
+    }
+
     const target: CompileTarget = bindings.isModule ? 'dylib' : 'wasm'
 
     if (bindings.exportedFunctions.length === 0 && !bindings.isModule) {
@@ -525,7 +662,7 @@ export async function compileZigDirect(file: string, opt?: ZigCompileOptions) {
     }
 
     const exported = bindings.exportedFunctions.map(fn => `--export=${fn.name}`)
-    const hasJsModule = bindings.importedModules.find(m => m.specifier === 'js')
+    const hasJsModule = bindings.importedModules.find(m => m.specifier === 'js') || needsRegistration
     const jsLibPath = hasJsModule ? await getJsLibPathCached() : undefined
     const shouldUseJsLib = !!jsLibPath
 
@@ -556,7 +693,8 @@ export async function compileZigDirect(file: string, opt?: ZigCompileOptions) {
 
     const args = [cmd]
 
-    const getArgs = (addLib?: boolean) => getPerModuleArgs(target, exported, hostTarget, opt?.debug, addLib)
+    const optMode = opt?.optimizationMode ?? (process.env.SYNAPSE_ENV?.includes('production') ? 'ReleaseFast' : undefined)
+    const getArgs = (addLib?: boolean) => getPerModuleArgs(target, exported, hostTarget, optMode, addLib)
 
     const builtinFilename = await writeSynapseBuiltin({
         features: {
@@ -566,12 +704,14 @@ export async function compileZigDirect(file: string, opt?: ZigCompileOptions) {
         }
     })
 
+    const processedFile = await maybeGetProcessedFilePath(file)
+
     if (!shouldUseJsLib) {
         args.push(file, ...await getArgs())
     } else {
         args.push(...await getArgs(false))
         args.push('--dep', 'js')
-        args.push(`-Mmain=${file}`)
+        args.push(`-Mmain=${processedFile}`)
 
         args.push(...await getArgs())
 
@@ -587,7 +727,9 @@ export async function compileZigDirect(file: string, opt?: ZigCompileOptions) {
 
     return {
         compiled,
-        stub: renderDylibStubNoSea(path.basename(outfile.relative), bindings.exportedFunctions),
+        stub: opt?.isSea
+            ? renderDylibStub(path.basename(outfile.relative), bindings.exportedFunctions)
+            : renderDylibStubNoSea(path.basename(outfile.relative), bindings.exportedFunctions),
     }
 }
 
@@ -664,8 +806,27 @@ async function writeSynapseBuiltin(params: SynapseBuiltinParams) {
     return fileName
 }
 
+async function maybeGetProcessedFilePath(file: string) {
+    const relPath = makeRelative(getWorkingDir(), file)
+    const processed = path.resolve(getTempZigBuildDir(), relPath)
+    const cache = await getCache()
+    if (cache.files[relPath]?.needsRegistration) {
+        return processed
+    }
+
+    return file
+}
+
 async function compileZig(file: string, opt: ResolvedProgramConfig, target: CompileTarget = 'wasm') {    
     const bindings = await generateTsZigBindings(file)
+
+    const exportedModuleFunctions = bindings.exportedFunctions.filter(x => x.isModuleExport)
+    const isInternalModule = !!bindings.importedModules.find(x => x.specifier === './lib/js.zig') // XXX: temporary
+    const needsRegistration = exportedModuleFunctions.length > 0 && !bindings.isModule && !isInternalModule
+    if (needsRegistration) {
+        bindings.isModule = true
+    }
+
     if (bindings.isModule) {
         target = 'dylib'
     }
@@ -676,7 +837,7 @@ async function compileZig(file: string, opt: ResolvedProgramConfig, target: Comp
     }
 
     const exported = bindings.exportedFunctions.map(fn => `--export=${fn.name}`)
-    const hasJsModule = bindings.importedModules.find(m => m.specifier === 'js')
+    const hasJsModule = bindings.importedModules.find(m => m.specifier === 'js') || needsRegistration
     const jsLibPath = hasJsModule ? await getJsLibPathCached() : undefined
     const shouldUseJsLib = !!jsLibPath
 
@@ -707,7 +868,8 @@ async function compileZig(file: string, opt: ResolvedProgramConfig, target: Comp
 
     const args = [cmd]
 
-    const getArgs = (addLib?: boolean) => getPerModuleArgs(target, exported, hostTarget, opt.csc.debug, addLib)
+    const optMode = process.env.SYNAPSE_ENV?.includes('production') ? 'ReleaseFast' : undefined
+    const getArgs = (addLib?: boolean) => getPerModuleArgs(target, exported, hostTarget, optMode, addLib)
 
     const builtinFilename = await writeSynapseBuiltin({
         features: {
@@ -717,12 +879,14 @@ async function compileZig(file: string, opt: ResolvedProgramConfig, target: Comp
         }
     })
 
+    const processedFile = await maybeGetProcessedFilePath(file)
+
     if (!shouldUseJsLib) {
-        args.push(file, ...await getArgs())
+        args.push(processedFile, ...await getArgs())
     } else {
         args.push(...await getArgs(false))
         args.push('--dep', 'js')
-        args.push(`-Mmain=${file}`)
+        args.push(`-Mmain=${processedFile}`)
 
         args.push(...await getArgs())
 

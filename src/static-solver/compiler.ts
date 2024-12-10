@@ -1,7 +1,7 @@
 import ts, { factory, isCallExpression } from 'typescript'
 import { SourceMapHost, createVariableStatement, emitChunk, extract, failOnNode, getNodeLocation, getNullTransformationContext, isNonNullable, printNodes } from './utils'
 import { isAssignmentExpression, Symbol, Scope, createGraphOmitGlobal, getContainingScope, unwrapScope, getSubscopeDfs, getReferencesInScope, getRootSymbol, RootScope, createGraph, getSubscopeContaining, getImmediatelyCapturedSymbols, getRootAndSuccessorSymbol, printSymbol } from './scopes'
-import { createObjectLiteral, createPropertyAssignment, createSymbolPropertyName, createSyntheticComment, hashNode, memoize, removeModifiers } from '../utils'
+import { createLiteral, createObjectLiteral, createPropertyAssignment, createSymbolPropertyName, createSyntheticComment, hashNode, memoize, removeModifiers } from '../utils'
 import { SourceMapV3 } from '../runtime/sourceMaps'
 import { liftScope } from './scopes'
 import { ResourceTypeChecker } from '../compiler/resourceGraph'
@@ -746,6 +746,181 @@ function getPrivateAccessExpressionSymbol(sym: Symbol): Symbol | undefined {
     return sym
 }
 
+function isConstantEnumDeclaration(sym: Symbol) {
+    if (!sym.declaration || !ts.isEnumDeclaration(sym.declaration)) {
+        return false
+    }
+
+    if (!sym.declaration.modifiers?.find(m => m.kind === ts.SyntaxKind.ConstKeyword)) {
+        return false
+    }
+
+    return true
+}
+
+function coerceNumber(value: any) {
+    if (typeof value === 'number') {
+        return value
+    }
+    if (typeof value === 'string') {
+        const parsed = Number(value)
+        if (!isNaN(parsed)) {
+            return parsed
+        }
+    }
+}
+
+function evaluateBinaryExpression(expression: ts.BinaryExpression,lookup?: (ident: string, node: ts.Node) => any) {
+    function evaluateNumber(exp: ts.Expression) {
+        const result = coerceNumber(evaluateExpression(exp, lookup))
+        if (result !== undefined) {
+            return result
+        }
+        failOnNode('Not a number', exp)
+    }
+
+    switch (expression.operatorToken.kind) {
+        case ts.SyntaxKind.PercentToken:
+            return evaluateNumber(expression.left) % evaluateNumber(expression.right)
+        case ts.SyntaxKind.AsteriskAsteriskToken:
+            return evaluateNumber(expression.left) ** evaluateNumber(expression.right)
+        case ts.SyntaxKind.AmpersandToken:
+            return evaluateNumber(expression.left) & evaluateNumber(expression.right)
+        case ts.SyntaxKind.BarToken:
+            return evaluateNumber(expression.left) | evaluateNumber(expression.right)
+        case ts.SyntaxKind.CaretToken:
+            return evaluateNumber(expression.left) ^ evaluateNumber(expression.right)
+        case ts.SyntaxKind.LessThanLessThanToken:
+            return evaluateNumber(expression.left) << evaluateNumber(expression.right)
+        case ts.SyntaxKind.GreaterThanGreaterThanToken:
+            return evaluateNumber(expression.left) >> evaluateNumber(expression.right)
+        case ts.SyntaxKind.GreaterThanGreaterThanGreaterThanToken:
+            return evaluateNumber(expression.left) >>> evaluateNumber(expression.right)
+        case ts.SyntaxKind.MinusToken:
+            return evaluateNumber(expression.left) - evaluateNumber(expression.right)
+        case ts.SyntaxKind.SlashToken:
+            return evaluateNumber(expression.left) / evaluateNumber(expression.right)
+        case ts.SyntaxKind.AsteriskToken:
+            return evaluateNumber(expression.left) * evaluateNumber(expression.right)
+        case ts.SyntaxKind.PlusToken:
+            // (string | number) + (string | number) is valid
+            return evaluateExpression(expression.left, lookup) + (evaluateExpression(expression.right, lookup) as any)
+    }
+
+    // TODO
+    failOnNode('Unhandled binary expression', expression)
+}
+
+function evaluatePrefixUnaryExpression(expression: ts.PrefixUnaryExpression, lookup?: (ident: string, node: ts.Node) => any) {
+    function evaluateNumber() {
+        const result = coerceNumber(evaluateExpression(expression.operand, lookup))
+        if (result !== undefined) {
+            return result
+        }
+        failOnNode('Not a number', expression.operand)
+    }
+
+    switch (expression.operator) {
+        case ts.SyntaxKind.TildeToken:
+            return ~evaluateNumber()
+        case ts.SyntaxKind.PlusToken:
+            return +evaluateNumber()
+        case ts.SyntaxKind.MinusToken:
+            return -evaluateNumber()
+    }
+
+    // TODO
+    failOnNode('Unhandled unary expression', expression)
+}
+
+// Basic impl. that doesn't handle all cases
+function evaluateExpression(expression: ts.Expression, lookup?: (ident: string, node: ts.Node) => any): any {
+    switch (expression.kind) {
+        case ts.SyntaxKind.ParenthesizedExpression:
+            return evaluateExpression((expression as ts.ParenthesizedExpression).expression)
+        case ts.SyntaxKind.NumericLiteral:
+            return Number((expression as ts.NumericLiteral).text)
+        case ts.SyntaxKind.StringLiteral:
+            return (expression as ts.StringLiteral).text
+        case ts.SyntaxKind.PrefixUnaryExpression:
+            return evaluatePrefixUnaryExpression(expression as ts.PrefixUnaryExpression, lookup)
+        case ts.SyntaxKind.BinaryExpression:
+            return evaluateBinaryExpression(expression as ts.BinaryExpression, lookup)
+        case ts.SyntaxKind.Identifier:
+            if (lookup) {
+                return lookup((expression as ts.Identifier).text, expression)
+            }
+            failOnNode('Failed to evaluate identfiier', expression)
+        case ts.SyntaxKind.PropertyAccessExpression: {
+            const target = evaluateExpression((expression as ts.PropertyAccessExpression), lookup)
+            
+            try {
+                return target[(expression as ts.PropertyAccessExpression).name.text]
+            } catch (e) {
+                failOnNode(`Bad property access: ${(e as any).message}`, expression)
+            }
+        }
+    }
+
+    // TODO
+    failOnNode('Unhandled expression', expression)
+}
+
+function getEnumMemberName(member: ts.EnumMember) {
+    switch (member.name.kind) {
+        case ts.SyntaxKind.Identifier:
+        case ts.SyntaxKind.StringLiteral:
+            return (member.name as ts.Identifier | ts.StringLiteral).text
+
+        case ts.SyntaxKind.ComputedPropertyName: {
+            const exp = ((member.name) as ts.ComputedPropertyName).expression
+            if (ts.isStringLiteralLike(exp)) {
+                return exp.text
+            }
+        }
+
+        default:
+            failOnNode('Invalid member name', member.name)
+    }
+}
+
+function getEnumInlineValue(member: ts.EnumMember): number | string {
+    const decl = member.parent
+    const initializer = member.initializer
+    if (initializer) {
+        return evaluateExpression(initializer, (ident, node) => {
+            // Identifiers can reference sibling members
+            const sibling = decl.members.find(x => getEnumMemberName(x) === ident)
+            if (sibling === member) {
+                failOnNode('Cannot use before assignment', node)
+            }
+
+            if (sibling) {
+                return getEnumInlineValue(sibling)
+            }
+
+            // TODO: need to lookup symbols in outer scopes
+            failOnNode('Not implemented', node)
+        })
+    }
+
+
+    // Find the closest member with an initializer
+    const index = decl.members.indexOf(member)
+    const closest = decl.members.slice(0, index).filter(x => x.initializer).at(-1)
+    if (!closest) {
+        return index
+    }
+
+    const indexOfClosest = decl.members.indexOf(closest)
+    const val = getEnumInlineValue(closest)
+    if (typeof val !== 'number') {
+        failOnNode('Enum must have an initializer', member)
+    }
+
+    return val + (index - indexOfClosest)
+}
+
 interface SymbolMapping {
     identifier: ts.Identifier
     bound?: boolean
@@ -778,6 +953,7 @@ function rewriteCapturedSymbols(
     const reduced = new Map<Symbol, ts.Node[]>()
     const boundSymbols = new Set<Symbol>()
     const defaultImports = new Set<Symbol>()
+    const replacements = new Map<ts.Node, ts.Node>()
     for (const [sym, nodes] of refs.entries()) {
         if (circularRefs.has(sym) && !sym.parent) {
             boundSymbols.add(sym)
@@ -825,7 +1001,22 @@ function rewriteCapturedSymbols(
 
             const importClause = root.importClause
             if (!importClause) {
-                reduced.set(root, getReferencesInScope(root, scope))
+                if (root !== sym && isConstantEnumDeclaration(root)) {
+                    // We can omit this capture only if there are no direct refs
+                    const refs = getReferencesInScope(root, scope)
+                    const hasDirect = refs.some(r =>  r.parent?.kind !== ts.SyntaxKind.PropertyAccessExpression)
+
+                    if (hasDirect) {
+                        reduced.set(root, refs)
+                    } else {
+                        const inlineValue = createLiteral(getEnumInlineValue(sym.declaration as ts.EnumMember))
+                        for (const n of nodes) {
+                            replacements.set(n, inlineValue)
+                        }
+                    }
+                } else {
+                    reduced.set(root, getReferencesInScope(root, scope))
+                }
 
                 continue
             }
@@ -889,7 +1080,6 @@ function rewriteCapturedSymbols(
         })
     }
 
-    const replacements = new Map<ts.Node, ts.Node>()
     for (const [sym, nodes] of reduced) {
         const { identifier, bound } = idents.get(sym)!
         const newNode = bound 

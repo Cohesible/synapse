@@ -1,7 +1,7 @@
 import ts from 'typescript'
 import * as path from 'node:path'
 import { getProviderCacheDir, getProviderTypesDirectory, getGlobalCacheDirectory, getWorkingDir } from '../workspaces'
-import { capitalize, createVariableStatement, memoize, toAmbientDeclarationFile, toSnakeCase } from '../utils'
+import { capitalize, createVariableStatement, memoize, strcmp, toAmbientDeclarationFile, toSnakeCase } from '../utils'
 import { providerPrefix } from '../runtime/loader'
 import { Fs, SyncFs } from '../system'
 import { runCommand } from '../utils/process'
@@ -440,7 +440,7 @@ async function installTypes(fs: Fs, workingDirectory: string, packages: Record<s
     }))
 
     packageJson.installed = Object.fromEntries(
-        Object.entries(packageJson.installed).sort((a, b) => a[0].localeCompare(b[0]))
+        Object.entries(packageJson.installed).sort((a, b) => strcmp(a[0], (b[0])))
     )
 
     await fs.writeFile(packageJsonPath, JSON.stringify(packageJson, undefined, 4))

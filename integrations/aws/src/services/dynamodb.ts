@@ -358,7 +358,11 @@ function serialize(obj: any): DynamoDB.AttributeValue {
     }
 }
 
-function deserialize(item: Record<string, DynamoDB.AttributeValue>): any {
+function deserialize(item: Record<string, DynamoDB.AttributeValue> | DynamoDB.AttributeValue[]): any {
+    if (Array.isArray(item)) {
+        return item.map(deserializeValue)
+    }
+
     const res: Record<string, any> = {}
     for (const [k, v] of Object.entries(item)) {
         res[k] = deserializeValue(v)
@@ -458,38 +462,51 @@ export class Cache<K extends string = string, V = any> {
 
 core.addTarget(storage.TTLCache, Cache, 'aws')
 
-// XXX: must be a function, otherwise `Symbol.asyncDispose` won't be initialized
-function getAsyncDispose(): typeof Symbol.asyncDispose {
-    if (!Symbol.asyncDispose) {
-        const asyncDispose = Symbol.for('Symbol.asyncDispose')
-        Object.defineProperty(Symbol, 'asyncDispose', { value: asyncDispose, enumerable: true })
+export class SimpleLock {
+    private readonly counter = new KeyedCounter()
+
+    async lock(id: string, timeout?: number) {
+        let sleepTime = 100
+
+        while (true) {
+            const l = await this.tryLock(id)
+            if (l) {
+                return l
+            }
+
+            await new Promise<void>(r => setTimeout(r, sleepTime))
+
+            if (sleepTime < 1_000) {
+                sleepTime = Math.round((1 + Math.random()) * sleepTime)
+            }
+        }
     }
 
-    return Symbol.asyncDispose
-}
-
-export class SimpleLock {
-    private readonly table = new Table<string, number>()
-    async lock(id: string) {
-        // Error: Not a function: ${table--Table.get} [kind: 212] (/Users/jadensimon/Projects/cloud-compiler/cloudscript-resources/src/services/aws/dynamodb.ts:92:32)
-        // const isLocked = (await this.table.get(id)) === 1
-        const currentState = await this.table.get(id)
-        if (currentState === 1) {
-            throw new HttpError(`Key is already locked: ${id}`, { statusCode: 423 })
+    async tryLock(id: string) {
+        const currentState = await this.counter.get(id)
+        if (currentState !== 0) {
+            return
         }
 
-        await this.table.set(id, 1)
+        const prev = await this.counter.inc(id)
 
-        return {
-            id,
-            [getAsyncDispose()]: () => this.unlock(id),
+        // XXX: hack to help the permissions solver
+        // `esbuild` polyfills `using` and it doesn't play nice with the solver
+        if (false) {
+            this.unlock(id)
+        }
+
+        // We were first
+        if (prev === 1) {
+            return {
+                id,
+                [Symbol.asyncDispose]: () => this.unlock(id),
+            }
         }
     }
 
     async unlock(id: string) {
-        await this.table.set(id, 0)
-        // TODO: make perms work with this by fixing `await using` somehow
-        // await this.table.delete(id)
+        await this.counter.set(id, 0)
     }
 }
 
@@ -617,7 +634,7 @@ export class Counter {
 
     private readonly item: CounterTableItem
     private readonly client = new DynamoDB.DynamoDB({})
-    private readonly key = core.getCurrentId().split('--').join('-')
+    private readonly key = core.getCurrentId()
 
     public constructor(init = 0) {
         this.item = new CounterTableItem(Counter.table, this.key, init)

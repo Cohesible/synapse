@@ -165,7 +165,6 @@ export function resolveValue(
     moduleLoader: ModuleLoader,
     dataTable: Record<string | number, any> = {},
     context = globalThis,
-    preserveId = false
 ): any {
     function loadFunction(val: any, params: any[]) {
         switch (params.length) {
@@ -378,6 +377,9 @@ export function resolveValue(
                         return loadObject(payload as SerializedObject)
 
                     case 'reflection':
+                        if (payload.operations instanceof Promise) {
+                            return payload.operations.then(handleReflection)
+                        }
                         return handleReflection(payload.operations!)
 
                     case 'binding':
@@ -411,14 +413,14 @@ export function resolveValue(
 
             const symbols = resolve(payload.symbols)
             if (result instanceof Promise) {
-                const r2 = result.then(x => addSymbols(x, payload, symbols, preserveId, context))
+                const r2 = result.then(x => addSymbols(x, payload, symbols, context))
                 // BUG: `resolve(payload.symbols)` could get a stale result if it's dependent on `o`
                 objectCache.set(o, r2)
 
                 return r2
             }
     
-            return addSymbols(result, payload, symbols, preserveId, context)
+            return addSymbols(result, payload, symbols, context)
         }
 
         const isReference = payload.id !== undefined && payload.valueType === undefined
@@ -466,7 +468,7 @@ function hydrateSymbol(name: string, globals = globalThis) {
     return Symbol.for(name)
 }
 
-function addSymbols(obj: any, payload: any, symbols?: any, preserveId?: boolean, globals = globalThis) {
+function addSymbols(obj: any, payload: any, symbols?: any, globals = globalThis) {
     if (!obj || (typeof obj !== 'object' && typeof obj !== 'function')) {
         return obj
     }
@@ -485,10 +487,6 @@ function addSymbols(obj: any, payload: any, symbols?: any, preserveId?: boolean,
         )
 
         Object.assign(obj, hydratedSymbols)
-    }
-
-    if (preserveId) {
-        return Object.assign(obj, { [objectId]: payload.id })
     }
 
     // Don't add the payload back unless it's a function or a binding

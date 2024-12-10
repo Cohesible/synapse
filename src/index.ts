@@ -1,19 +1,18 @@
 import ts from 'typescript'
 import * as path from 'node:path'
-import { CompilerOptions, CompilerHost, synth, CompiledSource, readPointersFile, readSources } from './compiler/host'
+import { CompilerOptions, getEnvVarHash, readPointersFile } from './compiler/host'
 import { FailedTestEvent, TestEvent, runTask } from './logging'
 import { BoundTerraformSession, DeployOptions, SessionContext, SessionError, createStatePersister, createZipFromDir, getChangeType, getDiff, getTerraformPath, isTriggeredReplaced, parsePlan, startTerraformSession } from './deploy/deployment'
 import { LocalWorkspace, getV8CacheDirectory, initProject, getLinkedPackagesDirectory, Program, getRootDirectory, getDeploymentBuildDirectory, getTargetDeploymentIdOrThrow, getOrCreateDeployment, getWorkingDir } from './workspaces'
 import { createLocalFs } from './system'
-import { AmbientDeclarationFileResult, Mutable, acquireFsLock, createHasher, createRwMutex, getCiType, isNonNullable, isWindows, keyedMemoize, makeExecutable, makeRelative, memoize, printNodes, replaceWithTilde, resolveRelative, showArtifact, throwIfNotFileNotFoundError, toAmbientDeclarationFile, wrapWithProxy } from './utils'
-import { MoveWithSymbols, SymbolGraph, SymbolNode, createMergedGraph, createSymbolGraph, createSymbolGraphFromTemplate, detectRefactors, evaluateMoveCommands, getKeyFromScopes, getMovesWithSymbols, getRenderedStatementFromScope, normalizeConfigs, renderSymbol, renderSymbolLocation } from './refactoring'
+import { AmbientDeclarationFileResult, Mutable, acquireFsLock, createHasher, createRwMutex, getCiType, gunzip, isNonNullable, isWindows, keyedMemoize, makeExecutable, makeRelative, memoize, printNodes, replaceWithTilde, resolveRelative, showArtifact, throwIfNotFileNotFoundError, toAmbientDeclarationFile, wrapWithProxy } from './utils'
+import { MoveWithSymbols, SymbolGraph, SymbolNode, createMergedGraph, createSymbolGraph, createSymbolGraphFromTemplate, deleteSourceMapResource, detectRefactors, findAutomaticMoves, getKeyFromScopes, getMovesWithSymbols, getRenderedStatementFromScope, isOldSourceMapFormat, normalizeConfigs, renderSymbol, renderSymbolLocation } from './refactoring'
 import { SourceMapHost } from './static-solver/utils'
 import { getLogger } from './logging'
-import { createContext, createModuleLoader, createSourceMapParser } from './runtime/loader'
-import { BuildFsIndex, CompiledChunk, TemplateWithHashes, checkBlock, commitProgram, createArtifactFs, createBuildFsFragment, createMountedFs, getDataRepository, getFsFromHash, getInstallation, getMoved, getPreviousDeploymentProgramHash, getDeploymentFs, getProgramFs, getProgramHash, getResourceProgramHashes, listCommits, maybeRestoreTemplate, printBlockInfo, putState, readResourceState, readState, saveMoved, shutdownRepos, syncRemote, toFs, toFsFromHash, writeTemplate } from './artifacts'
+import { BuildFsIndex, CompiledChunk, checkBlock, commitProgram, createArtifactFs, createBuildFsFragment, createMountedFs, getDataRepository, getFsFromHash, getInstallation, getMoved, getPreviousDeploymentProgramHash, getDeploymentFs, getProgramFs, getProgramHash, getResourceProgramHashes, listCommits, maybeRestoreTemplate, printBlockInfo, putState, readResourceState, readState, saveMoved, shutdownRepos, syncRemote, toFs, toFsFromHash, writeTemplate } from './artifacts'
 import { PackageService, createPackageService, maybeDownloadPackages, showManifest, downloadAndUpdatePackage, verifyInstall, downloadAndInstall, listInstall, resolveDepsGreedy, printTree } from './pm/packages'
-import { createTestRunner, listTestSuites, listTests } from './testing'
-import { ReplOptions, enterRepl, createReplServer, prepareReplWithSymbols, getSymbolDataResourceId } from './repl'
+import { clearCachedTestResults, createTestRunner, listTestSuites, listTests } from './testing'
+import { enterRepl } from './repl'
 import { createTemplateService, getHash, parseModuleName } from './templates'
 import { createImportMap, createModuleResolver } from './runtime/resolver'
 import { createAuth, getAuth } from './auth'
@@ -23,11 +22,11 @@ import { ResolvedProgramConfig, getResolvedTsConfig, resolveProgramConfig } from
 import { createProgramBuilder, getDeployables, getEntrypointsFile, getExecutables } from './compiler/programBuilder'
 import { loadCpuProfile } from './perf/profiles'
 import { colorize, createTreeView, printJson, printLine, print, getDisplay, bold, RenderableError, dim } from './cli/ui'
-import { createDeployView, extractSymbolInfoFromPlan, getPlannedChanges, groupSymbolInfoByFile, printSymbolTable, promptDestroyConfirmation, renderMove, renderSummary, renderSym, renderSymbolWithState } from './cli/views/deploy'
-import { TfJson } from './runtime/modules/terraform'
+import { createDeployView, extractSymbolInfoFromPlan, getPlannedChanges, groupSymbolInfoByPkg, printSymbolTable, promptDestroyConfirmation, renderMove, renderSummary, renderSym } from './cli/views/deploy'
+import { TerraformSourceMap, TfJson } from './runtime/modules/terraform'
 import { glob } from './utils/glob'
 import { createMinimalLoader } from './runtime/rootLoader'
-import { CancelError, getBuildTarget, getBuildTargetOrThrow, getFs, getSelfPathOrThrow, isCancelled, isSelfSea, throwIfCancelled } from './execution'
+import { CancelError, getBuildTarget, getBuildTargetOrThrow, getFs, getSelfPathOrThrow, isCancelled, isSelfSea, pushDisposable, throwIfCancelled } from './execution'
 import * as secrets from './services/secrets'
 import * as workspaces from './workspaces'
 import { createTestView } from './cli/views/test'
@@ -45,11 +44,11 @@ import { transformNodePrimordials } from './utils/convertNodePrimordials'
 import { createCompileView, getPreviousDeploymentData } from './cli/views/compile'
 import { createSessionContext, getModuleLoader, getSession, shutdownSessions } from './deploy/session'
 import { findArtifactByPrefix, getMetadata } from './build-fs/utils'
-import { diffFileInLatestCommit, diffIndices, diffObjects } from './build-fs/stats'
+import { collectStats, diffFileInLatestCommit, diffIndices, diffObjects, printStats, printTopNLargestObjects } from './build-fs/stats'
 import { renderCmdSuggestion } from './cli/commands'
 import * as ui from './cli/ui'
 import * as bfs from './artifacts'
-import { findAllBareSpecifiers, findProviderImports } from './compiler/entrypoints'
+import { findAllBareSpecifiers } from './compiler/entrypoints'
 import { makeSea, resolveAssets } from './build/sea'
 import { createInstallView } from './cli/views/install'
 import { resolveBuildTarget } from './build/builder'
@@ -62,6 +61,7 @@ import { openRemote } from './git'
 import { getTypesFile } from './compiler/resourceGraph'
 import { formatEvents, getLogService } from './services/logs'
 import { getNeededDependencies } from './pm/autoInstall'
+import { maybeLoadEnvironmentVariables } from './runtime/env'
 
 // TODO: https://github.com/pulumi/pulumi/issues/3388
 
@@ -77,18 +77,13 @@ export type CombinedOptions = CompilerOptions & DeployOptions & {
     process?: string
 }
 
-export function shutdown() {
-    const promises: Promise<unknown>[] = []
-
-    promises.push(shutdownSessions())
-    promises.push(shutdownRepos())
-    promises.push(analytics.shutdown().catch(e => {
-       getLogger().warn('Failed to flush events', e)
+export function pushPlatformDisposables() {
+    pushDisposable(shutdownSessions)
+    pushDisposable(shutdownRepos)
+    pushDisposable(() => analytics.shutdown().catch(e => {
+        getLogger().warn('Failed to flush events', e)
     }))
-
-    return Promise.all(promises)
 }
-
 
 // TODO: add permissions model to all system APIs e.g. `fs`, `https`, etc.
 // This would be very similar to Deno, but we can do so much more with it
@@ -141,7 +136,7 @@ export async function publish(target: string, opt?: PublishOptions) {
     }
 
     if (opt?.local) {
-        await linkPackage({ dryRun: opt?.dryRun, skipInstall: opt?.skipInstall, useNewFormat: opt?.newFormat })
+        await linkPackage({ dryRun: opt?.dryRun, skipInstall: opt?.skipInstall })
         return
     }
 
@@ -297,45 +292,94 @@ async function validateTargets(targets: string[]) {
     }))
 }
 
-export async function deploy(targets: string[], opt?: DeployOpt2) {
+function gatherTargets(template: TfJson, symbols: string[]) {
+    const targets = new Set<string>()
+    const graph = createSymbolGraphFromTemplate(template)
+
+    const allResources = new Set<string>(Object.keys(gatherResources(template)))
+
+    for (const s of symbols) {
+        if (allResources.has(s)) {
+            targets.add(s)
+            continue
+        }
+
+        const n = getSymbolNodeFromRef(graph, s)
+        for (const r of n.resources) {
+            targets.add(`${r.type}.${r.name}`)
+        }
+    }
+
+    if (targets.size === 0) {
+        throw new Error('No targets found')
+    }
+
+    return Array.from(targets)
+}
+
+async function checkCompileForDeploy(targets: string[], opt?: DeployOpt2) {
+    const programFsHash = opt?.sessionCtx?.buildTarget.programHash
+    if (programFsHash || opt?.targetResources) {
+        return
+    }
+
+    const doCompile = (forcedSynth?: boolean, targetFiles = targets) => compile(targetFiles, { 
+        forcedSynth, 
+        incremental: true, 
+        skipSummary: true, 
+        hideLogs: true, 
+        deployTarget: opt?.deployTarget,
+    })
+
+    const needsSynth = await getNeedsSynth()
+    if (needsSynth) {
+        await doCompile(true)
+    } else {
+        // In any kind of machine-to-machine interaction we shouldn't try to be smart like this
+        // It's better to fail and say that the program should be compiled explicitly first.
+        // Auto-compile/synth is a feature for humans, not machines. 
+        //
+        // TODO: we should check stale compilation for `syn test` too
+        // TODO: also we should limit the staleness check to the subgraph(s) specified by `targets`
+        const sources = await getStaleDeployableSources(targets.length > 0 ? targets : undefined)
+
+        // We never synthed, need a full compile
+        if (!sources) {
+            getLogger().log('No sources found, compiling all')
+            await doCompile(undefined, [])
+        } else if (sources.stale.size > 0) {
+            getLogger().log('Found stale sources, recompiling')
+            await doCompile()
+        } else if (opt?.deployTarget) {
+            const prev = await getPreviousPkg()
+            if (prev?.synapse?.config?.target !== opt.deployTarget) {
+                getLogger().log(`Target has changed, recompiling: ${prev?.synapse?.config?.target} [previous] !== ${opt.deployTarget} [current]`)
+                await doCompile()
+            } else {
+                await checkEnvVars()
+            }
+        } else {
+            await checkEnvVars()
+        }
+
+        async function checkEnvVars() {
+            const diff = await getChangedEnvVarsForSynth()
+            if (diff) {
+                getLogger().log(`Synthesis environment variables changed: ${diff}`)
+
+                return doCompile()
+            }
+        }
+    }
+
+    return await loadMoved(path.resolve(getWorkingDir(), 'moved.json'))
+}
+
+export async function deploy(targets: string[], opt: DeployOpt2 = {}) {
     await validateTargets(targets)
 
     const programFsHash = opt?.sessionCtx?.buildTarget.programHash
-    if (!programFsHash && !opt?.targetResources) {
-        const doCompile = (forcedSynth?: boolean) => compile(targets, { 
-            forcedSynth, 
-            incremental: true, 
-            skipSummary: true, 
-            hideLogs: true, 
-            deployTarget: opt?.deployTarget,
-        })
-
-        const needsSynth = await getNeedsSynth()
-        if (needsSynth) {
-            await doCompile(true)
-        } else {
-            // In any kind of machine-to-machine interaction we shouldn't try to be smart like this
-            // It's better to fail and say that the program should be compiled explicitly first.
-            // Auto-compile/synth is a feature for humans, not machines. 
-            //
-            // TODO: we should check stale compilation for `syn test` too
-            // TODO: also we should limit the staleness check to the subgraph(s) specified by `targets`
-            const { stale } = await getStaleDeployableSources(targets.length > 0 ? targets : undefined) ?? {}
-            if (!stale || stale.size > 0) {
-                getLogger().log('Found stale sources, recompiling')
-                await doCompile()
-            } else if (opt?.deployTarget) {
-                const prev = await getPreviousPkg()
-                if (prev?.synapse?.config?.target !== opt.deployTarget) {
-                    getLogger().log(`Target has changed, recompiling: ${prev?.synapse?.config?.target} [previous] !== ${opt.deployTarget} [current]`)
-                    await doCompile()
-                }
-            }
-        }
-
-        await loadMoved(path.resolve(getWorkingDir(), 'moved.json')).catch(e => {})
-    }
-
+    const maybeMoved = await checkCompileForDeploy(targets, opt)
     // TODO: return early if there is nothing to deploy
     // Currently users see "No deployment associated with build target" if they
     // try to deploy a file that does not instantiate any resources
@@ -350,27 +394,15 @@ export async function deploy(targets: string[], opt?: DeployOpt2) {
 
     const view = await getDeployView(template)
 
+    const targetResources = opt.targetResources ??= []
     if (opt?.symbols) {
-        const targets = opt.targetResources ??= []
-        const graph = createSymbolGraphFromTemplate(template)
-        for (const s of opt.symbols) {
-            if (!!graph.getConfig(s)) {
-                targets.push(s)
-                continue
-            }
+        targetResources.push(...gatherTargets(template, opt.symbols))
+    }
 
-            const n = getSymbolNodeFromRef(graph, s)
-            for (const r of n.resources) {
-                const id = `${r.type}.${r.name}`
-                if (!targets.includes(id)) {
-                    targets.push(id)
-                }
-            }
-        }
-
-        // Needed to fix this error "Moved resource instances excluded by targeting"
-        if (template.moved) {
-            targets.push(...template.moved.map(x => x.from))
+    if (maybeMoved) {
+        for (const m of maybeMoved) {
+            targetResources.push(m.from)
+            targetResources.push(m.to)
         }
     }
 
@@ -573,9 +605,7 @@ export async function destroy(targets: string[], opt?: CombinedOptions & { dryRu
 
         // Only delete this on a "full" destroy
         if (result.state.resources.length === 0) {
-            const templateFilePath = await session.templateService.getTemplateFilePath()
-            const stateFile = path.resolve(path.dirname(templateFilePath), '.terraform', 'terraform.tfstate')
-            await getFs().deleteFile(stateFile).catch(throwIfNotFileNotFoundError)
+            await session.templateService.cleanState()
         
             const artifactFs = await bfs.getArtifactFs()
             await artifactFs.resetManifest(deploymentId)
@@ -818,7 +848,7 @@ export async function findLocalResources(targets: string[], opt?: CombinedOption
 
 type TestOptions = DeployOptions & { 
     destroyAfter?: boolean
-    targetIds?: number[]
+    //targetIds?: string[]
     rollbackIfFailed?: boolean
     filter?: string,
     noCache?: boolean
@@ -834,7 +864,7 @@ export async function runTests(targets: string[], opt?: TestOptions) {
     const deploymentId = getTargetDeploymentIdOrThrow()
 
     const filter = {
-        targetIds: opt?.targetIds,
+        // targetIds: opt?.targetIds,
         fileNames: targets.length > 0 ? targets : undefined,
         names: opt?.filter,
     }
@@ -853,16 +883,18 @@ export async function runTests(targets: string[], opt?: TestOptions) {
 
     // FIXME: figure out a way to avoid doing this. Right now this is done to ensure 
     // that any resources that cause "side-effects" are also deployed
-    const suiteIds = [
-        ...Object.values(suites).map(x => x.id),
-        ...Object.values(tests).map(x => x.parentId),
+    const suiteKeys = [
+        ...Object.values(suites).map(x => `${x.fileName}:${x.id}`),
+        ...Object.values(tests).map(x => `${x.fileName}:${x.parentId}`),
     ].filter(isNonNullable)
+
     const resources = (await session.templateService.getTemplate()).resource
     for (const [k, v] of Object.entries(resources)) {
         for (const [k2, v2] of Object.entries(v as any)) {
             const parsed = parseModuleName((v2 as any).module_name)
             const key = `${k}.${k2}`
-            if (parsed.testSuiteId && suiteIds.includes(parsed.testSuiteId) && !targetResources.includes(key)) {
+            const testKey = parsed.testSuiteId !== undefined ? `${parsed.fileName}:${parsed.testSuiteId}` : undefined
+            if (testKey!== undefined && suiteKeys.includes(testKey) && !targetResources.includes(key)) {
                 targetResources.push(key)
                 targetModules.add(parsed.fileName)
             }
@@ -888,7 +920,6 @@ export async function runTests(targets: string[], opt?: TestOptions) {
         })
     }
 
-    // const status = await getDeploymentStatus2([...targetModules], (await getEntrypointsFile())?.deployables ?? {})
     if (staleResources.size === 0) {
         getLogger().log('No changes detected, skipping deploy for test resources')
     } else {
@@ -935,7 +966,7 @@ export async function runTests(targets: string[], opt?: TestOptions) {
         }
 
         if (shouldRollback) {
-            await shutdownSessions() // TODO: can be removed if test resources use a separate process ID
+            await shutdownSessions() // TODO: can be removed if test resources use a separate deployment ID
             await rollback('', opt)
         }
 
@@ -985,33 +1016,23 @@ export async function showLogs(patterns: string, opt?: DeployOptions) {
     process.stdout.write(await getFs().readFile(latest))
 }
 
-export async function plan(targets: string[], opt?: DeployOptions & { symbols?: string[]; forceRefresh?: boolean; planDepth?: number; debug?: boolean }) {
-    await loadMoved(path.resolve(getWorkingDir(), 'moved.json')).catch(e => {})
+type PlanOptions = DeployOptions & { symbols?: string[]; forceRefresh?: boolean; planDepth?: number; debug?: boolean; expectNoChanges?: boolean }
+
+export async function plan(targets: string[], opt: PlanOptions = {}) {
+    const maybeMoved = await checkCompileForDeploy(targets, opt)
 
     const session = await getSession(getTargetDeploymentIdOrThrow(), undefined, { ...opt, noSave: true })
     const template = await session.templateService.getTemplate()
 
+    const targetResources = opt.targetResources ??= []
     if (opt?.symbols) {
-        const targets = opt.targetResources ??= []
-        const graph = createSymbolGraphFromTemplate(template)
-        for (const s of opt.symbols) {
-            if (!!graph.getConfig(s)) {
-                targets.push(s)
-                continue
-            }
+        targetResources.push(...gatherTargets(template, opt.symbols))
+    }
 
-            const n = getSymbolNodeFromRef(graph, s)
-            for (const r of n.resources) {
-                const id = `${r.type}.${r.name}`
-                if (!targets.includes(id)) {
-                    targets.push(id)
-                }
-            }
-        }
-
-        // Needed to fix this error "Moved resource instances excluded by targeting"
-        if (template.moved) {
-            targets.push(...template.moved.map(x => x.from))
+    if (maybeMoved) {
+        for (const m of maybeMoved) {
+            targetResources.push(m.from)
+            targetResources.push(m.to)
         }
     }
 
@@ -1026,9 +1047,71 @@ export async function plan(targets: string[], opt?: DeployOptions & { symbols?: 
     )
 
     if (opt?.debug) {
+        const graph = createSymbolGraphFromTemplate(template)
+
         const changes = getPlannedChanges(res)
-        for (const [k, v] of Object.entries(changes)) {
-            printLine(`${v.change} - ${k}`)
+
+        function order(a: string) {
+            switch (a) {
+                case 'replace': return 0
+                case 'create': return 1
+                case 'delete': return 2
+                default: return 3
+            }
+        }
+
+        const moved = await getMoved()
+        const state = await readState()
+        const remaining = new Set<string>(state?.resources.map(r => `${r.type}.${r.name}`) ?? [])
+        for (const m of moved ?? []) {
+            remaining.delete(m.from)
+        }
+
+        const potentialMatches = new Map<string, string[]>()
+        const friendlyNames = new Map<string, string>()
+
+        const sorted = Object.entries(changes).sort((a, b) => order(a[1].change) - order(b[1].change))
+        for (const [k, v] of sorted) {
+            // Data source
+            if (v.change === 'read') continue
+
+            const s = graph.findSymbolFromResourceKey(k)
+            const ty = graph.getResourceType(k)
+            const name = s?.value.name
+
+            const wasMoved = moved?.find(x => x.to === k)
+
+            const text = `${v.change} - ${name ? `${name} [${k}]` : k}${wasMoved ? `[moved]` : ''}`
+            if (v.change === 'replace') {
+                // XXXX: generally noisy
+                if (k.startsWith('aws_s3_object.')) {
+                    continue
+                }
+                printLine(colorize('yellow', text))
+
+                printLine(`    reason: ${v.plan.reason}`)
+                printLine(`    diff: ${JSON.stringify(getDiff(v.plan.change), undefined, 4)}`)
+                printLine(`    attributes: ${JSON.stringify(v.plan.attributes, undefined, 4)}`)
+
+            } else if (v.change === 'create') {
+                if (ty.closureKindHint === 'definition') continue
+                printLine(colorize('green', text))
+                const z = k.split('.')[0]
+                const rem = [...remaining].filter(x => x.split('.')[0] === z && (ty.kind !== 'custom' || x.endsWith('--Custom')))
+                potentialMatches.set(k, rem)
+                friendlyNames.set(k, name ? `${name} [${k}]` : k)
+            } else if (v.change === 'delete') {
+                printLine(colorize('red', text))
+            } else {
+                printLine(colorize('gray', text))
+            }
+        }
+        
+        for (const [k, v] of potentialMatches) {
+            printLine(`maybe match ${friendlyNames.get(k)!}`)
+            for (const d of v) {
+                printLine(`    ${d.split('.')[1]}`)
+            }
         }
 
         return
@@ -1036,21 +1119,20 @@ export async function plan(targets: string[], opt?: DeployOptions & { symbols?: 
 
     const g = await getMergedGraph(template)
     const info = extractSymbolInfoFromPlan(g, res)
-    if (info.size === 0){
+    if (info.size === 0) {
         printLine('No changes planned')
         return
     }
 
-    const groups = groupSymbolInfoByFile(info)
-    for (const [fileName, group] of Object.entries(groups)) {
-        // const relPath = path.relative(getWorkingDir(), fileName)
-        // const headerSize = Math.min(process.stdout.columns, 80)
-        // const padding = Math.floor((headerSize - (relPath.length + 2)) / 2)
-        // printLine(colorize('gray', `${'-'.repeat(padding)} ${relPath} ${'-'.repeat(padding)}`))
-        // for (const [k, v] of group) {
-        //     printLine(renderSymbolWithState(k.value, v, undefined, ui.spinners.empty))
-        // }
-        printSymbolTable(group)
+    if (opt.expectNoChanges) {
+        throw new Error('Expected no changes')
+    }
+
+    const groups = groupSymbolInfoByPkg(info)
+    for (const [pkgRef, files] of Object.entries(groups)) {
+        for (const [fileName, group] of Object.entries(files)) {
+            printSymbolTable(group)
+        }
     }
 }
 
@@ -1254,6 +1336,20 @@ function parseSymbolRef(ref: string) {
 }
 
 function getSymbolNodeFromRef(graph: SymbolGraph, ref: string) {
+    if (graph.hasResource(ref)) {
+        const n = graph.findSymbolFromResourceKey(ref)
+        if (n) {
+            const r = n.value.resources.filter(x => `${x.type}.${x.name}` === ref)[0]
+            if (r) {
+                return {
+                    ...n.value,
+                    id: -1,
+                    resources: [r],
+                }
+            }
+        }
+    }
+
     const { name, fileName, index } = parseSymbolRef(ref)
     const matched = graph.matchSymbolNodes(name, fileName)
     if (matched.length === 0) {
@@ -1533,6 +1629,7 @@ export async function moveResource(from: string, to: string) {
 
     const oldGraph = createSymbolGraphFromTemplate(oldTemplate)
 
+    const oldMoved = await getMoved() ?? []
 
     if (graph.hasResource(to)) {
         const found = state.resources.find(r => `${r.type}.${r.name}` === from)
@@ -1540,8 +1637,12 @@ export async function moveResource(from: string, to: string) {
             throw new Error(`Missing resource in state: ${from}`)
         }
 
-        const moves = [{ from, to }]
-        await saveMoved(moves, template)
+        if (oldMoved.find(x => x.from === from && x.to === to)) {
+            return
+        }
+
+        const moves = [{ from, to }, ...oldMoved]
+        await saveMoved(moves)
         return
     }
 
@@ -1605,7 +1706,6 @@ export async function moveResource(from: string, to: string) {
         throw new Error('Nothing to move!')
     }
 
-
     const priorMoved = await getMoved()
     if (priorMoved) {
         for (const m of priorMoved) {
@@ -1659,7 +1759,7 @@ export async function moveResource(from: string, to: string) {
         }
     }
 
-    await saveMoved(moves, template)
+    await saveMoved(moves)
     printLine(`Will move ${moves.length} resource${moves.length > 1 ? 's' : ''}`)
     showMissedResources()
 }
@@ -1696,7 +1796,7 @@ export async function startWatch(targets?: string[], opt?: CompilerOptions & { a
     sys.getExecutingFilePath = () => isSea ? selfPath : resolver.resolve('typescript', path.resolve(workingDirectory, 'fake-script.ts'))
 
     const config = await resolveProgramConfig(options)
-    config.tsc.cmd.options.noLib = false // Forcibly set this otherwise `watch` can break if `lib` is set
+    config.tsc.cmd.options.noLib = false // Forcibly set this otherwise `watch` can break if `lib` is set 
 
     const watchHost = ts.createWatchCompilerHost(
         config.tsc.cmd.fileNames, 
@@ -1759,12 +1859,12 @@ export async function startWatch(targets?: string[], opt?: CompilerOptions & { a
         if (changedDeployables.size > 0 && config.csc.deployTarget) {
             const template = await builder.synth(config.csc.deployTarget)
 
-            await writeTemplate(template)
+            await writeTemplate(template.binary)
             await commitProgram()
 
-            await tfSession?.setTemplate(template)
+            await tfSession?.setTemplate(template.binary)
 
-            const view = tfSession ? await getDeployView(template) : undefined
+            const view = tfSession ? await getDeployView(template.json) : undefined
 
             await apply([...changedDeployables].map(f => path.relative(workingDirectory, f))).finally(() => {
                 view?.dispose()
@@ -1928,21 +2028,18 @@ export async function compile(targets: string[], opt?: CompileOptions) {
     if (needsSynth && !shouldSkipSynth) {
         // Fetch any existing state in the background so we can enhance the output messages
         const previousData = !opt?.skipSummary ? getPreviousDeploymentData() : undefined
-
         const template = await runTask('infra', 'synth', () => builder.synth(deployTarget, entrypointsFile), 10)
-        const ext = (template as Mutable<TfJson>)['//'] ??= {}
-        ext.deployTarget = deployTarget // Used to track what target was used in the last deployment
 
         await Promise.all([
-            writeTemplate(template),
+            writeTemplate(template.binary),
             opt?.forcedSynth ? setNeedsSynth(false) : undefined,
         ])
 
         await commitProgram()
 
         if (!opt?.skipSummary) {
-            const showSummary = async () => view.showSimplePlanSummary(template, deployTarget, targets, await previousData)
-            await runTask('view', 'show summary', showSummary, 1)
+            const showSummary = async () => view.showSimplePlanSummary(template.json, deployTarget, targets, await previousData)
+            await runTask('view', 'show summary', showSummary, 1) 
         } else {
             view.done()
         }
@@ -2111,21 +2208,8 @@ export async function showRemoteArtifact(target: string, opt?: { captured?: bool
         if (opt?.captured) {
             const capturedArray = parsed['@@__moveable__']['captured']
             printJson(capturedArray)
-
-            // const t = params.match(/captured:(.*)/)?.[1]
-            // if (t) {
-            //     printJson(capturedArray[Number(t)]['@@__moveable__'])
-            // } else {
-            //     printJson(capturedArray)
-            // }
         } else if (opt?.deployed || parsed.kind === 'deployed') {
             printLine(Buffer.from(parsed.rendered, 'base64').toString('utf-8'))
-
-            // if (params.includes('imports')) {
-            //     showManifest(parsed.packageDependencies)
-            // } else {
-            //     printLine(Buffer.from(parsed.rendered, 'base64').toString('utf-8'))
-            // }
         } else if (opt?.infra) {
             printLine(Buffer.from(parsed.infra, 'base64').toString('utf-8'))
         } else if (parsed.kind === 'compiled-chunk') {
@@ -2160,7 +2244,7 @@ function gatherResources(template: TfJson, targetFiles?: Set<string>, excluded?:
             if (excluded?.has(id)) {
                 continue
             }
-            if (targetFiles) {
+            if (targetFiles && (v2 as any).module_name) {
                 const parsed = parseModuleName((v2 as any).module_name)
                 if (!targetFiles.has(parsed.fileName)) continue
             }
@@ -2168,6 +2252,92 @@ function gatherResources(template: TfJson, targetFiles?: Set<string>, excluded?:
         }
     }
     return resources
+}
+
+async function reconstructSourceMap(required: string[]) {
+    const rem = new Set(required)
+    const sourcemap: TerraformSourceMap = {
+        symbols: [],
+        resources: {},
+    }
+
+    const m = new Map<string, number>()
+    function indexSymbol(sym: TerraformSourceMap['symbols'][number]) {
+        const key = `${sym.fileName}:${sym.column}:${sym.line}:${sym.name}`
+        if (m.has(key)) {
+            return m.get(key)!
+        }
+
+        const index = sourcemap.symbols.length
+        m.set(key, index)
+        sourcemap.symbols.push(sym)
+
+        return index
+    }
+
+    const template: Record<string, Record<string, any>> = {}
+
+    const commits = await bfs.listCommits(undefined, undefined, 100)
+    for (const c of commits) {
+        if (rem.size === 0) break
+
+        if (!c.programHash) continue
+
+        const oldTemplate = await bfs.maybeRestoreTemplate(c)
+        if (!oldTemplate) continue
+
+        const oldSourceMap = oldTemplate?.['//']?.sourceMap // FIXME: make this a required field
+        if (!oldSourceMap) continue
+
+        const oldFormat = isOldSourceMapFormat(oldSourceMap)
+
+
+        let didAdd = false
+        const oldResources = gatherResources(oldTemplate)
+        for (const [k, v] of Object.entries(oldResources)) {
+            if (!rem.has(k)) continue
+            const [type, name] = k.split('.')
+
+            const g2 = sourcemap.resources[type] ??= {}
+
+            g2[name] = oldFormat ? oldSourceMap.resources[k] as any : oldSourceMap.resources[type][name]
+
+            if (!g2[name]) {
+                delete g2[name]
+                rem.delete(k)
+                continue
+            }
+
+            const g = template[type] ??= {}
+            g[name] = v
+            didAdd = true
+
+            for (const scope of g2[name].scopes) {
+                scope.callSite = indexSymbol(oldSourceMap.symbols[scope.callSite])
+
+                if (scope.assignment !== undefined) {
+                    scope.assignment = indexSymbol(oldSourceMap.symbols[scope.assignment])
+                }
+                if (scope.namespace !== undefined) {
+                    scope.namespace = scope.namespace.map(x => indexSymbol(oldSourceMap.symbols[x]))
+                }
+                if (scope.declaration !== undefined) {
+                    scope.declaration = scope.declaration.map(x => indexSymbol(oldSourceMap.symbols[x]))
+                }
+            }
+
+            rem.delete(k)
+        }
+
+        if (didAdd) {
+            normalizeConfigs(oldTemplate)
+        }
+    }
+
+    return {
+        sourcemap,
+        template: { resource: template } as TfJson,
+    }
 }
 
 // FIXME: exclude invalid move sets (e.g. cycles)
@@ -2187,10 +2357,9 @@ export async function migrateIdentifiers(targets: string[], opt?: CombinedOption
 
     const session = await getSession(deploymentId)
 
-    const afs = await bfs.getArtifactFs()
-    const oldTemplate = await afs.maybeRestoreTemplate()
-
-    const oldSourceMap = oldTemplate?.['//']?.sourceMap // FIXME: make this a required field
+    const reconstructed = await reconstructSourceMap(state.resources.map(r => `${r.type}.${r.name}`))
+    const oldTemplate = reconstructed.template
+    const oldSourceMap = reconstructed.sourcemap
     if (!oldSourceMap) {
         throw new Error(`No existing source map found`)
     }
@@ -2202,53 +2371,37 @@ export async function migrateIdentifiers(targets: string[], opt?: CombinedOption
         throw new Error(`No new source map found`)
     }
 
-    const movesFromCommands = evaluateMoveCommands(template, state)
-    const excludedOld = new Set(movesFromCommands?.map(x => x.from))
-    const excludedNew = new Set(movesFromCommands?.map(x => x.to))
-    const oldSourceMapCopy = { ...oldSourceMap, resources: { ...oldSourceMap.resources }}
-    const newSourceMapCopy = { ...newSourceMap, resources: { ...newSourceMap.resources }}
+    const excludedOld = new Set<string>()
+    const excludedNew = new Set<string>()
 
-    getLogger().log(`resolved ${movesFromCommands?.length ?? 0} moves from commands`)
+    for (const [type, v] of Object.entries(template.resource)) {
+        for (const k of Object.keys(v)) {
+            if ((v[k] as any).input?.kindHint === 'definition') {
+                excludedNew.add(`${type}.${k}`)
+            }
+        }
+    }
 
     const newResources = gatherResources(template, targetFiles, excludedNew)
     normalizeConfigs(template)
 
-    // XXX: need to load the state manually
-    await session.getState()
-
-    const newDeps: Record<string, Set<string>> = {}
-    const newRefs = await session.getRefs(Object.keys(newResources))
-    for (const [k, v] of Object.entries(newRefs)) {
-        newDeps[k] = new Set(v.filter(x => !x.subject.startsWith('local.') && !x.subject.startsWith('data.')).map(x => x.subject))
-    } 
-
-    await session.setTemplate(oldTemplate)
+    for (const [type, v] of Object.entries(oldTemplate.resource)) {
+        for (const k of Object.keys(v)) {
+            if (k.endsWith('--definition') || (v[k] as any).input?.kindHint === 'definition') {
+                excludedOld.add(`${type}.${k}`)
+            }
+        }
+    }
 
     const oldResources = gatherResources(oldTemplate, targetFiles, excludedOld)
-    normalizeConfigs(oldTemplate)
 
-    const oldDeps: Record<string, Set<string>> = {}
-    const oldRefs = await session.getRefs(Object.keys(oldResources))
-    for (const [k, v] of Object.entries(oldRefs)) {
-        oldDeps[k] = new Set(v.filter(x => !x.subject.startsWith('local.') && !x.subject.startsWith('data.')).map(x => x.subject))
+    for (const k of excludedNew) {
+        deleteSourceMapResource(newSourceMap, k)
     }
 
-
-    if (targetFiles || movesFromCommands) {
-        const newKeys = Object.keys(newResources)
-        const oldKeys = Object.keys(oldResources)
-        for (const k of Object.keys(newSourceMap.resources)) {
-            if (!newKeys.includes(k)) {
-                delete newSourceMap.resources[k]
-            }
-        }
-        for (const k of Object.keys(oldSourceMap.resources)) {
-            if (!oldKeys.includes(k)) {
-                delete oldSourceMap.resources[k]
-            }
-        }
+    for (const k of excludedOld) {
+        deleteSourceMapResource(oldSourceMap, k)
     }
-
 
     // TODO: we _need_ to cross-reference the template with the actual state before proceeding
     // TODO: check existing moves
@@ -2256,15 +2409,9 @@ export async function migrateIdentifiers(targets: string[], opt?: CombinedOption
     const moves = runTask(
         'refactoring', 
         'tree edits', 
-        () => detectRefactors(newResources, newSourceMap, oldResources, oldSourceMap, newDeps, oldDeps), 
+        () => detectRefactors(newResources, newSourceMap, oldResources, oldSourceMap, {}, {}), 
         100
     )
-
-    if (movesFromCommands) {
-        const oldGraph = createSymbolGraph(oldSourceMapCopy, gatherResources(oldTemplate, targetFiles))
-        const newGraph = createSymbolGraph(newSourceMapCopy, gatherResources(template, targetFiles))
-        moves.push(...getMovesWithSymbols(movesFromCommands, oldGraph, newGraph))
-    }
 
     if (moves.length === 0) {
         printLine(colorize('green', 'No resources need to be moved'))
@@ -2314,16 +2461,84 @@ function showMoves(moves: MoveWithSymbols[]) {
     }
 }
 
-async function loadMovedIntoTemplate(fileName: string, template?: TfJson) {
-    const moved = await getFs().readFile(fileName, 'utf-8').then(JSON.parse)
-    if (typeof moved !== 'object' || !moved) {
+async function tryFindAutomaticMoves(state: TfState) {
+    const [oldTemplate, newTemplate] = await Promise.all([
+        bfs.maybeRestoreTemplate(),
+        bfs.getCurrentTemplate(),
+    ])
+
+    const oldSourceMap = oldTemplate?.['//']?.sourceMap
+    const newSourceMap = newTemplate?.['//']?.sourceMap
+    if (!oldSourceMap || !newSourceMap) {
+        return
+    }
+
+    const oldResources = gatherResources(oldTemplate)
+    const newResources = gatherResources(newTemplate)
+
+    const autoMoves = findAutomaticMoves(
+        state, 
+        createSymbolGraph(oldSourceMap, oldResources), 
+        createSymbolGraph(newSourceMap, newResources)
+    )
+
+    getLogger().debug('Unmatched from state', autoMoves.unmatched.state)
+    getLogger().debug('Unmatched from template', autoMoves.unmatched.template)
+
+    return autoMoves.moved
+}
+
+async function loadMovedIntoTemplate(fileName: string, merge = true) {
+    const [moved = {}, state] = await Promise.all([
+        getFs().readFile(fileName, 'utf-8').then(JSON.parse).catch(throwIfNotFileNotFoundError),
+        readState()
+    ])
+
+    if (!state) {
+        return
+    }
+
+    if (!moved || typeof moved !== 'object') {
         throw new Error(`Moved file must contain an object`)
     }
 
-    const state = await readState()
     const resourceSet = new Set(state?.resources.map(r => `${r.type}.${r.name}`))
 
-    const checked = await getMoved() ?? []
+    const [checked = [], autoMoved] = await Promise.all([
+        merge ? getMoved() : undefined,
+        tryFindAutomaticMoves(state),
+    ])
+
+    function addMove(from: string, to: string) {
+        const conflicts = checked.filter(x => x.from === from || x.to === to)
+        if (conflicts.length === 0) {
+            checked.push({ from, to })
+
+            return true
+        }
+
+        const withoutDupes = conflicts.filter(x => x.from !== from || x.to !== to)
+        if (withoutDupes.length === 0) {
+            return false
+        }
+
+        const overrides = withoutDupes.filter(x => x.to === to)
+        if (overrides.length === 1) {
+            getLogger().log(`Overriding move: ${from} [previvously ${overrides[0].from}] -> ${to}`)
+            checked.splice(checked.indexOf(overrides[0]), 1, { from, to })
+        } else {
+            getLogger().warn(`Found conflicting move: ${from} -> ${to}`, withoutDupes)
+        }
+
+        return false
+    }
+
+    if (autoMoved) {
+        for (const m of autoMoved) {
+            addMove(m.from, m.to)
+        }
+    }
+
     for (const [k, v] of Object.entries(moved)) {
         if (typeof v !== 'string') {
             throw new Error(`"from" is not a string: ${JSON.stringify(v)} [key: ${k}]`)
@@ -2336,22 +2551,18 @@ async function loadMovedIntoTemplate(fileName: string, template?: TfJson) {
             continue
         }
 
-        const conflicts = checked.filter(x => x.from === k || x.to === v)
-        if (conflicts.length > 0) {
-            const withoutDupes = conflicts.filter(x => x.from !== k || x.to !== v)
-            if (withoutDupes.length > 0) {
-                getLogger().warn(`Found conflicting move: ${k} -> ${v}`)
-            }
-            continue
-        }
-
-        checked.push({
-            from: k,
-            to: v,
-        })
+        addMove(k, v)
     }
 
-    await saveMoved(checked, template)
+    if (checked.length === 0) {
+        // We need to persist the empty set to clear out the old state
+        if (!merge) {
+            await saveMoved(checked)
+        }
+        return
+    }
+
+    await saveMoved(checked)
 
     for (const m of checked) {
         getLogger().log(`Will move: ${m.from.split('.')[1]} -> ${m.to.split('.')[1]}`)
@@ -2360,9 +2571,13 @@ async function loadMovedIntoTemplate(fileName: string, template?: TfJson) {
     return checked
 }
 
-export async function loadMoved(fileName: string) {
-    const moved = await loadMovedIntoTemplate(fileName)
-    await commitProgram()
+export async function loadMoved(fileName: string, merge?: boolean) {
+    const moved = await loadMovedIntoTemplate(fileName, merge)
+    if (moved) {
+        await commitProgram()
+    }
+
+    return moved
 }
 
 export async function machineLogin(type?: string, opt?: CombinedOptions) {
@@ -2624,6 +2839,31 @@ async function runProgramExecutable(fileName: string, args: string[]) {
     }
 }
 
+async function getChangedEnvVarsForSynth() {
+    const template = await bfs.getCurrentTemplate()
+    const envVars = template?.['//']?.envVarHashes
+    if (!envVars) {
+        getLogger().log('No environment variable hashes found')
+        return
+    }
+
+    await maybeLoadEnvironmentVariables(bfs.getProgramFs())
+
+    const diff: string[] = []
+    for (const [k, v] of Object.entries(envVars)) {
+        const current = getEnvVarHash(process.env[k])
+        if (current !== v) {
+            diff.push(k)
+        }
+    }
+
+    if (diff.length === 0) {
+        return
+    }
+
+    return diff
+}
+
 async function compileIfNeeded(target?: string, skipSynth = true) {
     // XXX: we should normalize everything at program entrypoints
     if (isWindows() && target) {
@@ -2657,6 +2897,20 @@ async function compileIfNeeded(target?: string, skipSynth = true) {
             { incremental: true, skipSummary: true, skipSynth: !!stale && skipSynth },
         )
     }
+
+    if (skipSynth) {
+        return
+    }
+
+    const diff = await getChangedEnvVarsForSynth()
+    if (diff) {
+        getLogger().log(`Synthesis environment variables changed: ${diff}`)
+
+        return compile(
+            target ? [target] : [],
+            { incremental: true, skipSummary: true },
+        )
+    }
 }
 
 async function getDeploymentStatus(target: string, deployables: Record<string, string>) {
@@ -2665,7 +2919,7 @@ async function getDeploymentStatus(target: string, deployables: Record<string, s
     const [deps, info, sources] = await Promise.all([
         incr.getCachedDependencies(path.resolve(getWorkingDir(), target)),
         getPreviousDeployInfo(),
-        readSources(),
+        bfs.readSources(),
     ])
 
     const allDeps = getAllDependencies(deps, [path.resolve(getWorkingDir(), target)])
@@ -2857,6 +3111,7 @@ async function getPreviousDeploymentProgramFs() {
     return toFsFromHash(hash)
 }
 
+// FIXME: this is wrong, we need to track the program hash per-file
 async function getPreviousDeployInfo() {
     if (!getBuildTargetOrThrow().deploymentId) {
         return
@@ -2869,7 +3124,7 @@ async function getPreviousDeployInfo() {
 
     const state = await readState()
     const oldProgramFs = await getFsFromHash(hash)
-    const deploySources = await readSources(oldProgramFs)
+    const deploySources = await bfs.readSources(oldProgramFs)
 
     return { state, hash, deploySources }
 }
@@ -2877,7 +3132,7 @@ async function getPreviousDeployInfo() {
 // TODO: we need to check if any new files were added to included dirs and
 // treat those additional files as stale
 async function getStaleSources(include?: Set<string>) {
-    const sources = await readSources()
+    const sources = await bfs.readSources()
     const hasher = getFileHasher()
     if (!sources) {
         return
@@ -2893,7 +3148,7 @@ async function getStaleSources(include?: Set<string>) {
 
         const hash = await hasher.getHash(source).catch(throwIfNotFileNotFoundError)
         if (!hash) {
-            delete sources![source]
+            delete sources![k]
         } else if (v.hash !== hash) {
             stale.add(source)
         }
@@ -2911,8 +3166,9 @@ async function getStaleDeployableSources(targets?: string[]) {
         return
     }
 
+    const resolvedOptions = await getResolvedTsConfig()
     const deployableSet = new Set(Object.keys(deployables).map(k => resolveRelative(getWorkingDir(), k)))
-    const incr = createIncrementalHost({})
+    const incr = createIncrementalHost(resolvedOptions?.options ?? {})
     const deps = await incr.getCachedDependencies(...(deployableSet))
     const allDeps = getAllDependencies(deps, targets?.map(x => resolveRelative(getWorkingDir(), x)) ?? [...deployableSet])
     
@@ -3062,13 +3318,35 @@ async function cleanTests(deploymentId = getBuildTargetOrThrow().deploymentId) {
     }
 }
 
+async function cleanDeployment(deploymentId = getBuildTargetOrThrow().deploymentId) {
+    if (deploymentId) {
+        await getDataRepository().deleteHead(`${deploymentId}`)
+    }
+}
+
 // This is safe because deployments always reference fs hashes not head IDs
-export async function clean(opt?: { packages?: boolean; tests?: boolean }) {
+export async function clean(opt?: { packages?: boolean; tests?: boolean; deployment?: boolean; program?: boolean }) {
     const bt = getBuildTargetOrThrow()
     if (opt?.tests) {
         return cleanTests(bt.deploymentId)
     }
-    await getDataRepository().deleteHead(workspaces.toProgramRef(bt))
+
+    // Potentially dangerous, can be difficult to recover
+    if (opt?.deployment) {
+        return cleanDeployment(bt.deploymentId)
+    }
+
+    // Useful for testing that compilation and deployment are deterministic.
+    // We preserve the test cache in this case. Fully deterministic builds 
+    // should not mutate the deployment nor invalidate any cached tests.
+    if (opt?.program) {
+        return getDataRepository().deleteHead(workspaces.toProgramRef(bt))
+    }
+
+    await Promise.all([
+        bt.deploymentId ? clearCachedTestResults() : undefined,
+        getDataRepository().deleteHead(workspaces.toProgramRef(bt))
+    ])
 }
 
 export async function lockedInstall() {
@@ -3108,6 +3386,14 @@ export async function inspectBlock(target: string, opt?: any) {
     printLine(colorize('green', 'No issues found'))
 }
 
+export async function printFsStats() {
+    const head = workspaces.toProgramRef(getBuildTargetOrThrow())
+    const stats = await collectStats(getDataRepository(), head)
+    await printStats(head, stats)
+
+    await printTopNLargestObjects(stats)
+}
+
 export async function runUserScript(target: string, args: string[]) {
     const loader = createMinimalLoader(target.endsWith('.ts'))
     const module = await loader.loadModule(target)
@@ -3124,7 +3410,10 @@ export async function runUserScript(target: string, args: string[]) {
 }
 
 interface BuildExecutableOpt {
+    readonly os?: 'windows' | 'linux' | 'darwin'
+    readonly arch?: 'aarch64' | 'x64'
     readonly sea?: boolean
+    readonly minify?: boolean
     readonly lazyLoad?: string[]
     readonly synapsePath?: string
 }
@@ -3173,7 +3462,7 @@ export async function buildExecutables(targets: string[], opt: BuildExecutableOp
 
     const set = new Set(Object.values(executables).map(k => path.resolve(bt.workingDirectory, k)))
 
-    async function _getNodePath() {
+    async function _getBasePath() {
         if (opt.synapsePath) {
             return opt.synapsePath
         }
@@ -3191,13 +3480,12 @@ export async function buildExecutables(targets: string[], opt: BuildExecutableOp
         }
     }
 
-    const getNodePath = memoize(_getNodePath)
+    const getBasePath = memoize(_getBasePath)
 
-    const external = ['esbuild', 'typescript', 'postject']
     // XXX: this is hard-coded to `synapse`
     const bundleOpt: InternalBundleOptions = pkg.data.name === 'synapse' ? {
-        sea: opt.sea,
-        external, 
+        ...opt,
+        external: ['esbuild', 'typescript', 'postject'], 
         lazyLoad: ['@cohesible/*', 'typescript', 'esbuild', ...lazyNodeModules],
         extraBuiltins: ['typescript', 'esbuild'],
     } : {
@@ -3206,12 +3494,19 @@ export async function buildExecutables(targets: string[], opt: BuildExecutableOp
     }
 
     if (pkg.data.name === 'synapse') {
-        process.env.SKIP_SEA_MAIN = '1'
         process.env.CURRENT_PACKAGE_DIR = pkg.directory
     }
 
     const config = (await getResolvedTsConfig())?.options
     const outDir = config?.outDir ?? 'out'
+
+    const host = resolveBuildTarget()
+    const isCrossCompilation = (opt.arch && opt.arch !== host.arch) || (opt.os && opt.os !== host.os)
+    if (isCrossCompilation) {
+        throw new Error('Cross-compilation is not yet supported')
+    }
+
+    const basePath = await getBasePath()
 
     for (const [k, v] of Object.entries(bin)) {
         const resolved = path.resolve(bt.workingDirectory, v)
@@ -3224,7 +3519,9 @@ export async function buildExecutables(targets: string[], opt: BuildExecutableOp
 
         if (opt.sea) {
             try {
-                await makeSea(res.outfile, await getNodePath(), dest, res.assets)
+                await makeSea(res.outfile, basePath, dest, {
+                    assets: res.assets, 
+                })
             } finally {
                 await getFs().deleteFile(res.outfile)
             }
@@ -3251,7 +3548,10 @@ export async function convertBundleToSea(dir: string) {
     }
 
     const seaDest = path.resolve(dir, 'bin', process.platform === 'win32' ? 'synapse.exe' : 'synapse')
-    await makeSea(bundledCliPath, nodePath, seaDest, assets, true)
+    await makeSea(bundledCliPath, nodePath, seaDest, {
+        assets,
+        sign: true,
+    })
 
     await getFs().deleteFile(nodePath)
     await getFs().deleteFile(path.resolve(dir, 'dist', 'cli.js'))
@@ -3262,4 +3562,3 @@ export async function convertBundleToSea(dir: string) {
 
     await createArchive(dir, `${dir}${process.platform === 'linux' ? `.tgz` : '.zip'}`, false)
 }
-

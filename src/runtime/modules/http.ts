@@ -490,7 +490,9 @@ interface FetchInit {
     headers?: Record<string, string>
 }
 
+export function fetch<T extends any[] = []>(route: HttpRoute<T, Blob>, ...request: T): Promise<Buffer>
 export function fetch<T extends any[] = []>(route: HttpRoute<T, Response>, ...request: T): Promise<Buffer>
+export function fetch<T extends any[] = []>(route: HttpRoute<T, AsyncIterable<TypedArray>>, ...request: T): Promise<Buffer>
 export function fetch<T extends any[] = [], R = unknown>(route: HttpRoute<T, R>, ...request: T): Promise<R>
 export function fetch(url: string, init?: FetchInit): Promise<any>
 export async function fetch(urlOrRoute: string | HttpRoute, ...args: [init?: FetchInit] | any[]): Promise<any> {
@@ -600,7 +602,7 @@ addBrowserImplementation(randomUUID, randomUUIDBrowser)
 
 function getResourceFromOptions(opt: http.RequestOptions) {
     const protocol = opt.protocol ?? 'https:'
-    const host = `${opt.host}${opt.port ? `:${opt.port}` : ''}` ?? opt.hostname
+    const host = opt.hostname ?? `${opt.host}${opt.port ? `:${opt.port}` : ''}`
     if (host) {
         return `${protocol}//${host}${opt.path ?? ''}`
     }

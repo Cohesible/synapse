@@ -6,8 +6,8 @@ import type { ReflectionOperation, ExternalValue } from './runtime/modules/serde
 import { createArrayLiteral, createLiteral, createObjectLiteral, createSymbolPropertyName, createVariableStatement, memoize, printNodes, throwIfNotFileNotFoundError } from './utils'
 import { topoSort } from './static-solver/scopes'
 import { getLogger } from './logging'
-import { Artifact, getDataRepository, getDeploymentFs } from './artifacts'
-import { PackageService, pruneManifest } from './pm/packages'
+import { Artifact } from './artifacts'
+import { pruneManifest } from './pm/packages'
 import { ModuleResolver } from './runtime/resolver'
 import { isBuiltin } from 'node:module'
 import { TerraformPackageManifest } from './runtime/modules/terraform'
@@ -18,6 +18,7 @@ import { pointerPrefix, createPointer, isDataPointer, toAbsolute, DataPointer, c
 import { getModuleType } from './static-solver'
 import { readPathKeySync } from './cli/config'
 import { isSelfSea } from './execution'
+import { parseCjsExports } from './runtime/loader'
 
 // Note: `//!` or `/*!` are considered "legal comments"
 // Using "linked" or "external" for `legalComments` creates a `.LEGAL.txt` file
@@ -410,6 +411,13 @@ function createFsPlugin(fs: Fs & SyncFs, resolver: ModuleResolver, opt: BundleOp
                 }
             })
 
+            build.onResolve({ filter: /^sea-asset:.*/ }, async args => {
+                return { 
+                    namespace: seaAssetPrefix.slice(0, -1),
+                    path: args.path.slice(seaAssetPrefix.length),
+                }
+            })
+
             build.onResolve({ filter: /^raw-sea-asset:.*/ }, async args => {
                 const importer = args.pluginData?.virtualId ?? args.importer
 
@@ -501,6 +509,15 @@ function createFsPlugin(fs: Fs & SyncFs, resolver: ModuleResolver, opt: BundleOp
             })
 
             build.onLoad({ namespace: 'lazy', filter: /.*/ }, async args => {
+                if (args.path === 'typescript') {
+                    const filePath = resolver.resolve(args.path)
+
+                    return {
+                        loader: 'js',
+                        contents: generateLazyModule(args.path, undefined, undefined, await fs.readFile(filePath, 'utf-8')),
+                    }
+                }
+
                 if (isBuiltin(args.path) || opt.extraBuiltins?.includes(args.path)) {
                     return {
                         loader: 'js',
@@ -511,6 +528,13 @@ function createFsPlugin(fs: Fs & SyncFs, resolver: ModuleResolver, opt: BundleOp
                 return {
                     loader: 'js',
                     contents: generateLazyModule(`lazy-load:${args.path}`, false, true),
+                }
+            })
+
+            build.onLoad({ namespace: seaAssetPrefix.slice(0, -1), filter: /.*/ }, async args => {
+                return {
+                    loader: 'js',
+                    contents: generateRawSeaAsset(args.path),
                 }
             })
 
@@ -585,8 +609,11 @@ function createFsPlugin(fs: Fs & SyncFs, resolver: ModuleResolver, opt: BundleOp
                         const resolved = path.resolve(getWorkingDir(), data.sourceName)
                         const compiled = await compiler(resolved)
                         const asset = serializerHost.addRawAsset(compiled.compiled)
-                        const relPath = serializerHost.addAsset!(asset).slice('file:'.length)
-                        const contents = compiled.stub.replace(`'${path.basename(resolved).replace(/\.zig$/, '.node')}'`, `'${relPath}'`)
+                        const url = serializerHost.addAsset!(asset)
+                        const [scheme, relPath] = url.split(':')
+                        const contents = scheme === 'file'
+                            ? compiled.stub.replace(`'${path.basename(resolved).replace(/\.zig$/, '.node')}'`, `'${relPath}'`)
+                            : compiled.stub.replace(`'raw-sea-asset:./${path.basename(resolved).replace(/\.zig$/, '.node')}'`, `'${url}'`)
 
                         return {
                             loader: 'js',
@@ -730,7 +757,7 @@ module.exports = { buffer, hash }
 }
 
 // The obfuscation is so `esbuild` doesn't try to re-resolve it
-function generateLazyModule(spec: string, obfuscate = true, allowDynamicLink = false) {
+function generateLazyModule(spec: string, obfuscate = true, allowDynamicLink = false, text?: string) {
     function obfuscateSpec() {
         if (!obfuscate) {
             return ts.factory.createStringLiteral(spec)
@@ -786,6 +813,98 @@ function generateLazyModule(spec: string, obfuscate = true, allowDynamicLink = f
                 undefined,
             )]
         )
+    }
+
+    function renderFromSymbols(symbols: string[]) {
+        function defProp(key: ts.Expression, desc: ts.Expression) {
+            return ts.factory.createCallExpression(
+                ts.factory.createPropertyAccessExpression(
+                    ts.factory.createIdentifier('Object'),
+                    'defineProperty'
+                ),
+                undefined,
+                [
+                    ts.factory.createPropertyAccessExpression(
+                        ts.factory.createIdentifier('module'),
+                        'exports'
+                    ),
+                    key,
+                    desc,
+                ]
+            )
+        }
+
+        const prop = ts.factory.createIdentifier('prop')
+        const mod = ts.factory.createIdentifier('mod')
+
+        // `Object.defineProperties` _might_ be faster with an object literal, possibly not though
+        const defLazy = ts.factory.createFunctionDeclaration(
+            undefined,
+            undefined,
+            'lazy',
+            undefined,
+            [ts.factory.createParameterDeclaration(undefined, undefined, 'prop')],
+            undefined,
+            ts.factory.createBlock([
+                ts.factory.createExpressionStatement(
+                    defProp(
+                        prop,
+                        createObjectLiteral({
+                            enumerable: true,
+                            configurable: true,
+                            get: ts.factory.createArrowFunction(
+                                undefined,  
+                                undefined, 
+                                [], 
+                                undefined, 
+                                undefined,
+                                ts.factory.createBlock([
+                                    createVariableStatement('mod', loadModule()),
+        
+                                    ts.factory.createExpressionStatement(defProp(prop, 
+                                        ts.factory.createCallExpression(
+                                            ts.factory.createPropertyAccessExpression(
+                                                ts.factory.createIdentifier('Object'),
+                                                'getOwnPropertyDescriptor'
+                                            ),
+                                            undefined,
+                                            [mod, prop]
+                                        )
+                                    )),
+
+                                    ts.factory.createReturnStatement(
+                                        ts.factory.createElementAccessExpression(mod, prop)
+                                    )
+                                ], true)
+                            )
+                        })
+                    )
+                ),
+            ])
+        )      
+        
+        const statements = [
+            defLazy,
+            ...symbols.map(x => ts.factory.createCallExpression(
+                defLazy.name!,
+                undefined,
+                [ts.factory.createStringLiteral(x)]
+            )),
+        ]
+
+        return printNodes(statements)
+    }
+
+    // Only used for `typescript` currently
+    if (text) {
+        const parsed = parseCjsExports(text, true)
+        if (parsed?.exports && parsed.exports.length > 0) {
+            getLogger().log('Found symbols for lazy module', spec)
+
+            return renderFromSymbols(parsed.exports)
+        } else {
+            getLogger().log('Failed to parse exports for lazy module', spec)
+        }
     }
 
     const loader = ts.factory.createFunctionDeclaration(
@@ -864,8 +983,6 @@ function generateLazyModule(spec: string, obfuscate = true, allowDynamicLink = f
             })
         ]
     )
-
-    
 
     const statements = [
         loader,

@@ -4,7 +4,7 @@ import { Fs, SyncFs } from '../system'
 import { getWorkingDir } from '../workspaces'
 import { SourceMapHost } from '../static-solver/utils'
 import { SourceMapV3, mergeSourcemaps } from '../runtime/sourceMaps'
-import { AmbientDeclarationFileResult, isRelativeSpecifier, makeRelative, memoize, resolveRelative, toAmbientDeclarationFile } from '../utils'
+import { AmbientDeclarationFileResult, isRelativeSpecifier, makeRelative, memoize, resolveRelative, strcmp, toAmbientDeclarationFile } from '../utils'
 
 
 function getLongestCommonPrefix(paths: string[]) {
@@ -208,7 +208,7 @@ export function createDeclarationFileHost(fs: Fs & SyncFs, sourcemapHost: Source
 
     async function createAmbientDeclarations() {
         const files: Record<string, { name: string; text: string; sourcemap: string }> = {}
-        const sorted = Array.from(ambientDeclFileMap.entries()).sort((a, b) => a[1].id.localeCompare(b[1].id))
+        const sorted = Array.from(ambientDeclFileMap.entries()).sort((a, b) => strcmp(a[1].id, b[1].id))
         for (const [k, v] of sorted) {
             files[v.id] = finalizeResult(k, v)
         }

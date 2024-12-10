@@ -9,26 +9,35 @@ export interface Symbol {
     line: number // 0-indexed
     column: number // 0-indexed
     fileName: string
+    packageRef?: string
 }
 
 /** @internal */
 export interface Scope {
-    name?: string
     moduleId?: string
     contexts?: any[]
     namespace?: Symbol[] // This is only relevant for property accesses
     isNewExpression?: boolean
-    isStandardResource?: boolean
+    // isStandardResource?: boolean
 
     // Used for mapping resource instantiations to source code 
     symbol?: Symbol
 
     assignmentSymbol?: Symbol
+
+    declarationScope?: Symbol[]
+}
+
+interface InternalContext {
+    run: (scope: Scope, fn: (...args: any[]) => any, ...args: any[]) => any
+    bind: (fn: (...args: any[]) => any) => typeof fn
+    get: (type: string) => any
+    getDeclScopeKey: () => string | undefined
 }
 
 declare function __getCurrentId(): string
 declare function __symEval(target: any, args: any[]): any
-declare function __getContext(): { run(scope: Scope, fn: (...args: any[]) => any, ...args: any[]): any, get: (type: string) => any }
+declare function __getContext(): InternalContext
 declare function __getBuildDirectory(): string
 declare function __getBackendClient(): BackendClient
 declare function __requireSecret(envVar: string, type: string): void 
@@ -159,9 +168,27 @@ export function getLogger(): Logger {
     return __getLogger()
 }
 
+export function getCaptured(target: any): any[] {
+    if (typeof target !== 'function') {
+        throw new Error('Only functions and classes have captured values')
+    }
+
+    const desc = target[moveable]?.()
+    if (!desc) {
+        throw new Error('Missing capture instrumentation')
+    }
+
+    if (!desc?.captured) {
+        throw new Error('Missing captured values')
+    }
+
+    return desc.captured
+}
+
 export const context = Symbol.for('synapse.context')
 export const contextType = Symbol.for('synapse.contextType')
 const permissions = Symbol.for('synapse.permissions')
+const moveable = Symbol.for('__moveable__')
 const moveable2 = Symbol.for('__moveable__2')
 
 type Binding<T extends any[], R, U = void> = ((this: U, ...args: T) => R)
@@ -340,13 +367,21 @@ export function defer(fn: () => void) {
 }
 
 declare function __createUnknown(): any
-
 export function createUnknown() {
     if (typeof __createUnknown === 'undefined') {
         failMissingRuntime('createUnknown')
     }
     
     return __createUnknown()
+}
+
+declare function __isUnknown(val: any): boolean
+export function isUnknown(val: any) {
+    if (typeof __isUnknown === 'undefined') {
+        failMissingRuntime('isUnknown')
+    }
+    
+    return __isUnknown(val)
 }
 
 interface LocalMetadata {
@@ -465,6 +500,23 @@ export function getOutputDirectory() {
     return __getBuildDirectory()
 }
 
+// TODO: should this exist on the resource class?
+/** @internal */
+export function getOwnResourceName(): string {
+    if (typeof __getContext === 'undefined') {
+        return failMissingRuntime('getOwnResourceName')
+    }
+
+    const name = __getContext().get('resource')?.[0]
+    if (!name) {
+        throw new Error('Missing resource name')
+    } else if (typeof name !== 'string') {
+        throw new Error(`Unexpected resource name type: ${name === null ? 'null' : typeof name}`)
+    }
+
+    return name
+}
+
 export declare function addTarget<
     T extends abstract new (...args: any[]) => any, 
     U extends T
@@ -506,11 +558,12 @@ export function defineResource<
 export function defineResource(
     definition: ResourceDefinition
 ): ResourceConstructor {
-    if (typeof __getCurrentId === 'undefined' || typeof arguments[1] !== 'string') {
+    const scope = typeof arguments[1] === 'object' ? arguments[1] : undefined
+    if (typeof __getCurrentId === 'undefined' || !scope) {
         return (class {}) as any
     }
 
-    return createCustomResourceClass(arguments[1], definition)
+    return __getContext().run(scope , () => createCustomResourceClass(definition))
 }
 
 type SerializeableKeys<T> = { [P in keyof T]: T[P] extends (...args: any[]) => any ? never : P }[keyof T]
@@ -525,14 +578,6 @@ export function using<T, U>(ctx: T, fn: (ctx: T) => U): U {
     }
 
     return __getContext().run({ contexts: Array.isArray(ctx) ? ctx : [ctx] }, fn)
-}
-
-export function move(from: string, to?: string) {
-    return terraform.move(from, to)
-}
-
-export function fixupScope(name: string) {
-    return terraform.fixupScope(name)
 }
 
 /**
@@ -636,11 +681,12 @@ export function defineDataSource<T, U extends any[]>(
     handler: (...args: U) => Promise<T> | T,
     opt?: { forceRefresh?: boolean }
 ): (...args: U) => T {
-    if (typeof __getCurrentId === 'undefined' || typeof arguments[arguments.length - 1] !== 'string') {
+    const scope = typeof arguments[arguments.length - 1] === 'object' ? arguments[arguments.length - 1] : undefined
+    if (typeof __getCurrentId === 'undefined' || !scope) {
         return (() => {}) as any
     }
-    
-    const ds = createCustomResourceClass(arguments[arguments.length - 1], { data: handler })
+
+    const ds = __getContext().run(scope, () => createCustomResourceClass({ data: handler }))
 
     return (...args) => {
         const v = ds.import(...args)
@@ -655,12 +701,6 @@ export function defineDataSource<T, U extends any[]>(
 export function stubWhenBundled(target: any) {
     Object.assign(target, { [terraform.stubWhenBundled]: true })
 }
-
-// Common node symbols that are useful in general
-// declare global {
-//     var __filename: string
-//     var __dirname: string
-// }
 
 interface SynapseProviderProps {
     readonly endpoint: string
@@ -699,7 +739,8 @@ interface ClosureProps {
     readonly globals?: any
     readonly location?: string
     readonly options?: any
-    readonly source?: string
+    readonly source?: string    
+    readonly kindHint?: string
 }
 
 interface ClosureOutput {
@@ -713,27 +754,6 @@ export const Closure = terraform.createSynapseClass<ClosureProps, ClosureOutput>
 /** @internal */
 export const Artifact = terraform.createSynapseClass<{ url: string }, { filePath: string }>('Artifact', 'data-source')
 
-interface ModuleExportsProps {
-    readonly source: string
-    readonly exports: any
-}
-
-const Exported = terraform.createSynapseClass<ModuleExportsProps, { pointer: string }>('ModuleExports')
-
-/** @internal */
-export class ModuleExports extends Exported {
-    constructor(source: string, exports: any) {
-        const id = source.replace(/\.(.*)$/, '').replace(/\//g, '--')
-
-        super({
-            source,
-            exports: new SerializedObject(exports, id + '-exports').filePath,
-        })
-
-        terraform.overrideId(this, id)
-    }
-}
-
 interface CustomResourceProps {
     readonly type: string
     readonly handler: string
@@ -746,15 +766,13 @@ export const Custom = terraform.createSynapseClass<CustomResourceProps, any>('Cu
 /** @internal */
 export const CustomData = terraform.createSynapseClass<CustomResourceProps, any>('CustomData', 'data-source')
 
-class Export extends Closure {
-    public constructor(id: string, target: any) {
+class Definition extends Closure {
+    public constructor(target: any) {
         super({
-            source: `${id.replace(/--/g, '-')}.ts`,
+            kindHint: 'definition',
             options: { bundled: false },
-            captured: new SerializedObject(target, id + '-captured').filePath,
+            captured: new SerializedObject(target).filePath,
         })
-
-        terraform.overrideId(this, id)
     }
 }
 
@@ -801,52 +819,24 @@ class CustomDataClass extends CustomData {
     }
 }
 
-const resourceDefinitionIds = new Map<string, number>()
-function createCustomResourceClass(id: string, definition: any): any {
-    let def: Export
-
-    // XXX: definitions should use `getCurrentId`, `id` is too static
-    // TODO: we need to make sure that scopes aren't being captured from 
-    // lazy eval during target binding, right now `getCurrentId` itself is
-    // too unstable for class ctor instantiation
-    if (resourceDefinitionIds.has(id)) {
-        const base = id
-        const count = resourceDefinitionIds.get(base)!
-        id = `${base}-${count}`
-
-        resourceDefinitionIds.set(base, count + 1)
-    } else {
-        resourceDefinitionIds.set(id, 1)
-    }
+function createCustomResourceClass(definition: any): any {
+    const createDef = __getContext().bind(() => new Definition(definition))
 
     // Lazy init
-    const getDef = () => {
-        if (def === undefined) {
-            return def = new Export(id, definition)
-        }
-
-        // TODO: this probably isn't needed despite being "technically correct"
-        // We want to strip `testContext` if the shared def is referenced outside of a test
-        const state = (def as any)[terraform.internalState]
-        if (state?.testContext) {
-            const current = __getContext().get('test-suite')?.[0]
-            if (!current) {
-                delete state['testContext']
-            }
-        }
-
-        return def
-    }
+    let def: Definition
+    const getDef = () => def ??= createDef()
 
     return class extends CustomResource {
-        static [terraform.customClassKey] = id
+        static get [terraform.customClassKey]() {
+            return terraform.getResourceName(getDef())
+        }
 
         constructor(...args: any[]) {
-            super(id, getDef().destination, ...args)
+            super(terraform.getResourceName(getDef()), getDef().destination, ...args)
         }
 
         static import(...args: any[]) {
-            return new CustomDataClass(id, getDef().destination, ...args)
+            return new CustomDataClass(terraform.getResourceName(getDef()), getDef().destination, ...args)
         }
     }
 }
@@ -976,13 +966,6 @@ export class LogProvider extends ApiRegistration {
             kind: 'log-provider',
             config: new SerializedObject(props).filePath,
         })
-
-        // TODO: modules should be bound with the context they're referenced in
-        // rather than the context they're loaded in. 
-        //
-        // Overriding ensures a stable resource key when the resource is created on
-        // module load. But it means only one resource can exist.
-        terraform.overrideId(this, `LogProvider-${props.resourceType.replaceAll('.', '-')}`)
     }
 }
 
@@ -998,4 +981,50 @@ export function registerLogProvider<T extends object>(
     const resourceType = key.split('.').slice(1).join('.')
 
     return new LogProvider({ resourceType, queryLogs })
+}
+
+// Constructor -> scope key -> instance info (TODO: validate args are the same)
+const singletons = new Map<any, Map<string, { instance: any; args: any[] }>>()
+
+function getInstances(ctor: any) {
+    const instances = singletons.get(ctor)
+    if (instances) {
+        return instances
+    }
+
+    const m = new Map<string, { instance: any; args: any[] }>()
+    singletons.set(ctor, m)
+    
+    return m
+}
+
+/** 
+ * @internal 
+ * 
+ * Keys the target constructor using the per-module callsite
+ */
+export function singleton<T extends new (...args: any[]) => any>(ctor: T, ...args: ConstructorParameters<T>): InstanceType<T> {
+    if (typeof __getContext === 'undefined') {
+        failMissingRuntime('singleton')
+    }
+
+    const context = __getContext()
+    if (typeof context.getDeclScopeKey === 'undefined') {
+        throw new Error(`Cannot use 'singleton' inside a deployment context`)
+    }
+
+    const key = context.getDeclScopeKey()
+    if (!key) {
+        throw new Error('No scope key available')
+    }
+
+    const instances = getInstances(ctor)
+    if (instances.has(key)) {
+        return instances.get(key)!.instance
+    }
+
+    const instance = new ctor(...args)
+    instances.set(key, { instance, args })
+
+    return instance
 }

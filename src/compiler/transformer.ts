@@ -1,6 +1,6 @@
 import ts from 'typescript'
 import * as path from 'node:path'
-import { createObjectLiteral, getInstantiationName, failOnNode, inferName, isExported, splitExpression, isRelativeSpecifier, getNodeLocation, printNodes, createVariableStatement, isSymbolAssignmentLike } from '../utils'
+import { createObjectLiteral, failOnNode, isExported, splitExpression, isRelativeSpecifier, getNodeLocation, printNodes, createVariableStatement, isSymbolAssignmentLike } from '../utils'
 import { createGraphCompiler, createImporterExpression, createStaticSolver } from '../static-solver'
 import type { Scope } from '../runtime/modules/core' // must be a type import!
 import { parseDirectives } from '../runtime/sourceMaps'
@@ -90,6 +90,9 @@ function isExternalImport(graphCompiler: ReturnType<typeof createGraphCompiler>,
     return false
 }
 
+const coreModuleName = 'synapse:core'
+const testModuleName = 'synapse:test'
+
 export function getCoreImportName(graphCompiler: ReturnType<typeof createGraphCompiler>, node: ts.Node) {
     const fqn = getFqn(graphCompiler, ts.getOriginalNode(node))
     if (!fqn) {
@@ -97,21 +100,18 @@ export function getCoreImportName(graphCompiler: ReturnType<typeof createGraphCo
     }
 
     const { module, name } = getFqnComponents(fqn)
-    if (module === 'synapse:core') {
+    if (module === coreModuleName) {
         return name
     }
 }
 
-function getLibImportName(graphCompiler: ReturnType<typeof createGraphCompiler>, node: ts.Node) {
-    const fqn = getFqn(graphCompiler, ts.getOriginalNode(node))
+function getSymbolFqnComponents(graphCompiler: ReturnType<typeof createGraphCompiler>, node: ts.Node) {
+    const fqn = getFqn(graphCompiler, node)
     if (!fqn) {
         return
     }
 
-    const { module, name } = getFqnComponents(fqn)
-    if (module === 'synapse:lib') {
-        return name
-    }
+    return getFqnComponents(fqn)
 }
 
 // TODO: put this cache somewhere else so it can be cleared during `watch`
@@ -186,7 +186,6 @@ export function getCallableDirective(node: ts.Node) {
 
 export type ResourceTransformer = ReturnType<typeof createTransformer>
 export function createTransformer(
-    workingDirectory: string, // For symbols
     context: ts.TransformationContext, 
     graphCompiler: ReturnType<typeof createGraphCompiler>,
     schemaFactory: SchemaFactory,
@@ -195,7 +194,7 @@ export function createTransformer(
     const factory = context.factory
     const bindings = new Map<FQN, Binding[]>()
     const staticSolver = createStaticSolver()
-    const scopeSymbolProvider = createSymbolProvider()
+    const scopeSymbolProvider = createSymbolProvider(graphCompiler.moduleType)
     const assignmentCache = new Map<ts.Node, Scope['assignmentSymbol'] | undefined>()
     const needsValidationImport = new Map<ts.Node, any>()
     const sourceDeltas = new Map<ts.Node, { line: number; column: number }>()
@@ -237,10 +236,16 @@ export function createTransformer(
                 const n = ts.getOriginalNode(node)  
                 const name = inferName(n)
                 if (!name) {
-                    failOnNode('No name found', n)
+                    failOnNode('Failed to infer resource type identifier', n)
                 }
 
-                return createConfigurationClass(node, name, workingDirectory, factory)
+                const symbol = scopeSymbolProvider.getIdentSymbol(name, deltas)
+
+                return createConfigurationClass(
+                    node,
+                    { symbol, namespace: undefined, declarationScope: undefined, assignmentSymbol: undefined, isNewExpression: undefined },
+                    context.factory
+                )
             } else if (importName === 'check') {
                 needsValidationImport.set(ts.getOriginalNode(node).getSourceFile(), true)
 
@@ -284,14 +289,26 @@ export function createTransformer(
                 return ts.visitEachChild(node, visit, context)
             }
 
-            const isNotCoreReceiver = !getCoreImportName(graphCompiler, getRootTarget(original))
-            if (isNotCoreReceiver) {
-                const name = getInstantiationName(node)
+            const symbolComponents = getSymbolFqnComponents(graphCompiler, getRootTarget(original))
+
+            // `singleton` needs access to scope info
+            const isSingleton = symbolComponents?.module === coreModuleName && symbolComponents.name === 'singleton'
+            const canAddScope = (
+                isSingleton || 
+                !symbolComponents || 
+                (symbolComponents.module === testModuleName 
+                    ? !symbolComponents.name.startsWith('expect') 
+                    : symbolComponents.module !== coreModuleName)
+            )
+            if (canAddScope) {
+                const declarationScope = isSingleton ? getDeclarationScope(original, scopeSymbolProvider) : undefined
+
                 if (deltas) {
                     const { symbol, namespace } = getSymbolForSourceMap(original, scopeSymbolProvider, deltas)
 
                     return wrapScope(
-                        { name, symbol, namespace },
+                        // Keep the shape the same as in the non-deltas case
+                        { symbol, namespace, declarationScope, assignmentSymbol: undefined, isNewExpression: undefined },
                         ts.visitEachChild(node, visit, context),
                         isAsync(node),
                         context.factory
@@ -301,10 +318,10 @@ export function createTransformer(
                 const { symbol, namespace } = getSymbolForSourceMap(original, scopeSymbolProvider)
                 const assignmentSymbol = getAssignmentSymbol(original, scopeSymbolProvider, assignmentCache)
                 const isNewExpression = node.kind === ts.SyntaxKind.NewExpression ? true : undefined
-                const ty = resourceTypeChecker.getNodeType((original as ts.CallExpression | ts.NewExpression).expression)
+                // const ty = resourceTypeChecker.getNodeType((original as ts.CallExpression | ts.NewExpression).expression)
 
                 return wrapScope(
-                    { name, symbol, assignmentSymbol, namespace, isNewExpression, isStandardResource: ty?.intrinsic },
+                    { symbol, namespace, declarationScope, assignmentSymbol, isNewExpression },
                     ts.visitEachChild(node, visit, context),
                     isAsync(node),
                     context.factory
@@ -358,28 +375,161 @@ export function createTransformer(
     }
 }
 
-function createSymbolProvider() {
+function getIdentifierLikeText(node: IdentifierLike) {
+    switch (node.kind) {
+        case ts.SyntaxKind.ThisKeyword:
+            return 'this'
+        case ts.SyntaxKind.SuperKeyword:
+            return 'super'
+
+        case ts.SyntaxKind.Identifier:
+        case ts.SyntaxKind.PrivateIdentifier:
+        case ts.SyntaxKind.StringLiteral:
+        case ts.SyntaxKind.NoSubstitutionTemplateLiteral:
+            return node.text
+    }
+}
+
+function getDeclarationScope(node: ts.Node, symbolProvider: ReturnType<typeof createSymbolProvider>): NonNullable<Scope['symbol']>[] {
+    const nodes: IdentifierLike[] = []
+
+    let n = node.parent
+    while (n) {
+        switch (n.kind) {
+            case ts.SyntaxKind.NewExpression:
+            case ts.SyntaxKind.CallExpression:
+                // TODO: needs to unwrap unary expressions
+                if ((n as ts.CallExpression).arguments.find(x => x === node)) {
+                    failOnNode('Cannot have declaration scope key in a call argument', node)
+                }
+                break
+            
+            case ts.SyntaxKind.FunctionDeclaration:
+            case ts.SyntaxKind.FunctionExpression:
+            case ts.SyntaxKind.ClassDeclaration:
+            case ts.SyntaxKind.ClassExpression:
+                if ((n as ts.ClassDeclaration).name) {
+                    nodes.push((n as ts.ClassDeclaration).name!)
+                }
+                break
+
+            case ts.SyntaxKind.VariableDeclaration:
+            case ts.SyntaxKind.PropertyDeclaration:
+            case ts.SyntaxKind.PropertyAssignment: {
+                const name = (n as ts.PropertyDeclaration | ts.PropertyAssignment | ts.VariableDeclaration).name
+                if (ts.isIdentifier(name)) {
+                    nodes.push(name)
+                }
+                break
+            }
+
+            case ts.SyntaxKind.Parameter:
+                if (ts.isParameterPropertyDeclaration(n, n.parent)) {
+                    nodes.push(n.name)
+                }
+                break
+        }
+
+        n = n.parent
+    }
+
+    return nodes.map(n => symbolProvider.getIdentSymbol(n)).reverse()
+}
+
+// Handles these cases:
+// * Properties e.g. { <name>: <node> }
+// * Functions e.g. <node function <name> { ... }>
+// * Classes e.g. <node class <name> { ... }>
+// * Variable declarations e.g. [const|let|var] <name> = <node> 
+// * Inheritance e.g. `<name> extends <node>
+export function inferName(node: ts.Node): IdentifierLike | undefined {
+    if (ts.isIdentifier(node) || ts.isPrivateIdentifier(node)) {
+        return node
+    }
+
+    if (ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node) || ts.isFunctionExpression(node) || ts.isClassExpression(node)) {
+        if (node.name) {
+            return node.name
+        }
+    }
+
+    if (ts.isArrowFunction(node)) {
+        return inferName(node.parent)
+    }
+
+    if (node.parent && isSymbolAssignmentLike(node.parent)) {
+        const name = node.parent.name
+        if (isIdentifierLike(name)) {
+            return name
+        }
+
+        // TODO: bindings, computed names
+        return
+    }
+
+    if (node.parent?.parent && ts.isHeritageClause(node.parent.parent)) {
+        const name = node.parent.parent.parent.name
+        if (name) {
+            return name
+        }
+    }
+
+    if (node.parent.kind === ts.SyntaxKind.ParenthesizedExpression) {
+        return inferName(node.parent)
+    }
+}
+
+function createSymbolProvider(mode: 'cjs' | 'esm' = 'cjs') {
     const cache = new Map<ts.Node, Scope['symbol']>()
 
-    function getIdentSymbol(node: ts.Identifier, deltas?: { line: number; column: number }) {
-        if (cache.has(node) && !deltas) {
+    const virtualIdNode = mode === 'cjs'
+        ? ts.factory.createPropertyAccessExpression(
+            ts.factory.createIdentifier('module'),
+            '__virtualId'
+        )
+        : ts.factory.createPropertyAccessExpression(
+            ts.factory.createPropertyAccessExpression(
+                ts.factory.createIdentifier('import'),
+                'meta'
+            ),
+            '__virtualId'
+        )
+
+    function getIdentSymbol(node: IdentifierLike, deltas?: { line: number; column: number }) {
+        if (cache.has(node)) {
+            if (deltas) {
+                const cached = cache.get(node)!
+
+                return {
+                    ...cached,
+                    line: cached.line - deltas.line,
+                    column: cached.column - deltas.column,
+                }
+            }
+
             return cache.get(node)!
         }
-    
+
         const sf = node.getSourceFile()
         const pos = node.pos + node.getLeadingTriviaWidth(sf)
         const lc = sf.getLineAndCharacterOfPosition(pos)
         const sym: Scope['symbol'] = {
-            name: node.text,
-            line: lc.line - (deltas?.line ?? 0),
-            column: lc.character - (deltas?.column ?? 0),
-            fileName: ts.factory.createIdentifier('__filename') as any,
+            name: getIdentifierLikeText(node),
+            line: lc.line,
+            column: lc.character,
+            fileName: virtualIdNode as any,
         }
-    
-        if (!deltas) {
-            cache.set(node, sym)
+
+        cache.set(node, sym)
+
+        if (deltas) {
+            return {
+                ...sym,
+                line: sym.line - deltas.line,
+                column: sym.column - deltas.column,
+            }
         }
-    
+
         return sym
     }
 
@@ -434,6 +584,23 @@ function getAssignmentSymbol(node: ts.Node, symbolProvider: ReturnType<typeof cr
     }
 }
 
+// TODO: expand this to "computed" identifiers
+type IdentifierLike = ts.Identifier | ts.PrivateIdentifier | ts.StringLiteralLike | ts.ThisExpression | ts.SuperExpression
+
+function isIdentifierLike(node: ts.Node): node is IdentifierLike {
+    switch (node.kind) {
+        case ts.SyntaxKind.ThisKeyword:
+        case ts.SyntaxKind.SuperKeyword:
+        case ts.SyntaxKind.Identifier:
+        case ts.SyntaxKind.PrivateIdentifier:
+        case ts.SyntaxKind.StringLiteral:
+        case ts.SyntaxKind.NoSubstitutionTemplateLiteral:
+            return true
+        
+        default: return false
+    }
+}
+
 type TfSymbol = NonNullable<Scope['symbol']>
 function getSymbolForSourceMap(
     node: ts.Node, 
@@ -444,7 +611,7 @@ function getSymbolForSourceMap(
         return {}
     }
 
-    const expressions = splitExpression((node as ts.CallExpression | ts.NewExpression).expression).filter(ts.isIdentifier)
+    const expressions = splitExpression((node as ts.CallExpression | ts.NewExpression).expression).filter(isIdentifierLike)
     if (expressions.length === 0) {
         return {}
     }
@@ -464,26 +631,16 @@ export interface Binding {
 
 function createConfigurationClass(
     node: ts.CallExpression, 
-    type: string,
-    workingDirectory: string,
+    typeScope: Scope,
     factory = ts.factory
 ) {
-    // FIXME: this is not robust for "shared" packages. The loader should probably prepend the module specifier
-    const fileName = path.relative(workingDirectory, ts.getOriginalNode(node).getSourceFile().fileName)
-        .replace(/\.(j|t)sx?$/, '')
-        .replaceAll(path.sep, '--')
-
-    getLogger().log(`resource handler ${fileName} -> "${type}"`)
-
     const callExp = factory.updateCallExpression(
         node,
         node.expression,
         node.typeArguments,
         [
             ...node.arguments,
-            factory.createStringLiteral(fileName + '--' + type + '--' + 'definition'), 
-            // TODO: use this instead
-            // factory.createStringLiteral(type + '--' + 'definition'), 
+            createObjectLiteral(typeScope as any)
         ]
     )
 
@@ -491,7 +648,7 @@ function createConfigurationClass(
 }
 
 function isAsync(node: ts.Node): boolean {
-    // Most common case   
+    // Most common case
     if (node.kind === ts.SyntaxKind.CallExpression || node.kind === ts.SyntaxKind.NewExpression) {
         const exp = node as ts.CallExpression | ts.NewExpression
         if (isAsync(exp.expression)) {
@@ -649,7 +806,7 @@ function wrapScope(
     factory = ts.factory
 ) {
     const wrapped = runWithContext([
-        createObjectLiteral({ ...scope } as any, factory),
+        createObjectLiteral(scope as any, factory),
         factory.createArrowFunction(
             isAsync ? [factory.createModifier(ts.SyntaxKind.AsyncKeyword)] : undefined,
             undefined,
@@ -774,6 +931,10 @@ export function generateModuleStub(tscRootDir: string, graphCompiler: ReturnType
                 exports.push(sym.name)
             }
         }
+    }
+
+    if (exports.length === 0) {
+        return sf
     }
 
     const moduleName = path.relative(tscRootDir, sf.fileName)

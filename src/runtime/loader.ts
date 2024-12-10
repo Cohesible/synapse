@@ -297,7 +297,7 @@ function parseTscHeader(text: string) {
 // TODO: handle cases where whitespace is minified
 const esbuildHintStart = '0 && (module.exports = {'
 
-function parseCjsExports(text: string) {
+export function parseCjsExports(text: string, parseTypescriptLib = false) {
     // `tsc` can emit this near the top of the file
     const parsedTscHints = parseTscHeader(text)
     if (parsedTscHints) {
@@ -329,6 +329,31 @@ function parseCjsExports(text: string) {
             }
         }
     }
+
+    if (!parseTypescriptLib) {
+        return
+    }
+
+    // `typescript` doesn't work with the above
+    const maybeStart = text.lastIndexOf('0 &&')
+    if (maybeStart !== -1) {
+        const matchingBrace = text.indexOf('{', maybeStart)
+        if (matchingBrace !== -1) {
+            const s = text.slice(matchingBrace - esbuildHintStart.length + 1, matchingBrace + 1)
+            if (s === esbuildHintStart) {
+                const lastSemicolonParen = text.indexOf('});', matchingBrace + 1)
+                if (lastSemicolonParen !== -1) {
+                    const lines = text.slice(matchingBrace + 1, lastSemicolonParen).split('\n')
+                    const exports = lines.map(l => l.trim()).map(l => l.endsWith(',') ? l.slice(0, -1) : l).filter(l => !!l)
+
+                    return {
+                        exports,
+                        reexports: [],
+                    }
+                }
+            }
+        }
+    }
 }
 
 function isPromise<T>(obj: T | Promise<T>): obj is Promise<T> {
@@ -354,6 +379,7 @@ export interface Module {
     readonly fileName?: string   // Physical location, identifies the code itself
 
     readonly typeHint?: ModuleTypeHint
+    readonly altFileName?: string // XXX: temporary hack for native modules
 
     cjs?: CjsModule
     esm?: Promise<vm.Module> | vm.Module
@@ -650,12 +676,23 @@ export function createModuleLinker(fs: Pick<SyncFs, 'readFileSync'>, resolver: M
         const resolved = resolver.resolveVirtualWithHint(spec, importer)
         const hasTypeHint = typeof resolved !== 'string'
         const id = hasTypeHint ? resolved[0] : resolved
-        const fileName = resolver.getFilePath(id)
         if (modules[id]) {
             return modules[id]
         }
 
+        const fileName = resolver.getFilePath(id)
         const typeHint = !hasTypeHint ? getTypeHint(spec, fileName) : resolved[1]
+        // FIXME: get rid of this condition. It's currently needed to load
+        // native modules from non-root packages.
+        if (typeHint === 'pointer' && importer.endsWith('.zig.js')) {
+            return modules[id] = {
+                id,
+                name: spec,
+                fileName,
+                typeHint,
+                altFileName: resolver.getFilePath(importer),
+            }
+        }
 
         return modules[id] = {
             id,
@@ -750,11 +787,11 @@ export function createModuleLinker(fs: Pick<SyncFs, 'readFileSync'>, resolver: M
             return createEsm(module)
         }
 
-        if (!module.fileName) {
+        const fileName = module.fileName
+        if (!fileName) {
             throw new Error(`Only built-in modules can be missing a filename`)
         }
 
-        const fileName = module.fileName
         const extname = path.extname(fileName)
         switch (extname) {
             case '.json':
@@ -979,6 +1016,7 @@ export function createModuleLoader(
         return require(id)
     }
 
+    // TODO: should be async
     function createEsm(m: Module, opt?: ModuleCreateOptions) {
         let data: string
 
@@ -1100,7 +1138,7 @@ export function createModuleLoader(
 
             // Native module
             if (Array.isArray(data) && data.length === 2) {
-                return createScript(data[0], data[1], pointer.hash)
+                return createScript(data[0], m.altFileName ?? data[1], pointer.hash)
             }
 
             return createSyntheticCjsModule(() => loadPointerData(data, m.id, ctx))
@@ -1283,16 +1321,14 @@ export function createSyntheticCjsModule(evaluate: (module: any) => any) {
     return cjs
 }
 
-function wrapCode(text: string, params: string[]) {
-    const sanitized = text.startsWith('#!')
+const params =  ['require', '__filename', '__dirname', 'module', 'exports']
+const paramsString = params.join(',')
+function wrapCode(text: string) {
+    const sanitized = text[0] === '#' && text[1] === '!'
         ? text.replace(/^#!.*/, '')
         : text
 
-    return `
-(function (${params.join(',')}) {
-${sanitized}
-})(${params.join(',')})
-`.trim()
+    return `(function (${paramsString}) {\n${sanitized}\n})(${paramsString})`
 }
 
 const minScriptLengthForCaching = 1_000
@@ -1397,7 +1433,7 @@ export function createScriptModule(
     
     function compileScript() {
         try {
-            return new vm.Script(wrapCode(text, ['require', '__filename', '__dirname', 'module', 'exports']), {
+            return new vm.Script(wrapCode(text), {
                 filename: sourceMapParser && key ? key : location,
                 cachedData,
                 lineOffset: -1, // The wrapped code has 1 extra line before and after the original code

@@ -99,6 +99,7 @@ function createLogService() {
 
         const queries: Promise<LogEventWithResource[] | void>[] = []
         for (const [k, v] of Object.entries(res)) {
+            getLogger().log(`Querying resource "${k}" for logs`)
             const eventsPromise = doQuery(k).catch(e => {
                 getLogger().warn(`Failed to get logs from resource "${k}"`, e)
             })

@@ -1,13 +1,7 @@
 const std = @import("std");
 const Type = std.builtin.Type;
 
-//const synapse_builtin = @import("synapse_builtin");
-const synapse_builtin = .{
-    .features = .{
-        .threadpool_schedule = false,
-        .fast_calls = true,
-    }
-};
+const synapse_builtin = @import("synapse_builtin");
 
 extern fn napi_fatal_error(location: [*:0]const u8, location_len: usize, message: [*:0]const u8, message_len: usize) noreturn;
 
@@ -1123,6 +1117,40 @@ fn MakeInit(comptime desc: ModuleDescriptor) type {
     };
 }
 
+fn findFastCallDecl(comptime T: type, comptime name: [:0]const u8) ?FastFunc {
+    if (!synapse_builtin.features.fast_calls) {
+        return null;
+    }
+
+    const s = getStruct(T) orelse return null;
+    comptime var buf: [name.len+7]u8 = undefined;
+    const n = std.fmt.bufPrintZ(&buf, "{s}__fast", .{name}) catch return null;
+
+    inline for (s.decls) |decl| {
+        const val = @field(T, decl.name);
+        const t = @typeInfo(@TypeOf(val));
+
+        switch (t) {
+            .Fn => |f| {
+                if (strEql(decl.name, n)) {
+                    const S = struct {
+                        const fn_def = makeFastcallFnDef(f);
+                    };
+
+                    if (S.fn_def) |d| {
+                        return .{ .cb = &val, .def = &d };
+                    } else {
+                        return null;
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    return null;
+}
+
 pub fn registerModule(comptime T: type) void {
     comptime var numDecls = 0;
     comptime var decls: [256]FnDecl = undefined;
@@ -1133,23 +1161,37 @@ pub fn registerModule(comptime T: type) void {
     switch (@typeInfo(T)) {
         .Struct => |s| {
             inline for (s.decls) |decl| {
+                if (decl.name.len > 6 and strEql(decl.name[decl.name.len-6..], "__fast")) {
+                    continue;
+                }
+
                 const val = @field(T, decl.name);
                 const t = @typeInfo(@TypeOf(val));
 
                 switch (t) {
                     .Fn => |f| {
-                        const S = struct {
-                            const fn_def = if (synapse_builtin.features.fast_calls) makeFastcallFnDef(f) else null;
-                        };
-                        const d = FnDecl{
-                            .name = decl.name,
-                            .cb = &makeFn(f, val),
-                            // TODO: the fast call cb needs to use a modified preamble for certain value types
-                            // currently typed arrays (e.g. []u8) result in a bus error
-                            .fast_call_def = if (S.fn_def) |d| .{ .cb = &val, .def = &d } else null,
-                        };
-                        decls[numDecls] = d;
-                        numDecls += 1;
+                        if (findFastCallDecl(T, decl.name)) |func| {
+                            const d = FnDecl{
+                                .name = decl.name,
+                                .cb = &makeFn(f, val),
+                                .fast_call_def = func,
+                            };
+                            decls[numDecls] = d;
+                            numDecls += 1;
+                        } else {
+                            const S = struct {
+                                const fn_def = if (synapse_builtin.features.fast_calls) makeFastcallFnDef(f) else null;
+                            };
+                            const d = FnDecl{
+                                .name = decl.name,
+                                .cb = &makeFn(f, val),
+                                // TODO: the fast call cb needs to use a modified preamble for certain value types
+                                // currently typed arrays (e.g. []u8) result in a bus error
+                                .fast_call_def = if (S.fn_def) |d| .{ .cb = &val, .def = &d } else null,
+                            };
+                            decls[numDecls] = d;
+                            numDecls += 1;
+                        }
                     },
                     .Type => {
                         if (getStruct(val)) |_| {
@@ -1170,7 +1212,7 @@ pub fn registerModule(comptime T: type) void {
     }
 
     const final = decls[0..numDecls].*;
-        const final2 = decls2[0..numDecls2].*;
+    const final2 = decls2[0..numDecls2].*;
 
     const desc: ModuleDescriptor = .{
         .fns = &final,

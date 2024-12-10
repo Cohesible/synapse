@@ -44,7 +44,23 @@ export function getSourceCode(fn: any) {
 }
 
 export function isUnknown(val: any): val is typeof unknown {
-    return val === unknown
+    if (val === unknown) {
+        return true
+    }
+
+    if (typeof val !== 'object' || val === null) {
+        return false
+    }
+
+    // If the LHS is an assignment where the key is unknown, we're essentially
+    // assigning to all possible keys. Likewise, if the value is unknown, we're
+    // assigning all possible values. When both are unknown, we can consider
+    // the destination symbol to have an unknown value.
+    //
+    // We only check this for objects because functions are still callable
+    // despite having totally unknown properties.
+
+    return val[unknown] === unknown
 }
 
 export function createUnknown() {
@@ -267,7 +283,7 @@ export function createStaticSolver(
             for (const v of node.properties) {
                 if (ts.isSpreadAssignment(v)) {
                     const val = solve(v.expression)
-                    if (val === unknown) {
+                    if (isUnknown(val)) {
                         return val
                     }
 
@@ -389,11 +405,11 @@ export function createStaticSolver(
     
             const c = createInternalFunction(function (this: any, ...args: any[]) {
                 let thisArg = this
+                thisArg ??= {}
 
                 if (heritage) {
                     const fn = solve(heritage)
                     if (typeof fn === 'function') {
-                        thisArg ??= {}
                         thisArg = fn.call(thisArg, ...args) ?? thisArg
                     } else {
                         if (fn !== unknown) {
@@ -462,7 +478,7 @@ export function createStaticSolver(
             for (const n of nodes) {
                 if (ts.isSpreadElement(n)) {
                     const val = solve(n.expression)
-                    if (val === unknown) {
+                    if (isUnknown(val)) {
                         results.push(unknown)
                     } else if (val) {
                         results.push(...val)
@@ -528,7 +544,7 @@ export function createStaticSolver(
             const args = solveArguments(node.arguments)
             const thisArg = getThisArg(node)
             const fn = solve(node.expression)
-            if (fn === unknown || thisArg === unknown || !fn) {
+            if (isUnknown(fn) || isUnknown(thisArg) || !fn) {
                 return unknown
             }
 
@@ -538,7 +554,7 @@ export function createStaticSolver(
         function solveNewExpression(node: ts.NewExpression) {
             const args = solveArguments(node.arguments)
             const fn = solve(node.expression)
-            if (fn === unknown) {
+            if (isUnknown(fn)) {
                 return unknown
             }
 
@@ -647,7 +663,7 @@ export function createStaticSolver(
                             failOnNode('No target name', left)
                         }
 
-                        if (rightVal === unknown) {
+                        if (isUnknown(rightVal)) {
                             state.set(localName, unknown)
                         } else {
                             const val = rightVal?.[targetName] ?? (element.initializer ? solve(element.initializer) : unknown)
@@ -655,9 +671,22 @@ export function createStaticSolver(
                         }
                     }
                 } else if (ts.isElementAccessExpression(left)) {
-                    // TODO
-                    solve(left)
-                    solve(right) 
+                    const target = solve(left.expression)
+                    const arg = solve(left.argumentExpression)
+
+                    if (isUnknown(target) || isUnion(target) || target === undefined) {
+                        return
+                    }
+
+                    if ((typeof target !== 'object' && typeof target !== 'function') || target === null) {
+                        failOnNode(`Not an object: ${target}`, node)
+                    }
+
+                    if (exp.operatorToken.kind === ts.SyntaxKind.QuestionQuestionEqualsToken) {
+                        target[arg] ??= solve(right)
+                    } else {
+                        target[arg] = solve(right)
+                    }
                 }
             } else {
                 // XXX: used to dump logs
@@ -670,7 +699,7 @@ export function createStaticSolver(
         }
 
         function getProp(val: any, prop: string | number) {
-            if (val === unknown) {
+            if (isUnknown(val)) {
                 return val
             }
 
@@ -914,7 +943,7 @@ export function createStaticSolver(
             const left = solve(node.left)
             const right = solve(node.right)
 
-            if (left === unknown || right === unknown) {
+            if (isUnknown(left) || isUnknown(right)) {
                 return unknown
             }
 
@@ -950,9 +979,6 @@ export function createStaticSolver(
         // CONTROL FLOW
         function solveIfStatement(node: ts.IfStatement) {
             const cond = solve(node.expression)
-            // if (cond === unknownSymbol) {
-            //     return unknownSymbol
-            // }
 
             solveScopedState(node.thenStatement)
             if (node.elseStatement) {
@@ -990,7 +1016,7 @@ export function createStaticSolver(
             const whenTrue = solve(node.whenTrue)
             const whenFalse = solve(node.whenFalse)
 
-            if (cond === unknown || isUnion(cond)) {
+            if (isUnknown(cond) || isUnion(cond)) {
                 return unknown
             }
 
@@ -999,7 +1025,7 @@ export function createStaticSolver(
 
         function solvePrefixUnaryExpression(node: ts.PrefixUnaryExpression) {
             const val = solve(node.operand)
-            if (val === unknown) {
+            if (isUnknown(val)) {
                 return unknown
             }
 
@@ -1020,7 +1046,7 @@ export function createStaticSolver(
             for (const e of node.elements) {
                 if (ts.isSpreadElement(e)) {
                     const val = solve(e.expression)
-                    if (val === unknown) {
+                    if (isUnknown(val)) {
                         return unknown
                     } else {
                         if (isUnion(val)) {
@@ -1052,7 +1078,7 @@ export function createStaticSolver(
 
         function solveTypeofExpression(node: ts.TypeOfExpression) {
             const val = solve(node.expression)
-            if (val === unknown) {
+            if (isUnknown(val)) {
                 return val
             }
 
@@ -1124,7 +1150,7 @@ export function createStaticSolver(
                 for (let i = 0; i < decl.name.elements.length; i++) {
                     const n = decl.name.elements[i]
                     if (ts.isBindingElement(n) && ts.isIdentifier(n.name)) {
-                        if (val === unknown) {
+                        if (isUnknown(val)) {
                             scopedState.set(n.name.text, unknown)
                         } else {
                             scopedState.set(n.name.text, createUnion(function* () {
@@ -1177,7 +1203,7 @@ export function createStaticSolver(
         function solveDeleteExpression(node: ts.DeleteExpression) {
             if (ts.isPropertyAccessExpression(node.expression) || ts.isElementAccessExpression(node.expression)) {
                 const target = solve(node.expression.expression)
-                if (target === unknown) {
+                if (isUnknown(target)) {
                     return unknown
                 }
 
@@ -1185,7 +1211,7 @@ export function createStaticSolver(
                     delete target[node.expression.name.text]
                 } else {
                     const key = solve(node.expression.argumentExpression)
-                    if (key === unknown) {
+                    if (isUnknown(key)) {
                         return unknown
                     }
                     delete target[key]
@@ -1343,7 +1369,7 @@ export function createStaticSolver(
         solver.solve(ts.findAncestor(node, ts.isSourceFile)!)
         const ctor = solver.solve(node)
         const instance = ctor.call({}, ...args)
-        if (instance === unknown) {
+        if (isUnknown(instance)) {
             return unknown
         }
 

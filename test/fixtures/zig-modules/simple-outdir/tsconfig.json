@@ -1,0 +1,6 @@
+{
+    "compilerOptions": {
+        "allowArbitraryExtensions": true,
+        "outDir": "dist"
+    }
+}

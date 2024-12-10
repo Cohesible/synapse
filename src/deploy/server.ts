@@ -4,7 +4,7 @@ import * as child_process from 'node:child_process'
 import { HttpServer, HttpRoute, HttpError, sendResponse, receiveData } from './httpServer'
 import { objectId, resolveValue } from '../runtime/modules/serdes'
 import { BinaryToTextEncoding, createHash, randomUUID } from 'node:crypto'
-import { bundleClosure, createDataExport, getImportMap, isDeduped, normalizeSymbolIds } from '../closures'
+import { bundleClosure, createDataExport, getImportMap, isDeduped, normalizeSymbolIds, prepareDeployedModule } from '../closures'
 import { getLogger } from '../logging'
 import { ModuleResolver, createImportMap } from '../runtime/resolver'
 import { AsyncLocalStorage } from 'node:async_hooks'
@@ -32,7 +32,7 @@ export interface DeploymentContext {
 
 export interface ModuleLoader {
     loadModule: (id: string, origin?: string) => Promise<any>
-    registerMapping(mapping: ImportMap<SourceInfo>, location: string): void
+    registerMapping(mapping: ImportMap, location: string): void
     runWithContext: <T>(namedContexts: Record<string, any>, fn: () => Promise<T> | T) => Promise<T>
 }
 
@@ -101,10 +101,10 @@ async function resolvePointer(val: any) {
 
 function deserializeObject(loader: ModuleLoader, obj: any) {
     if (isDeduped(obj)) {
-        return resolveValue(obj.captured, loader, obj.table, undefined, false)
+        return resolveValue(obj.captured, loader, obj.table)
     }
 
-    return resolveValue(obj, loader, undefined, undefined, false)
+    return resolveValue(obj, loader)
 }
 
 function createProviderRoutes(ctx: DeploymentContext) {
@@ -203,7 +203,7 @@ function createProviderRoutes(ctx: DeploymentContext) {
     async function runWithCancel(loader: ModuleLoader, context: any, fn: () => Promise<any>) {
         const signal = ctx.abortSignal
         if (!signal) {
-            return loader.runWithContext(context, fn)
+            return loader.runWithContext(context, fn).then(s => serializeValue(loader, s))
         }
 
         signal.throwIfAborted()
@@ -217,7 +217,7 @@ function createProviderRoutes(ctx: DeploymentContext) {
         try {
             return await Promise.race([
                 cancelPromise,
-                loader.runWithContext(context, fn),
+                loader.runWithContext(context, fn).then(s => serializeValue(loader, s)),
             ])
         } finally {
             listener.dispose()
@@ -306,36 +306,30 @@ function createProviderRoutes(ctx: DeploymentContext) {
         return await runWithCancel(loader, context, doOp)
     }
 
-    function serializeValue(val: any, dataTable: Record<string | number, any>): any {
-        if ((typeof val !== 'object' && typeof val !== 'function') || !val) {
+    // TODO: enable this after confirming there are no perf regressions
+    const shouldSerialize = false
+
+    async function serializeValue(loader: ModuleLoader, val: any) {
+        if (!shouldSerialize) {
             return val
         }
 
-        if (isDataPointer(val)) {
+        const terraform = await loader.loadModule('synapse:terraform') as typeof import('../runtime/modules/terraform')
+        if (terraform.shouldSerializeDirectly(val)) {
             return val
         }
 
-        const id = val[objectId]
-        if (id !== undefined) {
-            return { ['@@__moveable__']: dataTable[id] }
+        const result = terraform.serializeAsJson(val)
+        const datafile = prepareDeployedModule(ctx, result)
+        const afs = await getArtifactFs()
+        const pointer = await afs.writeData2(datafile.datafile, datafile.metadata)
+
+        return { 
+            '@@__moveable__': {
+                valueType: 'reflection',
+                operations: [{ type: 'import', module: pointer }]
+            }
         }
-
-        if (Array.isArray(val)) {
-            return val.map(v => serializeValue(v, dataTable))
-        }
-
-        if (typeof val === 'function') {
-            throw new Error(`Failed to serialize value: ${val}`)
-        }
-
-        // TODO: fail on prop descriptors
-
-        const o: Record<string, any> = {}
-        for (const [k, v] of Object.entries(val)) {
-            o[k] = serializeValue(v, dataTable)
-        }
-
-        return o
     }
 
     return {
@@ -678,6 +672,17 @@ function createProviderRoute(ctx: DeploymentContext, handlers: Handlers) {
                 const data = payload.plannedState!.value
 
                 // TODO: attach the symbol mapping as metadata so we can reverse the normalization
+                // if (!isDeduped(data)) {
+                //     const pointer = await artifactFs.writeData2(data)
+
+                //     return { filePath: pointer }
+                // }
+
+                // const normalized = normalizeSymbolIds(data, true)
+                // const pointer = await artifactFs.writeData2({ ...normalized, mapping: undefined }, {
+                //     symbolMapping: normalized.mapping
+                // })
+
                 const normalized = isDeduped(data) ? normalizeSymbolIds(data) : data
                 const pointer = await artifactFs.writeData2(normalized)
 
@@ -713,10 +718,6 @@ function createProviderRoute(ctx: DeploymentContext, handlers: Handlers) {
                         return payload.priorState
                 }
             }
-
-            // Effectively no-op resources
-            case 'ModuleExports':
-                return payload.plannedState ?? payload.priorState
 
             case apiRegistrationResourceType:
                 return getServiceRegistry().handleRequest(ctx, payload)

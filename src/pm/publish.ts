@@ -99,9 +99,19 @@ async function publishTarball(tarball: Buffer, pkgJson: PackageJson, opt?: Publi
     const client = registry.createClient()
     const { hash } = await client.uploadPackage(remotePkgId, tarball)
     if (opt?.ref) {
-        getLogger().log(`Setting package ref: ${opt.ref} --> ${hash}`)
+        getLogger().log(`Setting package ref: ${opt.ref} --> ${hash} [pkgId: ${remotePkgId}]`)
 
-        return client.setRef(remotePkgId, opt.ref, hash)
+        await client.setRef(remotePkgId, opt.ref, hash)
+
+        // TODO: only make this ref public
+        if (opt?.visibility === 'public') {
+            await client.updatePackageMetadata({
+                packageId: remotePkgId,
+                public: true,
+            })
+        }
+
+        return
     }
 
     await client.publishPackage({
@@ -162,7 +172,7 @@ export async function publishToRemote(opt?: PublishToRemoteOptions) {
     }
 }
 
-export async function linkPackage(opt?: PublishOptions & { globalInstall?: boolean; skipInstall?: boolean; useNewFormat?: boolean }) {
+export async function linkPackage(opt?: PublishOptions & { globalInstall?: boolean; skipInstall?: boolean }) {
     const bt = getBuildTargetOrThrow()
 
     function getPkg() {
@@ -182,37 +192,16 @@ export async function linkPackage(opt?: PublishOptions & { globalInstall?: boole
     const fs = getFs()
     const pkgName = pkg.data.name ?? path.basename(pkg.directory)
     const resolvedDir = getLinkedPkgPath(pkgName, bt.deploymentId)
-    if (opt?.useNewFormat) {
-        return createPackageForRelease(packageDir, resolvedDir, { skipBinaryDeps: true }, true, true, true)
+
+    async function pruneDeps() {
+        const pkgData = JSON.parse(await fs.readFile(path.resolve(resolvedDir, 'package.json'), 'utf-8'))
+        delete pkgData.bin
+        delete pkgData.dependencies
+        await fs.writeFile(path.resolve(resolvedDir, 'package.json'), JSON.stringify(pkgData))
     }
 
-    const pruned = await createMergedView(bt.programId, bt.deploymentId)
-    const oldManifest = await tryReadJson<Snapshot>(fs, getSnapshotPath(resolvedDir))
-    const oldStoreHash = oldManifest?.storeHash
-
-    await runTask('copyFs', 'linkPackage', () => copyFs(pruned, resolvedDir), 100)
-    await patchSourceRoots(bt.workingDirectory, resolvedDir)
-    const { snapshot, committed } = await createSnapshot(pruned,  bt.programId, bt.deploymentId)
-    // TODO: exclusively use data blocks instead of 'both'
-    await dumpData(resolvedDir, pruned, snapshot.storeHash, 'both', oldStoreHash)
-    await writeSnapshotFile(fs, resolvedDir, snapshot)
-
-    if (!pruned.files['package.json']) {
-        await fs.writeFile(
-            path.resolve(resolvedDir, 'package.json'), 
-            await fs.readFile(path.resolve(packageDir, 'package.json'))
-        )
-    } else {
-        await fs.writeFile(
-            path.resolve(resolvedDir, 'package.json'), 
-            await getDataRepository().readData(pruned.files['package.json'].hash)
-        )
-    }
-
-    await setPackage(pkgName, bt.programId)
-
-    if (pkgName === 'synapse') {
-        for (const [k, v] of Object.entries(getPkgExecutables(pkg.data) ?? {})) {
+    async function handleSynapsePkg(snapshot: { storeHash: string; published?: Record<string, string> | undefined }) {
+        for (const [k, v] of Object.entries(getPkgExecutables(pkg!.data) ?? {})) {
             await makeExecutable(path.resolve(resolvedDir, v))
         }
     
@@ -220,30 +209,31 @@ export async function linkPackage(opt?: PublishOptions & { globalInstall?: boole
             await writeImportMap(resolvedDir, snapshot.published, snapshot.storeHash)
         }
 
-        // XXX: remove deps
-        const pkgData = JSON.parse(await fs.readFile(path.resolve(resolvedDir, 'package.json'), 'utf-8'))
-        delete pkgData.bin
-        delete pkgData.dependencies
-        await fs.writeFile(path.resolve(resolvedDir, 'package.json'), JSON.stringify(pkgData))
+        await pruneDeps()
     }
 
-    async function replaceIntegration(name: string) {
-        await setPathKey(`projectOverrides.synapse-${name}`, resolvedDir)
+    const { snapshot } = await createPackageForRelease(packageDir, resolvedDir, { skipBinaryDeps: true }, pkgName !== 'synapse', true, true)
+
+    if (pkgName === 'synapse' || pkgName.startsWith('synapse-')) {
+        await setPathKey(`projectOverrides.${pkgName}`, resolvedDir)
     }
 
-    if (pkgName.startsWith('synapse-')) {
-        await replaceIntegration(pkgName.slice('synapse-'.length))
+    await setPackage(pkgName, bt.programId)
+
+    if (pkg.data.name === 'synapse') {
+        const pruned = await createMergedView(bt.programId, bt.deploymentId)
+        await runTask('copyFs', 'linkPackage', () => copyFs(pruned, resolvedDir), 100)
+        await patchSourceRoots(bt.workingDirectory, resolvedDir)
+        await handleSynapsePkg(snapshot)
     }
 
-    // Used internally for better devex
-    // This can make things really slow if there are many dependents
-    if (!bt.environmentName) {
-        const snapshotWithStore = Object.assign(snapshot, { store: committed })
-        await publishPkgUpdates(resolvedDir, snapshotWithStore)
-        await publishPkgUpdates(packageDir, snapshotWithStore)
-    }
-
-    return resolvedDir
+    // // Used internally for better devex
+    // // This can make things really slow if there are many dependents
+    // if (!bt.environmentName) {
+    //     const snapshotWithStore = Object.assign(snapshot, { store: committed })
+    //     await publishPkgUpdates(resolvedDir, snapshotWithStore)
+    //     await publishPkgUpdates(packageDir, snapshotWithStore)
+    // }
 }
 
 export async function emitPackageDist(dest: string, bt: BuildTarget, tsOutDir?: string, declaration?: boolean) {
@@ -542,15 +532,28 @@ export async function createMergedView(programId: string, deploymentId?: string,
     const merged = mergeBuilds(builds.filter(isNonNullable))
     const infraFiles = pruneInfra ? Object.keys(merged.files).filter(x => x.endsWith('.infra.js') || x.endsWith('.infra.js.map')) : []
     const privateFiles = Object.keys(merged.files).filter(x => !!x.match(/^__([a-zA-Z_-]+)__\.json$/)) // XXX
-    const pruned = pruneBuild(merged, ['template.json', 'published.json', 'state.json', 'packages.json', ...infraFiles, ...privateFiles])
+    const pruned = pruneBuild(merged, ['template.json', 'template.bin', 'published.json', 'state.json', 'packages.json', ...infraFiles, ...privateFiles])
 
     return pruned
 }
 
+async function tryParseJson(f: string) {
+    try {
+        return JSON.parse(await getFs().readFile(f, 'utf-8'))
+    } catch (e) {
+        // Swallow
+    }
+}
+
+// This is (currently) only used for internal dev. It's not very robust.
 async function patchSourceRoots(rootDir: string, targetDir: string) {
     const sourcemaps = await glob(getFs(), targetDir, ['**/*.map'], ['node_modules'])
     for (const f of sourcemaps) {
-        const sm = JSON.parse(await getFs().readFile(f, 'utf-8'))
+        const sm = await tryParseJson(f)
+        if (!sm) {
+            continue
+        }
+
         const source = sm.sources[0]
         if (!source || source.startsWith(rootDir)) {
             continue
@@ -943,7 +946,7 @@ function findBinPathsSync(pkgDir: string, fs = getFs()) {
     return paths
 }
 
-export function createNpmLikeCommandRunner(pkgDir: string, env?: Record<string, string>, stdio?: StdioOptions, shell?: string) {
+export function createNpmLikeCommandRunner(pkgDir: string, env?: Record<string, string | undefined>, stdio?: StdioOptions, shell?: string) {
     const paths = findBinPathsSync(pkgDir)
     env = patchPath(paths.join(':'), env)
 
@@ -964,7 +967,7 @@ export async function createSynapseTarball(dir: string) {
             contents: Buffer.from(data),
             mode: 0o755,
             path: path.relative(dir, f),
-            mtime: Math.round(stats.mtimeMs),
+            mtime: Math.round(stats.mtimeMs / 1000),
         }
     })))
 

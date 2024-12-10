@@ -15,21 +15,19 @@ interface Entity {
     readonly kind: TerraformElement['kind']
 }
 
-enum ExpressionKind {
-    NumberLiteral,
+const enum ExpressionKind {
     Reference,
     PropertyAccess,
     ElementAccess,
-    Call
+    Call,
+    Add,
+    Literal,
+    Serialize,
+    BareReference,
 }
 
 interface Expression {
     readonly kind: ExpressionKind
-}
-
-interface NumberLiteral extends Expression {
-    readonly kind: ExpressionKind.NumberLiteral
-    readonly value: number
 }
 
 interface ReferenceExpression extends Expression {
@@ -40,8 +38,13 @@ interface ReferenceExpression extends Expression {
 interface CallExpression extends Expression {
     readonly kind: ExpressionKind.Call
     readonly target: string
-    //readonly arguments: Expression[]
     readonly arguments: any[]
+}
+
+interface SerializeExpression extends Expression {
+    readonly kind: ExpressionKind.Serialize
+    readonly arguments: [target: any]
+    readonly serializer: Serializer
 }
 
 interface PropertyAccessExpression extends Expression {
@@ -56,7 +59,20 @@ interface ElementAccessExpression extends Expression {
     readonly element: Expression
 }
 
+interface Literal extends Expression {
+    readonly kind: ExpressionKind.Literal
+    readonly value: any
+}
 
+interface BinaryExpression extends Expression {
+    readonly lhs: Expression
+    readonly rhs: Expression
+}
+
+interface BareReference extends Expression {
+    readonly kind: ExpressionKind.BareReference 
+    readonly target: ReferenceExpression | PropertyAccessExpression | ElementAccessExpression
+}
 
 // const asyncFnProto = Object.getPrototypeOf((async function() {}))
 
@@ -85,16 +101,8 @@ function isCustomSerializeable(o: object | Function) {
     return false
 }
 
-function isProxy(o: any) {
-    return !!o && (typeof o === 'object' || typeof o === 'function') && !!Reflect.getOwnPropertyDescriptor(o, moveable2)
-}
-
 function unwrapProxy(o: any): any {
-    if (isProxy(o)) {
-        return unwrapProxy(o[unproxy])
-    }
-
-    return o
+    return globalFunctions.unwrapProxy(o)
 }
 
 function isJsonSerializeable(o: any, visited = new Set<any>()): boolean {
@@ -136,12 +144,12 @@ function isObjectOrNullPrototype(proto: any) {
 }
 
 export function isGeneratedClassConstructor(o: any) {
-    if (Object.prototype.hasOwnProperty.call(o, terraformClassKey)) {
+    if (Object.hasOwn(o, terraformClassKey)) {
         return true
     }
 
     const proto = Object.getPrototypeOf(o)
-    if (proto && Object.prototype.hasOwnProperty.call(proto, terraformClassKey)) {
+    if (proto && Object.hasOwn(proto, terraformClassKey)) {
         return true
     }
 
@@ -166,7 +174,6 @@ const objectId = Symbol.for('synapse.objectId')
 const indirectRefs = Symbol.for('synapse.indirectRefs')
 export const stubWhenBundled = Symbol.for('synapse.stubWhenBundled')
 
-const unproxy = Symbol.for('unproxy')
 const symbolId = Symbol.for('symbolId') // Used to track references when capturing
 const serializeableSymbols = new Set([permissions, browserImpl, objectId, stubWhenBundled, indirectRefs, ...knownSymbols])
 const reflectionType = Symbol.for('reflectionType')
@@ -211,31 +218,11 @@ function isDataPointer(h: string): h is DataPointer {
     return typeof h === 'object' && pointerSymbol in h
 }
 
-function renderDataPointer(pointer: DataPointer) {
-    const { hash, storeHash } = pointer.resolve()
-            
-    return renderCallExpression({
-        kind: ExpressionKind.Call,
-        target: 'markpointer',
-        arguments: [hash, storeHash],
-    })
-}
-
-function renderEntity(entity: Entity) {
-    return `${entity.kind === 'data-source' ? 'data.' : ''}${entity.type}.${entity.name}`
-}
-
 export function isRegExp(o: any): o is RegExp {
     return o instanceof RegExp || (typeof o === 'object' && !!o && 'source' in o && Symbol.match in o)
 }
 
-function renderObjectLiteral(obj: any, raw = false): string {
-    const entries = Object.entries(obj).filter(([_, v]) => v !== undefined)
-
-    return `{${entries.map(([k, v]) => `${renderLiteral(k)} = ${raw ? v : renderLiteral(v)}`).join(', ')}}`
-}
-
-type Ref = { [Symbol.toPrimitive]: () => string }
+type Ref = { [tableRefSym]: () => any }
 
 interface Context {
     readonly moduleId: string
@@ -250,11 +237,37 @@ const serializeableResourceClasses = new Set([
     'Closure',
     'Custom',
     'CustomData',
-
-    // Legacy
-    'Example',
-    'ExampleData',
 ])
+
+function createLocalReference(name: string): Expression {
+    return createRefExpression({ kind: 'resource', type: 'local', name })
+}
+
+function createRefExpression(target: Entity): Expression {
+    const exp: ReferenceExpression = {
+        kind: ExpressionKind.Reference,
+        target,
+    }
+    ;(exp as any)[expressionSym] = exp
+
+    return exp
+}
+
+
+const enum SerializationFlags {
+    None = 0,
+    Moveable = 1 << 0,
+    Array = 1 << 1,
+}
+
+interface SerializationData {
+    readonly encoded: any
+    readonly flags: SerializationFlags
+    readonly deps: string[]
+    readonly idOverride: string | undefined
+}
+
+const tableRefSym = Symbol('tableRef')
 
 export function createSerializer(
     serialized: State['serialized'] = new Map(), 
@@ -262,42 +275,39 @@ export function createSerializer(
 ) {
     const moduleIds = new Map<string, number>() // Used to track reference bindings per-module
 
-    const objectTable = new Map<any, { id: string; name: string, ref: Ref, ctx: Context }>()
-    const refCounter = new Map<string, number>()
+    const objectTable = new Map<any, { id: string; ref: Ref, ctx: Context; refCount: number }>()
 
+    const crypto = require('node:crypto')
     const hashes = new Map<string, string>()
-    function getHash(ctx: Context) {
-        const prefix = `${ctx.moduleId}:${ctx.testContext?.id ?? ''}`
+    function getHash(ctx: Context, kind: 'table' | 'object') {
+        const prefix = `${kind}:${ctx.moduleId}:${ctx.testContext?.id ?? ''}`
         if (hashes.has(prefix)) {
             return hashes.get(prefix)!
         }
 
-        const hash = require('node:crypto')
-            .createHash('sha1')
-            .update(prefix)
-            .digest('hex')
-            .slice(0, 16)
-        
+        const hash = crypto.hash('sha1', prefix, 'hex').slice(0, 16)
         hashes.set(prefix, hash)
 
         return hash
     }
 
     const idTable = new Map<string, number>()
-    function generateId(ctx: Context) {
-        const prefix = getHash(ctx)
+    function generateId(ctx: Context, kind: 'table' | 'object') {
+        const prefix = getHash(ctx, kind)
         const count = (idTable.get(prefix) ?? 0) + 1
         idTable.set(prefix, count)
 
+        // TODO: we should mark `prefix` for deduplication when serializing
+        // This would significantly reduce the size of the string table
         return `${prefix}_${count}`                
     }
 
     const depsStack: Set<string>[] = []
-    function addDep(id: string, name: string, ctx: Context) {
+    function addDep(id: string, ctx: Context) {
         if (depsStack.length > 0) {
             depsStack[depsStack.length - 1].add(id)
         } else {
-            ctx.dataTable[id] = `\${local.${name}}`
+            ctx.dataTable[id] = createLocalReference(id)
         }
     }
 
@@ -312,9 +322,8 @@ export function createSerializer(
             return tables.get(ctx)!.ref
         }
 
-        const id = generateId(ctx)
-        const name = `d_${id}`
-        const ref = renderEntity({ type: 'local', kind: 'resource', name })
+        const name = generateId(ctx, 'table')
+        const ref = createLocalReference(name)
         tables.set(ctx, { name, ref })
 
         return ref
@@ -325,8 +334,8 @@ export function createSerializer(
             throw new Error(`Object was never registered: ${o}`)
         }
 
-        const { id, name, ref } = objectTable.get(o)!
-        addDep(id, name, ctx)
+        const info = objectTable.get(o)!
+        addDep(info.id, ctx)
 
         // Self-reference, we have to inline a reference here instead of using the ref counter
         // 
@@ -336,10 +345,9 @@ export function createSerializer(
         //     return { [`@@${moveable.description!}`]: { id, valueType: 'reference' } }
         // }
 
-        const refCount = refCounter.get(name)!
-        refCounter.set(name, refCount + 1)
+        info.refCount += 1
 
-        return ref
+        return info.ref
     }
 
     function getId(obj: any, ctx: Context) {
@@ -351,109 +359,71 @@ export function createSerializer(
         // as opposed to when the object is created (the ideal). In most situations
         // this works fine, though it's still possible to see unexpected changes.
 
-        // const id = objectTable.size
-        const id = generateId(ctx)
-        const name = `o_${id}`
-        const ref = getReference(id, ctx)
-        objectTable.set(obj, { id, name, ref, ctx })
-        refCounter.set(name, 1)
-        addDep(id, name, ctx)
+        const id = generateId(ctx, 'object')
+        const ref = getInternalRef(id)
+        objectTable.set(obj, { id, ref, ctx, refCount: 1 })
+        addDep(id, ctx)
 
         return { id, ref }
     }
 
-    function getReference(id: number | string, ctx: Context, lateBound = false) {
-        function resolve(type?: string) {
-            const { obj, name, refCount, isMoveable, idOverride } = serialized.get(id)!
-            // TODO: just never inline? this is buggy
-            // or we can resolve all call expressions before synth
-            if (refCount <= 1 && !isMoveable) {
-                return obj[Symbol.toPrimitive](type)
-            }
-
-            // The latebound ref is a bare id and should not be treated as a config object
-            if (lateBound && type === 'object') {
-                return undefined
-            }
+    function getInternalRef(id: string, lateBound = false) {
+        function resolve() {
+            const info = serialized.get(id)!
 
             if (lateBound) {
-                return idOverride ?? id
+                return info.data.idOverride ?? id
             }
 
-            if (!isMoveable) {
-                // This is an itsy bitsy hack to force multiple references to an array to be shared
-                if (Array.isArray(obj.val)) {
-                    return renderLiteral({ [`@@${moveable.description!}`]: { id: idOverride ?? id } })
-                }
-                return `local.${name}`
+            const flags = info.data.flags
+
+            // TODO: potentially inline this
+            if (flags & SerializationFlags.Moveable) {
+                return { [`@@${moveable.description!}`]: { id: info.data.idOverride ?? id } }
             }
 
-            return renderLiteral({ [`@@${moveable.description!}`]: { id: idOverride ?? id } })
+            if (info.refCount <= 1) {
+                return info.data.encoded
+            }
+
+            // This is an itsy bitsy hack to force multiple references to an array to be shared
+            if (flags & SerializationFlags.Array) {
+                return { [`@@${moveable.description!}`]: { id } }
+            }
+
+            return createLocalReference(id)
         }
 
-        return { [Symbol.toPrimitive]: resolve }
+        return { [tableRefSym]: resolve }
     }
 
-    function getLateBoundRef(o: any, ctx: Context) {
+    function getLateBoundRef(o: any) {
         if (!objectTable.has(o)) {
             throw new Error(`Object was never registered: ${o}`)
         }
 
         const { id } = objectTable.get(o)!
 
-        return getReference(id, ctx, true)
+        return getInternalRef(id, true)
     }
 
-    class DataClass {
-        static [terraformClassKey] = 'local'
-        constructor(public readonly val: any, data: { encoded: any, isMoveable: boolean, deps: string[], idOverride?: string }) {
-            if (!objectTable.get(val)) {
-                throw new Error(`Object was never registered: ${data}`)
-            }
+    function addData(id: string, val: any, data: SerializationData) {
+        if (serialized.has(id)) {
+            throw new Error(`Object was created more than once`)
+        }
 
-            const { id, name, ctx } = objectTable.get(val)!
-
-            if (serialized.has(id)) {
-                throw new Error(`Object was created more than once`)
-            }
-
-            const inlineVal = data.isMoveable
-                ? { [`@@${moveable.description!}`]: data.encoded }
-                : data.encoded
-
-            const state = {
-                name, 
+        serialized.set(id, {
+            data,
+            element: {
+                name: id,
+                kind: 'resource' as const,
                 type: 'local',
                 state: data.encoded,  
-                kind: 'resource' as const,
-                ...ctx,
+            } as TerraformElement,
+            get refCount() {
+                return objectTable.get(val)!.refCount
             }
-
-            const entity = createEntityProxy(this, state, {})
-            const proxy = new Proxy(entity, {
-                get: (_, prop) => {
-                    if (prop === Symbol.toPrimitive) {
-                        return (type?: string) => type === 'object' ? inlineVal : renderLiteral(inlineVal)
-                    }
-
-                    return entity[prop]
-                }
-            })
-
-            serialized.set(id, {
-                ctx,
-                name,
-                obj: proxy,
-                deps: data.deps,
-                isMoveable: data.isMoveable,
-                idOverride: data.idOverride,
-                get refCount() {
-                    return refCounter.get(name) ?? 1
-                }
-            })    
-
-            return proxy
-        }
+        })    
     }
 
     function withContext(ctx: Context) {
@@ -476,13 +446,14 @@ export function createSerializer(
             depsStack.push(new Set())
             serializeStack.push(obj)
 
-            let isMoveable = true
+            let flags = SerializationFlags.Moveable
             let idOverride: string | undefined
-            new DataClass(unproxied, {
+
+            addData(id, unproxied, {
                 encoded: serializeData(),
-                isMoveable,
-                idOverride,
+                flags,
                 deps: Array.from(depsStack.pop()!),
+                idOverride,
             })
     
             serializeStack.pop()
@@ -491,8 +462,8 @@ export function createSerializer(
     
             function serializeData(): any {
                 if (Array.isArray(obj)) {
-                    isMoveable = false
-    
+                    flags = SerializationFlags.Array
+
                     return obj.map(serialize)
                 }
     
@@ -515,15 +486,21 @@ export function createSerializer(
 
                             // Dervived classes of `ConstructClass`
                             if (obj.constructor && !isGeneratedClassConstructor(obj.constructor) && !isObjectOrNullPrototype(Object.getPrototypeOf(obj))) {
+                                // Force the value into the data table.
+                                //
+                                // This is needed when custom resources serialize execution 
+                                // state, which cannot easily be known ahead of time.
+                                const properties = serialize(val)
+                                
                                 return {
                                     id,
                                     valueType: 'object',
-                                    properties: val, // FIXME: doesn't handle extra props
+                                    properties, // FIXME: doesn't handle extra props
                                     constructor: serialize(obj.constructor),
                                 }
                             }
         
-                            isMoveable = false
+                            flags = SerializationFlags.None
         
                             return val
                         }
@@ -538,7 +515,7 @@ export function createSerializer(
                 if (expressionSym in obj) {
                     const exp = (obj as any)[expressionSym]
                     if (exp.kind == ExpressionKind.Call) { // Maybe not needed
-                        isMoveable = false
+                        flags = SerializationFlags.None
     
                         return obj
                     }
@@ -557,7 +534,7 @@ export function createSerializer(
                             }
     
                             console.log(`Unable to serialize entity of kind "provider": ${entity.type}.${entity.name}`)
-                            isMoveable = false
+                            flags = SerializationFlags.None
                             
                             // We'll dump the provider's config anyway...
                             return {} // { ...obj }
@@ -603,7 +580,7 @@ export function createSerializer(
                                 : unwrapProxy(obj[key])
     
                             serialize(unproxied)
-                            const ref = getLateBoundRef(unproxied, ctx)
+                            const ref = getLateBoundRef(unproxied)
     
                             return {
                                 id: boundId,
@@ -617,10 +594,6 @@ export function createSerializer(
                     }
     
                     return serializeFullObject(id, obj)
-
-                    // isMoveable = false
-    
-                    // return serializeObjectLiteral(obj)
                 }
     
                 if (obj instanceof Uint8Array) {
@@ -685,7 +658,7 @@ export function createSerializer(
                 }
     
                 if (typeof obj === 'function') {
-                    if (obj.name === 'Object' && Object.keys(Object).every(k => Object.prototype.hasOwnProperty.call(obj, k))) {
+                    if (obj.name === 'Object' && Object.keys(Object).every(k => Object.hasOwn(obj, k))) {
                         return {
                             id,
                             valueType: 'reflection',
@@ -824,7 +797,7 @@ export function createSerializer(
 
             depsStack.push(new Set())
     
-            new DataClass(obj, {
+            addData(id, obj, {
                 encoded: {
                     id,
                     valueType: 'reflection',
@@ -834,8 +807,9 @@ export function createSerializer(
                         { type: 'apply', args: [desc], thisArg }
                     ]
                 },
-                isMoveable: true,
+                flags: SerializationFlags.Moveable,
                 deps: Array.from(depsStack.pop()!),
+                idOverride: undefined,
             })
     
             return ref
@@ -846,12 +820,11 @@ export function createSerializer(
                 return obj
             }
 
-            if (isDataPointer(obj)) {
-                return `\${${renderDataPointer(obj)}}`
-            }
-    
             switch (typeof obj) {
                 case 'object':
+                    if (isDataPointer(obj)) {
+                        return obj
+                    }
                 case 'function':
                     return serializeObject(obj)
     
@@ -874,114 +847,15 @@ export function createSerializer(
 }
 
 interface Serializer {
-    serialize: (obj: any) => string
-    getTable: () => string
-}
-
-function renderLiteral(obj: any, isEncoding = false, serializer?: Serializer): string {
-    if (Array.isArray(obj)) {
-        return `[${obj.map(x => renderLiteral(x, isEncoding, serializer)).join(', ')}]`
-    }
-
-    if (typeof obj === 'string') {
-        // This is awful...
-        const pattern = /([^]*[^$]?)\$\{(.*)\}([^]*)/g
-        let res: string = ''
-        let match: RegExpExecArray | null
-        while (match = pattern.exec(obj)) {
-            res += JSON.stringify(match[1]).slice(1, -1) + `\${${match[2]}}` + JSON.stringify(match[3]).slice(1, -1)
-        }
-        if (res) return '"' + res + '"'
-
-        return JSON.stringify(obj)
-    }
-
-    if (typeof obj === 'number') {
-        return String(obj)
-    }
-
-    if (typeof obj === 'boolean') {
-        return obj ? 'true' : 'false'
-    }
-
-    if (obj === null) {
-        return 'null'
-    }
-
-    // Not correct
-    if (obj === undefined) {
-        return 'null'
-    }
-
-    if (isRegExp(obj)) {
-        return JSON.stringify(`/${obj.source}/`)
-    }
-
-    if (isDataPointer(obj)) {
-        return renderDataPointer(obj)
-    }
-
-    if (serializer && isEncoding) {
-        return serializer.serialize(obj)
-    }
-
-    if (expressionSym in obj) {
-        return render((obj as any)[expressionSym])
-    }
-
-    if (Object.prototype.hasOwnProperty.call(obj, Symbol.toPrimitive)) {
-        return obj[Symbol.toPrimitive]('string')
-    }
-
-    if (typeof obj === 'function') {
-        throw new Error(`Unable to render function: ${obj.toString()}`)
-    }
-
-    if (typeof obj === 'symbol') {
-        throw new Error(`Unable to render symbol: ${obj.toString()}`)
-    }
-
-    return renderObjectLiteral(obj)
-}
-
-function renderCallExpression(expression: CallExpression, serializer?: Serializer) {
-    if (expression.target === 'serialize') {
-        const captured = renderLiteral(expression.arguments[0], true, serializer)
-
-        return renderObjectLiteral({
-            captured,
-            table: serializer?.getTable(),
-            __isDeduped: true,
-        }, true)
-    }
-
-    const target = expression.target === 'encoderesource' ? 'jsonencode' : expression.target
-    const isEncoding = expression.target === 'encoderesource'
-    const args = expression.arguments.map(x => renderLiteral(x, isEncoding, serializer))
-
-    return `${target}(${args.join(', ')})` 
-}
-
-function render(expression: Expression, serializer?: Serializer): string {
-    switch (expression.kind) {
-        case ExpressionKind.Reference:
-            return renderEntity((expression as ReferenceExpression).target)
-        case ExpressionKind.PropertyAccess:
-            return `${render((expression as PropertyAccessExpression).expression)}.${(expression as PropertyAccessExpression).member}`
-        case ExpressionKind.ElementAccess:
-            return `${render((expression as ElementAccessExpression).expression)}[${render((expression as ElementAccessExpression).element)}]`
-        case ExpressionKind.NumberLiteral:
-            return renderLiteral((expression as NumberLiteral).value)
-        case ExpressionKind.Call:
-            return renderCallExpression(expression as CallExpression, serializer)    
-    }
+    serialize: (obj: any) => any
+    getTable: () => Expression
 }
 
 function createEntityProxy(original: any, state: InternalState, mappings?: Record<string, string>) {
     return createProxy({
         kind: ExpressionKind.Reference,
         target: state,
-    } as any, state, mappings, original,)
+    } as any, state, mappings, original)
 }
 
 export const internalState = Symbol.for('internalState')
@@ -1025,7 +899,7 @@ export type TerraformElement =
     | TerraformDataSourceElement
     | TerraformLocalElement
 
-function mapKey(key: string, mappings: Record<string, any>) {
+function mapKey(key: string, mappings?: Record<string, any>) {
     if (!mappings) {
         return key
     }
@@ -1049,14 +923,16 @@ function createTfExpression() {
     return terraformExpression
 }
 
+// This may hurt perf on containing strings because they can be treated as two-byte strings
+const expressionMarker = '\u039BexpMarker\u039B'
+const renderedExpressions = new Map<string, Expression>()
+
 export function createProxy<T = unknown>(
     expression: Expression, 
     state: InternalState | undefined, 
     mappings: Record<string, any> = {}, 
     original?: any, 
 ): any {
-    const serializer = state?.['__serializer']
-
     // We cache all created proxies to ensure referential equality
     const proxies = new Map<PropertyKey, any>()
     function createInnerProxy(key: PropertyKey, expression: Expression) {
@@ -1073,6 +949,21 @@ export function createProxy<T = unknown>(
     }
 
     const target = original ? original : createTfExpression()
+
+    let renderedIndex: number
+
+    function toString() {
+        if (renderedIndex !== undefined) {
+            return `\${${expressionMarker}${renderedIndex}}`
+        }
+
+        renderedIndex = renderedExpressions.size
+
+        const rendered = `${renderedIndex}`
+        renderedExpressions.set(rendered, expression)
+
+        return `\${${expressionMarker}${rendered}}`
+    }
 
     return new Proxy(target, {
         get: (target, prop, receiver) => {
@@ -1092,22 +983,14 @@ export function createProxy<T = unknown>(
                 return original
             }
 
-            if (prop === 'toString') {
-                return () => `\${${render(expression, serializer)}}`
-            }
-
-            if (prop === 'toJSON') {
-                return () => `\${${render(expression, serializer)}}`
+            if (prop === 'toString' || prop === 'toJSON' || prop === Symbol.toPrimitive) {
+                return toString
             }
 
             // if (prop === 'slice') {
             // // call `substr`
             //     return () => `\${${render(expression)}}`
             // }
-
-            if (prop === Symbol.toPrimitive) {
-                return () => `\${${render(expression, serializer)}}`
-            }
 
             if (original && Reflect.has(original, prop)) {
                 return Reflect.get(original, prop, receiver)
@@ -1128,7 +1011,7 @@ export function createProxy<T = unknown>(
             // Obfuscation isn't the goal here. The values used minimizes generated code size.
             const inner = mappings['_'] === 1
                 ? { kind: ExpressionKind.ElementAccess, expression, element: {
-                    kind: ExpressionKind.NumberLiteral,
+                    kind: ExpressionKind.Literal,
                     value: 0,
                 } }
                 : expression
@@ -1139,7 +1022,7 @@ export function createProxy<T = unknown>(
                     kind: ExpressionKind.ElementAccess,
                     expression: inner,
                     element: {
-                        kind: ExpressionKind.NumberLiteral,
+                        kind: ExpressionKind.Literal,
                         value: val,
                     }
                 }
@@ -1197,82 +1080,46 @@ export function createProxy<T = unknown>(
     })
 }
 
+function maybeGetMappings(obj: any) {
+    if ((typeof obj !== 'object' && typeof obj !== 'function') || !obj) {
+        return
+    }
+
+    return obj[mappingsSym]
+}
+
+function maybeGetExpression(obj: any): Expression | undefined {
+    if ((typeof obj !== 'object' && typeof obj !== 'function') || !obj) {
+        return
+    }
+
+    return obj[expressionSym]
+}
+
 const createCallExpression = (name: string, args: any[], state?: any) => createProxy({
     kind: ExpressionKind.Call,
     target: name,
     arguments: args, // FIXME: don't use jsonencode for this
-} as any, state, ((typeof args[0] === 'object' || typeof args[0] === 'function') && !!args[0] && mappingsSym in args[0]) ? (args[0] as any)[mappingsSym] : undefined)
+} as any, state, maybeGetMappings(args[0]))
 
 
 export interface TfJson {
-    readonly '//'?: Extensions
     readonly provider: Record<string, any[]>
     readonly resource: Record<string, Record<string, any>>
     readonly data:  Record<string, Record<string, any>>
     readonly terraform: { backend?: Record<string, any>, 'required_providers': Record<string, any> }
     readonly moved: { from: string, to: string }[]
     readonly locals: Record<string, any>
+    
+    '//'?: TemplateMetadata
 }
 
 function isDefaultProviderName(name: string, type: string) {
-    return name === '#default' || name === 'default' || name === type
+    return name === 'default' || name === type
 }
 
 function isDefaultProvider(element: TerraformElement) {
     return isDefaultProviderName(element.name, element.type)
-}
-
-// terraform: 'terraform.io/builtin/terraform',
-
-function computeSizeTree(o: any): any {
-    if (typeof o === 'string' || typeof o === 'number' || typeof o === 'boolean' || o === null) {
-        return String(o).length
-    }
-
-    if (typeof o !== 'object' && typeof o !== 'function') {
-        return 0
-    }
-
-    if (Array.isArray(o)) {
-        return o.map(computeSizeTree)
-    }
-
-    if (expressionSym in o) {
-        return computeSizeTree(JSON.parse(`"${String(o)}"`))
-    }
-
-    function getSize(o: any): number {
-        if (typeof o === 'number') {
-            return o
-        }
-
-        if (Array.isArray(o)) {
-            return o.reduce((a, b) => a + getSize(b), 0)
-        }
-
-        return o['__size']
-    }
-
-    if (typeof o === 'object') {
-        let totalSize = 0
-        const res: Record<string, any> = {}
-        for (const [k, v] of Object.entries(o)) {
-            const size = computeSizeTree(v)
-            totalSize += getSize(size)
-            res[k] = size
-        }
-
-        res['__size'] = totalSize
-
-        return res
-    }
-
-    throw new Error(`Bad type: ${JSON.stringify(o)}`)
-}
-
-
-function escapeRegExp(pattern: string) {
-    return pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 }
 
 export interface HookContext {
@@ -1286,18 +1133,31 @@ export interface Symbol {
     line: number // 0-indexed
     column: number // 0-indexed
     fileName: string
+    specifier?: string // specific to the consumer
+    packageRef?: string // normalized ref
 }
 
 export interface ExecutionScope {
-    isNewExpression?: boolean
     callSite?: Symbol
     assignment?: Symbol
     namespace?: Symbol[]
+    // This can generally be derived from the symbol location, we add 
+    // it here to further decouple from the source
+    declaration?: Symbol[]
+    isNewExpression?: boolean
+}
+
+interface IndexedScope {
+    callSite: number
+    assignment?: number
+    namespace?: number[]
+    declaration?: number[]
+    isNewExpression?: boolean
 }
 
 export interface TerraformSourceMap {
     symbols: Symbol[]
-    resources: Record<string, { scopes: { isNewExpression?: boolean; callSite: number; assignment?: number; namespace?: number[] }[] }>
+    resources: Record<string, Record<string, { scopes: IndexedScope[] }>>
 }
 
 export interface PackageInfo {
@@ -1324,24 +1184,19 @@ interface ResolvedDependency {
     readonly versionConstraint: string
 }
 
-interface MoveCommand {
-    scope: string
-    name: string
-    type?: 'fixup'
-}
-
-// These are embedded as comments into the Terraform format
-interface Extensions {
+// This is added as a separate object beneath the root template
+export interface TemplateMetadata {
     deployTarget?: string
     secrets?: Record<string, string> // TODO: make secrets into a proper data source
     sourceMap?: TerraformSourceMap
-    moveCommands?: MoveCommand[]
     synapseVersion?: string
+
+    // `null` is used to represent accesses when the var was undefined
+    envVarHashes?: Record<string, string | null>
 }
 
 function initTfJson(): TfJson {
     return {
-        '//': {},
         provider: {},
         resource: {},
         data: {},
@@ -1374,58 +1229,45 @@ function strcmp(a: string, b: string) {
 }
 
 interface SourceMapper {
-    addSymbols(resourceName: string, scopes: ExecutionScope[]): void
+    addSymbols(resourceType: string, resourceName: string, scopes: ExecutionScope[]): void
     getSourceMap(): TerraformSourceMap
+}
+
+export interface EmitResult {
+    finalize: (extraMetadata?: Partial<TemplateMetadata>) => {
+        json: TfJson & { metadata?: TemplateMetadata }
+        binary: Buffer
+    }
 }
 
 function emitTerraformJson(
     state: State,
     sourceMapper: SourceMapper,
-    hooks: { before?: SynthHook[] } = {},
-): { main: TfJson } {
+): EmitResult {
     const tfJson: TfJson = {
         ...initTfJson(),
     }
 
-    const synthedSizes: Record<string, number> = {}
-
-    const hookContext: HookContext = {
-        moveResource(from, to) {
-            const type = to.type
-            tfJson.moved.push({
-                from: type + '.' + from,
-                to: type + '.' + to.name,
-            })
-        },
-    }
-
-    function before(element: TerraformElement) {
-        if (!hooks.before) {
-            return element
-        }
-
-        return hooks.before.reduce((a, b) => b(a, hookContext) ?? a, element)
-    }
-
     const sortedResources = Array.from(state.registered.entries()).sort((a, b) => strcmp(a[0], b[0]))
     for (const [k, v] of sortedResources) {
-        const element = before(v[internalState] as TerraformElement)
-        element.state['module_name'] = getModuleName(element)
-
+        const element = v[internalState] as TerraformElement
+        if (element.kind === 'resource') {
+            element.state['module_name'] = getModuleName(element)
+        }
         const mappings = v[mappingsSym]
-        const synthed = synth(element.state, mappings, element)
+        const synthed = finalize(element.state, mappings, element)
         const name = element.name
 
         // Only add symbols for resources for now. Providers/data nodes aren't as useful to show
         // without resolving them i.e. calling the provider
         const scopes = (element as InternalState).scopes
         if (scopes && element.kind === 'resource') {
-            sourceMapper.addSymbols(`${element.type}.${element.name}`, scopes)
+            sourceMapper.addSymbols(element.type, name, scopes)
         }
 
         if (element.kind === 'provider') {
             if (!isDefaultProvider(element)) {
-                synthed['alias'] = element.name
+                synthed['alias'] = name
             }
 
             tfJson.provider[element.type] ??= []
@@ -1448,12 +1290,12 @@ function emitTerraformJson(
         }
     }
 
+    // Prune all refs that were inlined
     const pruned = new Set<string>()
     const sortedSerialized = Array.from(state.serialized.entries()).sort((a, b) => strcmp(a[0] as string, b[0] as string))
     for (const [id, v] of sortedSerialized) {
-        if (v.refCount > 1 || v.isMoveable) {
-            const element = v.obj[internalState] as TerraformElement
-            tfJson.locals[v.name] = synth(element.state, undefined, element)
+        if (v.refCount > 1 || (v.data.flags & SerializationFlags.Moveable)) {
+            tfJson.locals[id] = finalize(v.element.state)
         } else {
             pruned.add(id as string)
         }
@@ -1461,20 +1303,20 @@ function emitTerraformJson(
 
     if (state.tables) {
         // Merge all transitive data segments
-        function merge(ctx: Context, seen = new Set<string>()): Record<string, string> {
-            const m: Record<string, string> = {}
+        function merge(ctx: Context, seen = new Set<string>()): Record<string, Expression> {
+            const m: Record<string, Expression> = {}
             function visit(id: string) {
                 if (seen.has(id)) {
                     return
                 }
                 
                 seen.add(id)
-                const o = state.serialized.get(id)!
-                for (const d of o.deps) {
+                const { data } = state.serialized.get(id)!
+                for (const d of data.deps) {
                     visit(d)                    
                 }
                 if (!pruned.has(id)) {
-                    m[o.idOverride ?? id] = `\${local.${o.name}}`
+                    m[data.idOverride ?? id] = createLocalReference(id)
                 }
             }
 
@@ -1482,8 +1324,9 @@ function emitTerraformJson(
                 visit(k)
             }
 
-            return Object.fromEntries(Object.entries(m).sort(([a, b]) => strcmp(a[0], b[0])))
+            return Object.fromEntries(Object.entries(m).sort((a, b) => strcmp(a[0], b[0])))
         }
+
         const sortedTable = Array.from(state.tables.entries()).sort((a, b) => strcmp(a[1].name, b[1].name))
         for (const [t, { name }] of sortedTable) {
             tfJson.locals[name] = merge(t)
@@ -1492,19 +1335,36 @@ function emitTerraformJson(
 
     for (const [k, v] of state.backends.entries()) {
         const backend = tfJson.terraform.backend ??= {}
-        backend[k] = synth(v, {})
+        backend[k] = finalize(v, {})
     }
+
+    const metadata: TemplateMetadata = {}
 
     if (state.secrets.size > 0) {
-        tfJson['//']!.secrets = Object.fromEntries(state.secrets.entries())
+        metadata.secrets = Object.fromEntries(state.secrets.entries())
     }
 
-    tfJson['//']!.sourceMap = sourceMapper.getSourceMap()
-    tfJson['//']!.moveCommands = moveCommands
+    metadata.sourceMap = sourceMapper.getSourceMap()
 
     deleteEmptyKeys(tfJson)
 
-    return { main: tfJson }
+    function finalizeTemplate(extraMetadata?: Partial<TemplateMetadata>) {
+        for (const [k, v] of Object.entries(extraMetadata ?? {})) {
+            (metadata as any)[k] = v
+        }
+
+        const sorted = Object.fromEntries(Object.entries(metadata).sort((a, b) => strcmp(a[0], b[0])))
+        tfJson['//'] = sorted
+
+        const binary = createBinarySerializer().serialize(tfJson)
+
+        return {
+            binary,
+            json: tfJson,
+        }
+    }
+
+    return { finalize: finalizeTemplate }
 }
 
 const uncapitalize = (s: string) => s ? s.charAt(0).toLowerCase().concat(s.slice(1)) : s
@@ -1572,39 +1432,26 @@ export function overrideId(o: any, id: string) {
     return o
 }
 
-function synth(obj: any, mappings?: Record<string, any>, parent?: TerraformElement): any {
-    if (isElement(obj)) {
-        return obj.toString()
-    }
+function finalize(obj: any, mappings?: Record<string, any>, parent?: TerraformElement): any {
+    const exp = maybeGetExpression(obj)
+    if (exp) {
+        if (exp.kind === ExpressionKind.Serialize) {
+            doSerialize(exp as SerializeExpression)
+        }
 
-    if (Array.isArray(obj)) {
-        return obj.map(x => synth(x, mappings))
-    }
-
-    if (obj instanceof RegExp) {
-        return `/${obj.source}/`
+        return obj
     }
 
     if (typeof obj !== 'object' || !obj) {
         return obj
     }
 
-    if (isDataPointer(obj)) {
-        return `\${${renderDataPointer(obj)}}`
+    if (Array.isArray(obj)) {
+        return obj.map(x => finalize(x, mappings))
     }
 
-    if (Object.prototype.hasOwnProperty.call(obj, Symbol.toPrimitive)) {
-        // Try serializing the target as a ref first before falling back to a literal
-        const res = obj[Symbol.toPrimitive]('object')
-        if (res === undefined) {
-            return obj[Symbol.toPrimitive]('string')
-        }
-
-        if (typeof res === 'string') {
-            return `\${${res}}`
-        }
-
-        return synth(res)
+    if (obj[tableRefSym] || isDataPointer(obj) || obj instanceof RegExp) {
+        return obj
     }
 
     const res: Record<string, any> = {}
@@ -1612,9 +1459,9 @@ function synth(obj: any, mappings?: Record<string, any>, parent?: TerraformEleme
         if (k === 'module_name') {
             res[k] = v
         } else if (k === 'lifecycle' && Array.isArray(v)) {
-            res[k] = v.map(x => synthLifecycle(x, mappings ?? {}))
+            res[k] = v.map(x => finalizeLifecycle(x, mappings))
         } else if (k === 'depends_on' && Array.isArray(v) && parent) {
-            res[k] = v.filter(x => expressionSym in x).map(x => render(x[expressionSym]))
+            res[k] = v.filter(x => expressionSym in x)
         } else if (k === 'provider' && (parent?.kind === 'resource' || parent?.kind === 'data-source')) {
             if (!isElement(v)) {
                 throw new Error(`Expected element value for key: ${k}`)
@@ -1622,38 +1469,27 @@ function synth(obj: any, mappings?: Record<string, any>, parent?: TerraformEleme
 
             const element = v[internalState]
             if (!isDefaultProvider(element)) {
-                res[k] = `${element.type}.${element.name}`
+                res[k] = createRefExpression({ kind: 'provider', type: element.type, name: element.name })
             }
         } else {
-            res[mappings ? mapKey(k, mappings) : k] = synth(v, mappings?.[k])
+            res[mapKey(k, mappings)] = finalize(v, mappings?.[k])
         }
     }
 
     return res
 }
 
-function synthLifecycle(obj: any, mappings: Record<string, any>) {
+function finalizeLifecycle(obj: any, mappings?: Record<string, any>) {
     const ignoreChanges = Array.isArray(obj['ignore_changes'])
         ? obj['ignore_changes'].map(k => mapKey(k, mappings))
         : undefined
 
      const replaceTriggeredBy = Array.isArray(obj['replace_triggered_by'])
-        ? obj['replace_triggered_by'].filter(x => expressionSym in x).map(x => render(x[expressionSym]))
-        : undefined
-
-    const hook = Array.isArray(obj['hook'])
-        ? obj['hook'].map(x => {
-            return {
-                kind: x.kind,
-                input: x.input.toString(),
-                handler: x.handler.toString(),
-            }
-        })
+        ? obj['replace_triggered_by'].filter(x => expressionSym in x)
         : undefined
 
     return {
         ...obj,
-        hook,
         ignore_changes: ignoreChanges,
         replace_triggered_by: replaceTriggeredBy,
     }
@@ -1708,7 +1544,7 @@ function getExcludeSet(exclude: Iterable<any>) {
 }
 
 export function addIndirectRefs<T extends Record<PropertyKey, any> | Function>(dst: T, src: any, exclude?: Iterable<any>) {
-    const arr = (dst as any)[indirectRefs] ??= []
+    const arr: BareReference[] = (dst as any)[indirectRefs] ??= []
 
     if (typeof src === 'function' && src[moveable]) {
         arr.push(src)
@@ -1723,49 +1559,16 @@ export function addIndirectRefs<T extends Record<PropertyKey, any> | Function>(d
             case ExpressionKind.Reference:
             case ExpressionKind.ElementAccess:
             case ExpressionKind.PropertyAccess:
-                const ref = render(exp)
-                if (!arr.includes(ref)) {
-                    arr.push(ref)
+                if (!arr.find(e => e.target === exp)) {
+                    arr.push({
+                        kind: ExpressionKind.BareReference,
+                        target: exp as any,
+                    })
                 }
         }
     }
 
     return dst
-}
-
-const moveCommands: MoveCommand[] = []
-export function move(from: string, to?: string): void {
-    const scope = getScopedId()
-    if (!scope) {
-        throw new Error(`Failed to move "${from}": not within a scope`)
-    }
-
-    if (to) {
-        moveCommands.push({
-            name: from,
-            scope: `${scope}--${to}`,
-        })
-
-        return
-    }
-
-    moveCommands.push({
-        name: from,
-        scope,
-    })
-}
-
-export function fixupScope(name: string): void {
-    const scope = getScopedId()
-    if (!scope) {
-        throw new Error(`Failed to fixup with name "${name}": not within a scope`)
-    }
-
-    moveCommands.push({
-        name,
-        scope,
-        type: 'fixup',
-    })
 }
 
 function getTestContext() {
@@ -1792,7 +1595,13 @@ function getDefaultProvider(type: string) {
         return
     }
 
-    return __getDefaultProvider(type)
+    // We need to enter the provider context
+    const p = __getDefaultProvider(type)
+    if (p !== undefined) {
+        getProviders()[type] ??= [p]
+    }
+
+    return p
 }
 
 declare var __registerProvider: (cls: new () => any) => boolean
@@ -1844,22 +1653,15 @@ export function createTerraformClass<T = any>(
 
     const c = class {
         static [terraformClassKey] = `${kind}.${type}`
-        static [peekNameSym] = () => `${type}.${peekName(type, kind, getScopedId(true))}`
+        static [peekNameSym] = () => `${type}.${getScopedId(type, kind, undefined, true)}`
 
-        constructor(...args: any[]) {
-            const props = (typeof args[args.length - 1] !== 'string' ? args[args.length - 1] : args[args.length - 2]) ?? {}
-            const csType = isSynapse ? props['type'] : undefined
-            const name = typeof args[args.length - 1] === 'string' 
-                ? args[args.length - 1] 
-                : generateName(type, kind, getScopedId(), csType)
+        constructor(props: any = {}) {
+            const name = getScopedId(type, kind, isSynapse ? props['type'] : undefined)
 
             if (kind === 'resource' || kind === 'data-source') {
                 props['provider'] = getProviderForElement({ name, type })
             } else if (kind === 'provider') {
                 Object.assign(this, props)
-                // Object.defineProperty(this, Symbol.for('synapse.context'), {
-                //     get: () => ({ [type]: proxy })
-                // })
             }
 
             const state = {
@@ -1870,9 +1672,9 @@ export function createTerraformClass<T = any>(
                 version,
                 mappings,
                 state: props,
-                module: getModuleId() ?? '__global',
-                testContext: getTestContext(),
-                scopes: globalFunctions.getScopes(),
+                module: kind === 'resource' ? (getModuleId() ?? '__global') : undefined,
+                testContext: kind === 'resource' ? getTestContext() : undefined,
+                scopes: kind === 'resource' ? globalFunctions.getScopes() : undefined,
             }
 
             const proxy = createEntityProxy(this, state, mappings)
@@ -1904,6 +1706,7 @@ export function createSynapseClass<T, U>(
 
     const cls = class extends createTerraformClass(tfType, kind) {
         static [terraformClassKey] = `${kind}.${tfType}.${type}`
+        static [peekNameSym] = () => `${kind === 'data-source' ? 'data.' : ''}${tfType}.${getScopedId(tfType, kind, type, true)}`
 
         public constructor(config: T) {
             if (kind === 'provider') {
@@ -1941,9 +1744,9 @@ export function createSynapseClass<T, U>(
 }
 
 const functions = {
-    jsonencode: (obj: any) => '' as string,
-    encoderesource: (obj: any) => '' as string,
+    // This is a special function which is not actually rendered as a function
     serialize: (obj: any) => ({}) as any,
+    jsonencode: (obj: any) => '' as string,
     jsondecode: (str: string) => ({}) as any,
     dirname: (path: string) => '' as string,
     trimprefix: (target: string, prefix: string) => '' as string,
@@ -1956,15 +1759,48 @@ const functions = {
     generateidentifier: (targetId: string, attribute: string, maxLength: number, sep?: string) => '' as string,
 }
 
-export const Fn = createFunctions(k => (...args: any[]) => createCallExpression(k, args, { 
-    ['__serializer']: getSerializer({
-        moduleId: getModuleId() ?? '__global',
-        testContext: getTestContext(),
-        dataTable: {},
-    }),
-}))
+const serializeExps = new Map<SerializeExpression, { result?: { captured: any, table: any, __isDeduped: true } }>()
 
-// export declare function registerBeforeSynthHook(callback: SynthHook): void
+function doSerialize(exp: SerializeExpression) {
+    if (serializeExps.get(exp)?.result) {
+        return serializeExps.get(exp)!.result
+    }
+
+    const captured = exp.serializer.serialize(exp.arguments[0])
+    const table = exp.serializer.getTable()
+    const result = { captured, table, __isDeduped: true } as const
+    serializeExps.set(exp, { result })
+
+    return result
+}
+
+export const Fn = createFunctions(k => {
+    if (k !== 'serialize') {
+        return (...args: any[]) => createCallExpression(k, args)
+    }
+    
+    return (...args: any[]) => {
+        if (args.length !== 1) {
+            throw new Error(`Serialize requires 1 argument`)
+        }
+
+        const serializer = getSerializer({
+            moduleId: getModuleId() ?? '__global',
+            testContext: getTestContext(),
+            dataTable: {},
+        })
+
+        const exp: SerializeExpression = {
+            kind: ExpressionKind.Serialize,
+            serializer,
+            arguments: args as [any],
+        }
+
+        serializeExps.set(exp, {})
+
+        return createProxy(exp as Expression, undefined, maybeGetMappings(args[0]))        
+    }
+})
 
 function createFunctions(factory: <T extends keyof typeof functions>(name: T) => (typeof functions)[T]): typeof functions {
     return Object.fromEntries(
@@ -1977,8 +1813,8 @@ export interface State {
     backends: Map<string, any>
     moved: { from: string, to: string }[]
     names: Set<string>
-    serialized: Map<number | string, { obj: any; name: string; refCount: number, isMoveable: boolean, ctx: Context, deps: string[]; idOverride?: string }>
-    tables: Map<Context, { ref: string; name: string }>
+    serialized: Map<number | string, { element: TerraformElement; refCount: number, data: SerializationData }>
+    tables: Map<Context, { ref: Expression; name: string }>
     serializers: Map<string, ReturnType<typeof createSerializer>>
     secrets: Map<string, string>
 }
@@ -1995,13 +1831,21 @@ export function isProviderClass(o: any) {
 
 export const customClassKey = Symbol('customClassKey')
 
+export function getResourceName(r: any): string {
+    if (!isElement(r)) {
+        throw new Error('Not a resource')
+    }
+
+    return r[internalState].name
+}
+
 let globalFunctions: {
     getState: () => State,
-    getScopedId: (peek?: boolean) => string | undefined,
+    getScopedId: (type: string, kind: TerraformElement['kind'], suffix?: string, peek?: boolean) => string,
     getModuleId: () => string | undefined
     getProviders: () => Record<string, any[]>
-    exportSymbols?: (getSymbolId: (sym: Symbol) => number) => void
     getScopes: () => ExecutionScope[]
+    unwrapProxy: (o: any, checkPrototype?: boolean) => any
 }
 
 function assertInit() {
@@ -2016,10 +1860,10 @@ function getState() {
     return globalFunctions.getState()
 }
 
-function getScopedId(peek?: boolean) {
+function getScopedId(type: string, kind: TerraformElement['kind'], suffix?: string, peek?: boolean) {
     assertInit()
 
-    return globalFunctions.getScopedId(peek)
+    return globalFunctions.getScopedId(type, kind, suffix, peek)
 }
 
 function getProviders() {
@@ -2047,36 +1891,13 @@ function getSerializer(ctx: Context) {
     return serializer.withContext(ctx)
 }
 
-function peekName(type: string, kind: TerraformElement['kind'] | 'local', prefix?: string, suffix?: string) {
-    let count = 0
-    const resolvedPrefix = prefix ?? `${kind === 'provider' ? '' : `${kind}-`}${type}`
-    const cleanedPrefix = resolvedPrefix.replace(/\$/g, 'S-') // XXX
-    const getName = () => `${cleanedPrefix || 'default'}${suffix ? `--${suffix}` : ''}${count === 0 ? '' : `-${count}`}`
-    while (getState().names.has(`${type}.${getName()}`)) count++
-
-    return getName()
-
-    // if (kind === 'provider' && isDefaultProviderName(finalName, type)) {
-    //     return finalName
-    // }
-
-    // return 'r-' + require('crypto').createHash('sha256').update(finalName).digest('hex')
-}
-
-function generateName(type: string, kind: TerraformElement['kind'] | 'local', prefix?: string, suffix?: string) {
-    const finalName = peekName(type, kind, prefix, suffix)
-    getState().names.add(`${type}.${finalName}`)
-
-    return finalName
-}
-
 export function init(
     getState: () => State,
-    getScopedId: (peek?: boolean) => string | undefined,
+    getScopedId: (type: string, kind: TerraformElement['kind'], suffix?: string, peek?: boolean) => string,
     getModuleId: () => string | undefined,
     getProviders: () => Record<string, any[]>,
     getScopes: () => ExecutionScope[],
-    exportSymbols?: (getSymbolId: (sym: Symbol) => number) => void,
+    unwrapProxy: (o: any, checkPrototype?: boolean) => any
 ) {
     globalFunctions = { 
         getState, 
@@ -2084,7 +1905,7 @@ export function init(
         getProviders,
         getModuleId,
         getScopes,
-        exportSymbols,
+        unwrapProxy,
     }
 
     function registerBackend(type: string, config: any) {
@@ -2120,28 +1941,31 @@ export function init(
         resources: {}
     }
 
-    const symbolIds = new Map<string, number>()
+    const symbolIds = new Map<Symbol, number>()
     function getSymbolId(symbol: Symbol) {
-        const key = `${symbol.fileName}:${symbol.line}:${symbol.column}`
-        if (!symbolIds.has(key)) {
-            symbolIds.set(key, symbolIds.size)
+        if (!symbolIds.has(symbol)) {
+            const id = symbolIds.size
+            symbolIds.set(symbol, id)
             sourceMap.symbols.push(symbol)
+
+            return id
         }
 
-        return symbolIds.get(key)!
+        return symbolIds.get(symbol)!
     }
 
-    function addSymbols(resourceName: string, scopes: ExecutionScope[]) {
-        const relevantScopes = scopes.filter(s => !!s.callSite)
-        const mapped = relevantScopes.map(s => ({
+    function addSymbols(resourceType: string, resourceName: string, scopes: ExecutionScope[]) {
+        const mapped = scopes.filter(s => !!s.callSite).map(s => ({
             isNewExpression: s.isNewExpression,
             callSite: getSymbolId(s.callSite!),
             assignment: s.assignment ? getSymbolId(s.assignment) : undefined,
             namespace: s.namespace?.map(getSymbolId),
+            declaration: s.declaration?.map(getSymbolId),
         }))
 
         if (mapped.length > 0) {
-            sourceMap.resources[resourceName] = { scopes: mapped }
+            const byType = sourceMap.resources[resourceType] ??= {}
+            byType[resourceName] = { scopes: mapped }
         }
     }
 
@@ -2155,12 +1979,522 @@ export function init(
         registerSecret,
         registerBackend,
         registerBeforeSynthHook,
-        emitTerraformJson: () => {
-            if (globalFunctions.exportSymbols) {
-                globalFunctions.exportSymbols(getSymbolId)
+        emitTerraformJson: () => emitTerraformJson(getState(), sourceMapper)
+    }
+}
+
+function quote(s: string) {
+    // TODO: handle already escaped quotes...
+    const escaped = s.replaceAll('"', '\\"')
+
+    return `"${escaped}"`
+}
+
+function renderResourceIdPart(part: string) {
+    if (part.includes('.')) {
+        return quote(part)
+    }
+
+    return part
+}
+
+const enum ValueKind {
+    _,
+    Boolean,
+    Null,
+    u32,
+    i32,
+    u64,
+    i64,
+    f64,
+    String,
+    EmptyString,
+    RegExp,
+    Object,
+    Array,
+    Identifier,
+    CallExpression,
+    PropertyAccess,
+    ElementAccess,
+    AddExpression,
+}
+
+function createBinarySerializer() {
+    const strings = new Map<string, number>()
+    function indexString(s: string) {
+        if (strings.has(s)) {
+            return strings.get(s)!
+        }
+
+        const index = strings.size
+        strings.set(s, index)
+
+        return index
+    }
+
+    // FIXME: don't use a fixed buffer, either find the size ahead of time or dynamically resize
+    let offset = 0
+    let buf = Buffer.allocUnsafe(4 * 1024 * 1024)
+
+    function writeSized(writer: () => void) {
+        offset += 4
+        const start = offset
+        writer()
+        buf.writeUint32LE(offset - start, start - 4)
+    }
+
+    function writeObject(obj: Record<string, any>) {
+        writeKind(ValueKind.Object)
+        writeSized(() => {
+            const entries = Object.entries(obj).filter(([_, v]) => v !== undefined)
+            buf.writeUInt32LE(entries.length, offset)
+            offset += 4
+    
+            for (const [k, v] of entries) {
+                writeIndexedString(k)
+                writeValue(v)
+            }
+        })
+    }
+
+    function writeArrayInner(arr: any[]) {
+        buf.writeUInt32LE(arr.length, offset)
+        offset += 4
+
+        for (const el of arr) {
+            writeValue(el)
+        }    
+    }
+
+    function writeArray(arr: any[]) {
+        writeKind(ValueKind.Array)
+        writeSized(() => {
+            writeArrayInner(arr)
+        })
+    }
+
+    function maybeWriteExpressions(s: string) {
+        const maybeExpressions = s.split(`\${${expressionMarker}`)   
+        if (maybeExpressions.length === 1) {
+            return false
+        }
+
+        const cleaned = [maybeExpressions[0]]
+        const expressions: Expression[] = []
+        for (let i = 1; i < maybeExpressions.length; i++) {
+            const rightBrace = maybeExpressions[i].indexOf('}')
+            if (rightBrace === -1) {
+                throw new Error(`Missing right brace: ${maybeExpressions[i]} [source: ${s}]`)
             }
 
-            return emitTerraformJson(getState(), sourceMapper, { before: beforeSynthHooks })
+            const index = maybeExpressions[i].slice(0, rightBrace)
+            expressions.push(renderedExpressions.get(index)!)
+            cleaned.push(maybeExpressions[i].slice(rightBrace + 1))
+        }
+
+        if (cleaned[0] === '' && cleaned.length === 1 && expressions.length === 1) {
+            writeExpression(expressions[0])
+
+            return true
+        }
+
+
+        let lhs: BinaryExpression = {
+            kind: ExpressionKind.Add,
+            lhs: { kind: ExpressionKind.Literal, value: cleaned[0] } as Literal,
+            rhs: expressions[0]
+        }
+
+        // TODO: prune empty strings
+        for (let i = 1; i < cleaned.length; i++) {
+            const n1 = {
+                kind: ExpressionKind.Add,
+                lhs,
+                rhs: { kind: ExpressionKind.Literal, value: cleaned[i] } as Literal,
+            }
+
+            lhs = n1
+
+            if (expressions[i]) {
+                const n2 = {
+                    kind: ExpressionKind.Add,
+                    lhs,
+                    rhs: expressions[i]
+                }
+
+                lhs = n2
+            }
+        }
+
+        writeExpression(lhs)
+
+        return true
+    }
+
+    function writeString(s: string) {
+        if (maybeWriteExpressions(s)) {
+            return
+        }
+
+        if (s === '') {
+            return writeKind(ValueKind.EmptyString)
+        }
+
+        writeStringChecked(s)
+    }
+
+    function writeStringChecked(s: string) {
+        writeKind(ValueKind.String)
+        writeIndexedString(s)
+    }
+
+    const i32Threshold = -(2**31)
+    const u32Threshold = 2**32
+
+    function writeNumber(n: number) {
+        if (!Number.isInteger(n)) {
+            writeKind(ValueKind.f64)
+            buf.writeDoubleLE(n, offset)
+            offset += 8
+            return
+        }
+
+        if (n < 0) {
+            if (n <= i32Threshold) {
+                writeKind(ValueKind.i32)
+                buf.writeInt32LE(n, offset)
+                offset += 4
+                return
+            }
+
+            writeKind(ValueKind.i64)
+
+            buf.writeIntLE(n, offset, 6)
+            buf.writeUInt16LE(0xFFFF, offset + 6)
+            offset += 8
+        } else {
+            if (n < u32Threshold) {
+                writeKind(ValueKind.u32)
+                buf.writeUint32LE(n, offset)
+                offset += 4
+                return
+            }
+
+            writeKind(ValueKind.u64)
+
+            buf.writeUIntLE(n, offset, 6)
+            buf.writeUInt16LE(0, offset + 6)
+            offset += 8
         }
     }
+
+    function writeIndexedString(s: string) {
+        buf.writeUInt32LE(indexString(s), offset)
+        offset += 4
+    }
+
+    function writeKind(kind: ValueKind) {
+        buf[offset] = kind
+        offset += 1
+    }
+
+    function writeCallExpression(name: string, args: any[]) {
+        writeKind(ValueKind.CallExpression)
+        writeSized(() => {
+            writeIndexedString(name)
+            writeArrayInner(args)
+        })
+    }
+
+    function writeReference(exp: ReferenceExpression) {
+        writeKind(ValueKind.PropertyAccess)
+        writeSized(() => {
+            if (exp.target.kind === 'data-source') {
+                writePropertyAccess('data', exp.target.type)
+            } else {
+                writeKind(ValueKind.Identifier)
+                writeIndexedString(exp.target.type)
+            }
+    
+            writeIndexedString(exp.target.name)
+        })
+    }
+
+    function writePropertyAccess(exp: string | Expression, member: string) {
+        writeKind(ValueKind.PropertyAccess)
+        writeSized(() => {
+            if (typeof exp === 'string') {
+                writeKind(ValueKind.Identifier)
+                writeIndexedString(exp)
+            } else {
+                writeExpression(exp)
+            }
+            writeIndexedString(member)
+        })
+    }
+
+    function writeElementAccess(exp: any, element: any) {
+        writeKind(ValueKind.ElementAccess)
+        writeSized(() => {
+            writeExpression(exp)
+            writeExpression(element)
+        })
+    }
+
+    function writeAddExpression(lhs: Expression, rhs: Expression) {
+        writeKind(ValueKind.AddExpression)
+        writeSized(() => {
+            writeExpression(lhs)
+            writeExpression(rhs)
+        })
+    }
+
+    function writeSerialization(exp: SerializeExpression) {
+        writeValue(doSerialize(exp))
+    }
+
+    function isBareReferenceTarget(exp: Expression): exp is BareReference['target'] {
+        switch (exp.kind) {
+            case ExpressionKind.Reference:
+            case ExpressionKind.ElementAccess:
+            case ExpressionKind.PropertyAccess:
+                return true
+        }
+
+        return false
+    }
+
+    function writeBareReference(exp: BareReference) {
+        const parts: string[] = []
+
+        let current: BareReference['target'] = exp.target
+
+        loop: while (true) {
+            switch (current.kind) {
+                case ExpressionKind.Reference:
+                    parts.unshift(current.target.type, current.target.name)
+                    break loop
+
+                case ExpressionKind.ElementAccess:
+                case ExpressionKind.PropertyAccess:
+                    const target = (current as PropertyAccessExpression | ElementAccessExpression).expression
+                    if (!isBareReferenceTarget(target)) {
+                        return
+                    }
+
+                    current = target
+                    break
+            }
+        }
+
+        if (parts.length === 0) {
+            return
+        }
+
+        // writeStringChecked(parts.map(renderResourceIdPart).join('.'))
+        writeStringChecked(parts.join('.'))
+    }
+
+    function writeExpression(exp: Expression): void {
+        switch (exp.kind) {
+            case ExpressionKind.Call:
+                return writeCallExpression((exp as CallExpression).target, (exp as CallExpression).arguments)
+            case ExpressionKind.Reference:
+                return writeReference((exp as ReferenceExpression))
+            case ExpressionKind.PropertyAccess:
+                return writePropertyAccess((exp as PropertyAccessExpression).expression, (exp as PropertyAccessExpression).member)
+            case ExpressionKind.ElementAccess:
+                return writeElementAccess((exp as ElementAccessExpression).expression, (exp as ElementAccessExpression).element)
+            case ExpressionKind.Add:
+                return writeAddExpression((exp as BinaryExpression).lhs, (exp as BinaryExpression).rhs)
+            case ExpressionKind.Literal:
+                return writeValue((exp as Literal).value)
+            case ExpressionKind.Serialize:
+                return writeSerialization(exp as SerializeExpression)
+            case ExpressionKind.BareReference:
+                return writeBareReference(exp as BareReference)
+        }
+    }
+    
+    function writeObjectLike(v: any): void {
+        const exp = maybeGetExpression(v)
+        if (exp) {
+            return writeExpression(exp)
+        }
+
+        if (Array.isArray(v)) {
+            return writeArray(v)
+        }
+    
+        if (isRegExp(v)) {
+            writeKind(ValueKind.RegExp)
+            return writeIndexedString(v.source)
+        }
+
+        if (isDataPointer(v)) {
+            const { hash, storeHash } = v.resolve()
+
+            return writeCallExpression('markpointer', [hash, storeHash])
+        }
+
+        if (v[tableRefSym]) {
+            return writeValue(v[tableRefSym]())
+        }
+
+        if (typeof v === 'function') {
+            throw new Error(`Failed to serialize function: ${v.toString()}`)
+        }
+
+        return writeObject(v)
+    }
+
+    function writeValue(v: any) {
+        if (v === null || v === undefined) {
+            return writeKind(ValueKind.Null)
+        }
+
+        switch (typeof v) {
+            case 'object':
+            case 'function':        
+                return writeObjectLike(v)
+            case 'string':
+                return writeString(v)
+            case 'number':
+                return writeNumber(v)
+            case 'boolean':
+                writeKind(ValueKind.Boolean)
+                buf[offset] = v ? 1 : 0
+                offset += 1
+                break
+            
+            case 'bigint': // TODO
+            case 'symbol':
+                throw new Error(`Not serializeable: ${typeof v}`)
+        }
+    }
+    
+    function encodeStringTable() {
+        let totalSize = 0
+        const encoded: Buffer[] = []
+        for (const [k, v] of strings) {
+            encoded[v] = Buffer.from(k)
+            totalSize += encoded[v].byteLength + 4 // 4 bytes for the length
+        }
+
+        return { encoded, totalSize }
+    }
+
+    const version = 1
+
+    function serialize(obj: any) {
+        writeValue(obj)
+
+        const { encoded, totalSize } = encodeStringTable()
+
+        const numStrings = encoded.length
+        const finalBuf = Buffer.allocUnsafe(totalSize + offset + 4 + 4)
+
+        // `version` is the low byte, remaining 3 are reserved
+        finalBuf.writeUint32LE(version)
+        let offset2 = 4
+
+        finalBuf.writeUint32LE(numStrings, offset2)
+        offset2 += 4
+
+        for (const b of encoded) {
+            finalBuf.writeUint32LE(b.byteLength, offset2)
+            offset2 += 4
+            finalBuf.set(b, offset2)
+            offset2 += b.byteLength
+        }
+
+        finalBuf.set(buf.subarray(0, offset), offset2)
+
+        return finalBuf
+    }
+
+    return { serialize }
+}
+
+export function serializeAsJson(obj: any) {
+    const serialized: State['serialized'] = new Map()
+    const serializer = createSerializer(serialized).withContext({
+        moduleId: '',
+        dataTable: {},
+    })
+
+    function unwrap(obj: any): any {
+        if ((typeof obj !== 'function' && typeof obj !== 'object') || !obj) {
+            return obj
+        }
+
+        if (isElement(obj)) {
+            return unwrap(obj[internalState].state)
+        }
+
+        if (obj[tableRefSym]) {
+            return unwrap(obj[tableRefSym]())
+        }
+
+        if (isDataPointer(obj)) {
+            return obj
+        }
+
+        if (Array.isArray(obj)) {
+            return obj.map(unwrap)
+        }
+
+        const res: Record<string, any> = {}
+        for (const k of Object.keys(obj)) {
+            res[k] = unwrap(obj[k])
+        }
+
+        return res
+    }
+
+    const captured = unwrap(serializer.serialize(obj))
+    const table: Record<string, any> = {}
+    for (const [k, v] of serialized) {
+        if (v.refCount > 1 || (v.data.flags & SerializationFlags.Moveable)) {
+            table[k] = unwrap(v.element.state)
+        }
+    }
+    
+    return { captured, table, __isDeduped: true } as const
+}
+
+export function shouldSerializeDirectly(o: any, visited = new Set<any>()): boolean {
+    if (typeof o === 'function' || typeof o === 'symbol' || typeof o === 'bigint') { 
+        return false
+    }
+
+    if (typeof o !== 'object' || o === null) {
+        return true
+    }
+
+    if (isDataPointer(o)) {
+        return true
+    }
+
+    if (visited.has(o)) {
+        return false
+    }
+    visited.add(o)
+
+    if (Array.isArray(o)) {
+        return o.every(x => shouldSerializeDirectly(x, visited))
+    }
+
+    if (!isObjectOrNullPrototype(Object.getPrototypeOf(o))) {
+        return false
+    }
+
+    // This is somewhat lossy as we should only attempt to serialize 'simple' descriptors (value + writable + enumerable + configurable)
+    for (const desc of Object.values(Object.getOwnPropertyDescriptors(o))) {
+        if (desc.get || desc.set || !shouldSerializeDirectly(desc.value, visited)) {
+            return false
+        }
+    }
+
+    return true
 }

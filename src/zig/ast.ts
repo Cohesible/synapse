@@ -360,14 +360,21 @@ function toTsNode(node: zig.Node, treatPubAsExport?: boolean): ts.Node | undefin
     }
 }
 
-type AstRoot = zig.ContainerDecl & { subtype: 'root' }
+export type AstRoot = zig.ContainerDecl & { 
+    subtype: 'root'
+    shouldCompileAsWasm?: boolean
+}
 
 async function _getAst(sourceFile: string): Promise<AstRoot> {
     if ('parse' in (zig as any)) {
         const data = await getFs().readFile(sourceFile, 'utf-8')
         const rawAst = zig.parse(data)
+        const ast = JSON.parse(rawAst).container
+        if (data.startsWith('// @wasm') || data.startsWith('//# outputMode = wasm')) {
+            ast.shouldCompileAsWasm = true
+        }
 
-        return JSON.parse(rawAst).container
+        return ast
     }
 
     if (!('main' in (zig as any))) {
@@ -379,7 +386,7 @@ async function _getAst(sourceFile: string): Promise<AstRoot> {
     return ast.container
 }
 
-const getAst = keyedMemoize(_getAst)
+export const getAst = keyedMemoize(_getAst)
 
 function generateSourceFile(root: AstRoot, treatPubAsExport?: boolean) {
     const statements = root.members.map(m => {
@@ -399,12 +406,15 @@ function generateSourceFile(root: AstRoot, treatPubAsExport?: boolean) {
 interface Param {
     readonly name: string
     readonly type: string
+    readonly typeNode: zig.Node
 }
 
 export interface ExportedFn {
     readonly name: string
     readonly params: Param[]
     readonly returnType: string
+    readonly returnTypeNode: zig.Node
+    readonly isModuleExport?: boolean
 }
 
 export interface ImportedModule {
@@ -422,7 +432,7 @@ function toSimpleType(node: zig.Node): string {
 
             const converted = convertType(n.name)
             if (!converted) {
-                throw new Error(`Unknown type: ${n.name}`)
+                return 'any'
             }
 
             return 'number'
@@ -450,11 +460,11 @@ function toSimpleType(node: zig.Node): string {
         }
     }
 
-    throw new Error(`Not implemented: ${JSON.stringify(n)}`)
+    return 'any'
 }
 
 // FIXME: this check is too simplistic
-function isNativeModule(ast: AstRoot) {
+export function hasModuleRegistration(ast: AstRoot) {
     return !!ast.members.map(createSyntheticUnion)
         .find(m => {
             if (m.$type !== 'comptime_node' || !m.node) {
@@ -487,28 +497,45 @@ function getVarDecls(nodes: zig.Node[]): zig.VarDecl[] {
         .map(n => n as any as zig.VarDecl)
 }
 
+function maybeGetBuiltinCall(n: zig.CallExp) {
+    const exp = createSyntheticUnion(n.exp)
+    if (exp.$type !== 'ident' || !exp.name.startsWith('@')) {
+        return
+    }
+
+    return {
+        expression: n,
+        name: exp.name.slice(1),
+    }
+}
+
 function getBuiltinCalls(nodes: zig.Node[]): { expression: zig.CallExp, name: string }[] {
     const decls = getVarDecls(nodes)
     const initializers = decls.map(d => d.initializer).filter(isNonNullable)
+    const result: { expression: zig.CallExp, name: string }[] = []
 
-    return initializers.map(createSyntheticUnion).filter(n => n.$type === 'call_exp')
-        .map(n => n as any as zig.CallExp)
-        .map(n => {
-            const exp = createSyntheticUnion(n.exp)
-            if (exp.$type !== 'ident' || !exp.name.startsWith('@')) {
-                return
+    // TODO: traverse everything
+    function visit(node: zig.Node) {
+        const n = createSyntheticUnion(node)
+        switch (n.$type) {
+            case 'field_access':
+                return visit(n.exp)
+            case 'call_exp': {
+                const c = maybeGetBuiltinCall(n)
+                if (c) {
+                    result.push(c)
+                }
+                break
             }
+        }
+    }
 
-            return {
-                expression: n,
-                name: exp.name.slice(1),
-            }
-        })
-        .filter(isNonNullable)
+    initializers.forEach(visit)
+
+    return result
 }
 
-
-function getImportedModules(nodes: zig.Node[]) {
+export function getImportedModules(nodes: zig.Node[]) {
     return getBuiltinCalls(nodes)
         .filter(n => n.name === 'import')
         .map(n => {
@@ -528,39 +555,64 @@ export async function getImportedModulesFromFile(target: string) {
     const ast = await getAst(target)
     const dir = path.dirname(target)
 
-    const result = new Set<string>()
+    const deps = new Set<string>()
     for (const n of getImportedModules(ast.members)) {
         if (n.specifier.endsWith('.zig')) {
-            result.add(path.resolve(dir, n.specifier))
+            deps.add(path.resolve(dir, n.specifier))
         }
     }
 
-    return result
+    return { ast, deps }
+}
+
+export function renderNode(node: zig.Node): string {
+    const n = createSyntheticUnion(node)
+    switch (n.$type) {
+        case 'ident':
+            return n.name
+        case 'call_exp':
+            return `${renderNode(n.exp)}(${n.args.map(renderNode).join(', ')})`
+        case 'field_access':
+            return `${renderNode(n.exp)}.${n.member}`
+        case 'ptr_type':
+            return `${n.is_const ? `const ` : ''}*${renderNode(n.child_type)}`
+        case 'error_union':
+            return `${n.lhs ? renderNode(n.lhs) : ''}!${renderNode(n.rhs)}`
+    }
+
+    throw new Error(`Unhandled type: ${n.$type}`)
+}
+
+export function getExportedFunctions(ast: AstRoot) {
+    return ast.members.map(createSyntheticUnion).filter(n => {
+        return n.$type === 'fndecl'
+    })
+        .map(n => n as any as zig.FnDecl)
+        .filter(n => (n.qualifier === 'export' || n.visibility === 'pub') && n.name && n.return_type)
+        .map(n => ({
+            name: n.name!,
+            params: n.params.map(p => ({
+                name: p.name!,
+                type: toSimpleType(p.type_expr!),
+                typeNode: p.type_expr!,
+            })),
+            returnType: toSimpleType(n.return_type!),
+            returnTypeNode: n.return_type!,
+            isModuleExport: n.visibility === 'pub',
+        } satisfies ExportedFn))
 }
 
 export async function generateTsZigBindings(target: string) {
     const ast = await getAst(target)
-    const isModule = isNativeModule(ast)
-    const sf = generateSourceFile(ast, isModule)
+    const isModule = hasModuleRegistration(ast)
+    const sf = generateSourceFile(ast, isModule || !ast.shouldCompileAsWasm)
     const sourcemapHost = {
         getCurrentDirectory: () => process.cwd(),
         getCanonicalFileName: (fileName: string) => fileName,
     }
 
     const { text } = emitChunk(sourcemapHost, sf, undefined, { emitSourceMap: false, removeComments: true })
-    const exportedFunctions = ast.members.map(createSyntheticUnion).filter(n => {
-        return n.$type === 'fndecl'
-    })
-        .map(n => n as any as zig.FnDecl)
-        .filter(n => (n.qualifier === 'export' || (isModule || n.visibility === 'pub')) && n.name && n.return_type)
-        .map(n => ({
-            name: n.name!,
-            params: n.params.map(p => ({
-                name: p.name!,
-                type: isModule ? 'any' : toSimpleType(p.type_expr!),
-            })),
-            returnType: isModule ? 'any' : toSimpleType(n.return_type!),
-        } satisfies ExportedFn))
+    const exportedFunctions = getExportedFunctions(ast)
 
     // Requires `--allowArbitraryExtensions` for tsc
     const outfile = target.replace(/\.zig$/, '.d.zig.ts')
@@ -568,6 +620,7 @@ export async function generateTsZigBindings(target: string) {
 
     return {
         isModule,
+        shouldCompileAsWasm: ast.shouldCompileAsWasm,
         importedModules,
         exportedFunctions,
         typeDefinition: { name: outfile, text: text },

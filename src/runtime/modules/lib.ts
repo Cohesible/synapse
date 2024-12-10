@@ -22,7 +22,7 @@ export interface BundleOptions {
     /** @internal */
     readonly includeAssets?: boolean
 
-    /** @internal */
+    /** @internal */ 
     readonly arch?: 'aarch64' | 'x64'
 
     /** @internal */
@@ -71,15 +71,24 @@ export class Bundle extends core.Closure {
     }
 }
 
+interface ExportProps {
+    id?: string
+    destination?: string
+    source?: string
+    testSuiteId?: number
+    publishName?: string
+}
+ 
 //# resource = true
 /** @internal */
 export class Export extends core.Closure {
-    public constructor(target: any, opt?: { id?: string, destination?: string, source?: string, testSuiteId?: number; publishName?: string }) {
+    public constructor(target: any, opt?: ExportProps) {
         const normalizedLocation = opt?.destination 
             ? path.relative(core.cwd(), opt.destination)
             : undefined
 
         super({
+            kindHint: 'module',
             source: opt?.source,
             location: normalizedLocation,
             options: {
@@ -163,14 +172,17 @@ function tagPointer(ref: string): string {
     return Object.assign(ref as any, { [pointerSymbol]: true })
 }
 
-const nodeEnv = process.env['NODE_ENV']
-export function isProd() {
-    return nodeEnv === 'production' || envName?.includes('production')
+const vars: Record<string, string | undefined> = {}
+function getEnvVarLazy(key: string) {
+    return vars[key] ??= process.env[key]
 }
 
-const envName = process.env['SYNAPSE_ENV']
+export function isProd() {
+    return getEnvVarLazy('NODE_ENV') === 'production' || getEnvVarLazy('SYNAPSE_ENV')?.includes('production')
+}
+
 export function getEnvironmentName() {
-    return envName
+    return getEnvVarLazy('SYNAPSE_ENV')
 }
 
 /** @internal */
@@ -199,7 +211,7 @@ export function createFileAsset(filePath: string, opt?: { publishName?: string }
     async function resolve() {
         const artifactFs = core.getArtifactFs()
 
-        return artifactFs.resolveArtifact(pointer) //, { extname })
+        return artifactFs.resolveArtifact(pointer)
     }
 
     return {
@@ -343,6 +355,9 @@ export function generateIdentifier<T extends Record<string, any>, K extends keyo
     }
 
     const resourceId = (target[peekNameSym] as any)()
+    if (!resourceId) {
+        throw new Error(`Missing resource id for constructor: ${target.name}`)
+    }
     
     return Fn.generateidentifier(resourceId, toSnakeCase(attribute), maxLength, sep)
 }

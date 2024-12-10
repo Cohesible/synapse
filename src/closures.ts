@@ -178,7 +178,7 @@ function stripIndirectRefs(obj: ReturnType<typeof createDataTable>) {
     return table
 }
 
-export function normalizeSymbolIds(obj: ReturnType<typeof createDataTable>) {
+export function normalizeSymbolIds(obj: ReturnType<typeof createDataTable>, includeMapping = false) {
     if (!isDeduped(obj)) {
         return obj
     }
@@ -210,6 +210,16 @@ export function normalizeSymbolIds(obj: ReturnType<typeof createDataTable>) {
         return id
     }
 
+    const result = applySymbolMappings(obj, getId)
+
+    return {
+        ...result,
+        __isNormalized: true,
+        mapping: includeMapping ? Object.fromEntries([...symbolMapping].map(([k, v]) => [v, k])) : undefined,
+    }
+}
+
+function applySymbolMappings(obj: ReturnType<typeof createDataTable>, getId: (symbolId: string | number) => string) {
     function visit(val: any): any {
         if (Array.isArray(val)) {
             return val.map(visit)
@@ -232,9 +242,7 @@ export function normalizeSymbolIds(obj: ReturnType<typeof createDataTable>) {
 
             const desc = v as any
             if (typeof desc['id'] === 'number' || typeof desc['id'] === 'string') {
-                const id = desc['id']
-                const mapped = getId(id)
-                result[k] = { id: mapped }
+                result[k] = { id: getId(desc['id']) }
             } else {
                 result[k] = visit(v)
             }
@@ -263,9 +271,24 @@ export function normalizeSymbolIds(obj: ReturnType<typeof createDataTable>) {
 
     return {
         ...obj,
-        __isNormalized: true,
         table,
         captured: visit(obj.captured),
+    }
+}
+
+function denormalizeSymbolIds(obj: ReturnType<typeof createDataTable> & { mapping?: Record<string, string> }) {
+    const mapping = obj.mapping
+    if (!mapping) {
+        return obj
+    }
+
+    function getId(symbolId: number | string) {
+        return mapping![symbolId] ?? symbolId
+    }
+
+    return {
+        ...applySymbolMappings(obj, getId),
+        mapping: undefined,
     }
 }
 
@@ -305,8 +328,6 @@ const findRuntimeExecutable = memoize(async () => {
 
 function createSeaCode() {
     return `
-process.env.SKIP_SEA_MAIN = '1' // XXX: temporary hack for building Synapse
-
 if (!require('node:v8').startupSnapshot.isBuildingSnapshot()) {
     throw new Error("We're building an SEA but we're not building a snapshot")
 }
@@ -355,6 +376,12 @@ export async function bundleExecutable(
     }) : undefined
 
     const serializerHost = createSerializerHost(emitFs.root, undefined, optimizer)
+    ;(serializerHost as SerializerHost).nativeCompiler = createNativeCompiler(
+        workingDirectory, 
+        getCompilerOptions(workingDirectory), 
+        opt,
+    )
+
     const transpiler = createTranspiler(mountedFs, resolver, {})
 
     const sourceFileName = path.resolve(workingDirectory, target).replace('.js', '.bundled.js')
@@ -417,11 +444,12 @@ function createOptimizer(fs: { readDataSync: (hash: string) => Uint8Array; write
     }
 }
 
-function createNativeCompiler(workingDirectory: string, tsOptions: ts.CompilerOptions, opt?: BundleOptions) {
+function createNativeCompiler(workingDirectory: string, tsOptions: ts.CompilerOptions, opt?: InternalBundleOptions) {
     const systemTarget = resolveBuildTarget()
             
     return (fileName: string) => {
         return compileZigDirect(fileName, {
+            isSea: opt?.sea,
             rootDir: tsOptions.rootDir ?? workingDirectory,
             outDir: tsOptions.outDir,
             hostTarget: {
@@ -434,10 +462,140 @@ function createNativeCompiler(workingDirectory: string, tsOptions: ts.CompilerOp
     }
 }
 
+function gatherPointerDeps(data: { captured: any; table: Record<string | number, any> }) {
+    const set = new Set<string>()
+    for (const v of Object.values(data.table)) {
+        if (v?.valueType === 'function') {
+            if (isDataPointer(v.module)) {
+                set.add(v.module)
+            } else if (v.module.startsWith(pointerPrefix)) {
+                set.add(v!.module.slice(pointerPrefix.length))
+            }
+        } else if (v?.valueType === 'resource') {
+            // This is only necessary because we don't automatically treat all data pointers
+            // serialized within the data as dependencies. 
+            if (typeof v.value === 'object' && !!v.value && moveableStr in v.value) {
+                if (v.value[moveableStr]?.valueType === 'reflection') {
+                    const ops = v.value[moveableStr].operations
+                    if (ops[0].type === 'import') {
+                        set.add(ops[0].module)
+                    }
+                }
+            }
+        }
+    }
+
+    return Array.from(set)
+}
+
+function pruneDefineResourceCalls(data: { captured: any; table: Record<string | number, any> }) {
+    for (const [k, v] of Object.entries(data.table)) {
+        if (typeof v === 'object' && v?.valueType === 'reflection') {
+            let ops = v.operations
+            if (!Array.isArray(ops)) {
+                ops = data.table[ops.id]
+            }
+
+            if (ops.length !== 3) continue
+
+            const resolved = ops.map((x: any) => moveableStr in x ? data.table[x[moveableStr].id] : x)
+            if (resolved[0].type !== 'import' || resolved[0].module !== 'synapse:core') continue
+            if (resolved[1].type !== 'get' || resolved[1].property !== 'defineResource') continue
+            if (resolved[2].type !== 'apply') continue
+
+            data.table[k] = null
+        }
+    }
+}
+
+async function mergeNestedResources(
+    buildFs: BuildFsFragment,
+    data: { captured: any; table: Record<string | number, any>; mapping?: Record<string, string> }
+) {
+    const reversedMappings = data.mapping ? Object.fromEntries(Object.entries(data.mapping).map(([k, v]) => [v, k])) : undefined
+
+    for (const [k, v] of Object.entries(data.table)) {
+        if (typeof v !== 'object' && v?.valueType !== 'resource') continue
+        if (typeof v.value !== 'object' || !v.value || !(moveableStr in v.value)) continue
+        if (v.value[moveableStr]?.valueType !== 'reflection') continue
+
+        const ops = v.value[moveableStr].operations
+        if (ops[0].type !== 'import') continue
+
+        const data2 = await buildFs.readData2(ops[0].module)
+        const data3 = denormalizeSymbolIds(data2)
+        let canMerge = true
+
+        const mapping: Record<string, string> = {}
+        const included: string[] = []
+
+        for (const [k2, v2] of Object.entries(data3.table)) {
+            const unmapped = reversedMappings?.[k2]
+            if (unmapped) {
+                // It's still possible for unrelated objects to end up with the same id
+                // TODO: generate prefixed ids grouped by value type to minimize collisions
+                if (v2.valueType !== data.table[unmapped].valueType) {
+                    canMerge = false
+                    break
+                }
+
+                mapping[k2] = unmapped 
+                continue
+            }
+
+            const o = data.table[k2]
+            if (!o) {
+                included.push(k2)
+                continue
+            }
+
+            canMerge = false
+            break
+        }
+
+        if (canMerge) {
+            const data4 = denormalizeSymbolIds({ ...data3, mapping })
+            data.table[k] = {
+                id: k,
+                valueType: 'object',
+                properties: data4.captured,
+            }
+
+            for (const k of included) {
+                data.table[k] = data4.table[k]
+            }
+        }
+    }
+}
+
+export function prepareDeployedModule(
+    ctx: DeploymentContext,
+    data: { captured: any; table: Record<string | number, any> },
+    bundled?: boolean,
+) {
+    const dependencies = gatherPointerDeps(data)
+    const packageDependencies = !bundled ? getPackageDependencies(ctx, data.table) : undefined
+
+    const ambientDependencies = getAmbientDependencies(ctx, data.table)
+    // const data2 = normalizeSymbolIds(data, true)
+    // const data3 = extractPointers({ ...data2, mapping: undefined })
+    const data3 = extractPointers(data)
+    const datafile = {
+        kind: 'deployed' as const,
+        table: data3[0].table,
+        captured: data3[0].captured,
+    }
+
+    return {
+        datafile,
+        metadata: { dependencies, packageDependencies, pointers: data3[1], ambientDependencies },
+    }
+}
+
 export async function bundleClosure(
     ctx: DeploymentContext,
     buildFs: BuildFsFragment,
-    target: string, // TODO: rename to `source`, make optional
+    source: string, // TODO: rename to `source`, make optional
     captured: any, 
     globals: any, 
     workingDirectory: string,
@@ -452,11 +610,6 @@ export async function bundleClosure(
     const isArtifact = !bundled && !opt?.destination
     const extname = opt?.moduleTarget === 'esm' ? '.mjs' : '.cjs'
 
-    const compilerOptions = getCompilerOptions(workingDirectory, outputDirectory)
-    const outDir = compilerOptions.outDir ?? workingDirectory
-    const dest = opt?.destination ?? target.replace(/\.(?:t|j)(sx?)$/, '-bundled.j$1')
-    const outfile = path.resolve(outDir, dest)
-
     // TODO: normalize all symbol ids, store a mapping in metadata so it can be reversed
     // This is somewhat similar to position-independent code
     //
@@ -467,22 +620,8 @@ export async function bundleClosure(
     }
 
     // We have to do this before we render because rendering currently mutates to serialize
-    const artifacts = Object.values(data.table)
-        .filter(x => x?.valueType === 'function')
-        .filter(x => x!.module.startsWith(pointerPrefix))
-        .map(x => {
-            if (isDataPointer(x.module)) {
-                return x.module
-            }
-
-            return x!.module.slice(pointerPrefix.length)
-        })
-
-    const dependencies = Array.from(new Set(artifacts))
+    const dependencies = gatherPointerDeps(data)
     const packageDependencies = !bundled ? getPackageDependencies(ctx, data.table) : undefined
-    // if (packageDependencies) {
-    //     getLogger().debug(`Found package dependencies for target "${target}"`, Object.values(packageDependencies.packages).map(p => `${p.name}@${p.version}`))
-    // }
 
     const ambientDependencies = getAmbientDependencies(ctx, data.table)
 
@@ -498,7 +637,7 @@ export async function bundleClosure(
             captured: data3[0].captured,
         }
 
-        const p = await buildFs.writeData2(datafile, { source: target, dependencies, packageDependencies, pointers: data3[1], ambientDependencies })
+        const p = await buildFs.writeData2(datafile, { source, dependencies, packageDependencies, pointers: data3[1], ambientDependencies })
         const text = `module.exports = require('${p}');`
 
         return {
@@ -509,7 +648,7 @@ export async function bundleClosure(
 
     // TODO: implement hash tree for integrity checks against the 'data' files 
 
-    async function saveArtifact(data: Uint8Array, name: string, source: string, pointers?: any) {
+    async function saveArtifact(data: Uint8Array, name?: string, source?: string, pointers?: any) {
         const p = await buildFs.writeData(data, { name, source, dependencies, packageDependencies, pointers, ambientDependencies })
         if (opt?.publishName) {
             if (!isArtifact) {
@@ -525,8 +664,14 @@ export async function bundleClosure(
         return p
     }
 
+    const compilerOptions = getCompilerOptions(workingDirectory, outputDirectory)
+    const outDir = compilerOptions.outDir ?? workingDirectory
+    const dest = opt?.destination ?? source.replace(/\.(?:t|j)(sx?)$/, '-bundled.j$1')
+    const outfile = path.resolve(outDir, dest)
+
     if (isArtifact) {
-        const name = path.relative(workingDirectory, outfile)
+        const name = outfile ? path.relative(workingDirectory, outfile) : undefined
+        // await mergeNestedResources(buildFs, data)
         const data3 = extractPointers(normalizeSymbolIds(data))
 
         const datafile = {
@@ -538,7 +683,7 @@ export async function bundleClosure(
         if (!opt?.publishName) {
             return {
                 extname,
-                location: await buildFs.writeData2(datafile, { source: target, dependencies, packageDependencies, pointers: data3[1], ambientDependencies })
+                location: await buildFs.writeData2(datafile, { source, dependencies, packageDependencies, pointers: data3[1], ambientDependencies })
             }
         }
 
@@ -546,7 +691,7 @@ export async function bundleClosure(
 
         return {
             extname,
-            location: await saveArtifact(artifactData, name, target, data3[1]),
+            location: await saveArtifact(artifactData, name, source, data3[1]),
         }
     }
 
@@ -589,7 +734,7 @@ export async function bundleClosure(
     const pointer = await saveArtifact(
         res.result.contents,
         path.relative(workingDirectory, outfile),
-        target,
+        source,
     )
 
     const assets = opt?.includeAssets ? (serializerHost as ReturnType<typeof createSerializerHost>).getAssets() : undefined

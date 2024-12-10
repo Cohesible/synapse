@@ -74,8 +74,6 @@ export class Gateway {
                 fn: this.addRouteInfra('$default', router.routeRequest)
             }
 
-            core.move('this.route')
-
             // if (!domain && typeof this.props?.auth !== 'function') {
             //     const healthCheck = this._addRoute('HEAD', '/__checkEndpoint__', () => {})
             //     // `{ callOperation: this.callOperation.bind(this) }` fails to serialize
@@ -164,11 +162,9 @@ export class Gateway {
             routeKey: route,
             target: `integrations/${integration.id}`,
             operationName: route,
-            // authorizationType: 'AWS_IAM', // 'NONE' | 'AWS_IAM' | 'CUSTOM
-            authorizationType: this.props?.auth === 'native' ? 'AWS_IAM' : 'NONE',
+            authorizationType: this.props?.auth === 'native' ? 'AWS_IAM' : 'NONE', // 'NONE' | 'AWS_IAM' | 'CUSTOM
         })
 
-        // BUG: this sometimes requires 2 deploys to get right...
         new aws.LambdaPermission({
             functionName: fn.resource.functionName,
             action: "lambda:InvokeFunction",

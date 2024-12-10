@@ -1,12 +1,12 @@
 import * as perf from 'node:perf_hooks'
+import { memoize } from './utils'
+import { getBuildTarget, getExecutionId, isInContext } from './execution'
 import { Event, EventEmitter, addMetaListener, createEvent, createEventEmitter } from './events'
 import type { BuildTarget } from './workspaces'
 import type { ParsedPlan } from './deploy/deployment'
 import type { TfState } from './deploy/state'
 import type { ResolvedProgramConfig } from './compiler/config'
-import { getBuildTarget, getBuildTargetOrThrow, getExecutionId, isInContext } from './execution'
-import { InstallLifecycleEvent, PackageProgressEvent } from './cli/views/install'
-import { memoize } from './utils'
+import type { InstallLifecycleEvent, PackageProgressEvent } from './cli/views/install'
 
 export interface PerfDetail {
     readonly taskType: string
@@ -15,8 +15,14 @@ export interface PerfDetail {
     readonly aggregate?: boolean
 }
 
+const isProdBuild = process.env.SYNAPSE_ENV === 'production'
+
 const markCounts: Record<string, number> = {}
 export function runTask<T>(type: string, name: string, task: () => T, slowThreshold?: number, aggregate?: boolean): T {
+    if (isProdBuild && !process.env.SYNAPSE_TRACE_TASKS) {
+        return task()
+    }
+
     const markName = `${type}-${name}`
     const detail: PerfDetail = { 
         taskType: type, 
@@ -86,11 +92,30 @@ export interface CommandEvent extends BaseOutputMessage {
     readonly context: OutputContext
 }
 
+export const enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+export function levelToString(level: LogLevel) {
+    switch (level) {
+        case LogLevel.Error:    return 'ERROR'
+        case LogLevel.Warn:     return 'WARN'
+        case LogLevel.Info:     return 'INFO'
+        case LogLevel.Debug:    return 'DEBUG'
+        case LogLevel.Trace:    return 'TRACE'
+    }
+}
+
 // Generic log event
 export interface LogEvent extends BaseOutputMessage {
     readonly type: 'log'
-    readonly level: 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'raw'
+    readonly level: LogLevel
     readonly args: any[]
+    readonly raw?: boolean
 }
 
 export interface PerfEvent extends BaseOutputMessage {
@@ -169,7 +194,7 @@ export interface DeploySummaryEvent extends BaseOutputMessage {
 // From custom resources
 export interface DeployLogEvent extends BaseOutputMessage {
     readonly type: 'deploy-log'
-    readonly level: 'trace' | 'debug' | 'info' | 'warn' | 'error'
+    readonly level: LogLevel
     readonly args: any[]
     readonly resource: string
 }
@@ -187,18 +212,19 @@ export interface CompileEvent extends BaseOutputMessage {
 // Using `console` or `process.(stdout|stderr)` during synthesis will fire this event
 export interface SynthLogEvent extends BaseOutputMessage {
     readonly type: 'synth-log'
-    readonly level: 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'raw'
-    readonly source?: 'symEval'
+    readonly level: LogLevel
     readonly args: any[]
+    readonly source?: 'symEval'
+    readonly raw?: boolean
 }
 
 // TESTS
 
 export interface BaseTestEvent extends BaseOutputMessage {
     readonly type: 'test'
-    readonly id: number
+    readonly id: string
     readonly name: string
-    readonly parentId?: number
+    readonly parentId?: string
     readonly context: OutputContext
     readonly itemType: 'test' | 'suite'
 }
@@ -233,11 +259,11 @@ export type TestEvent =
 
 export interface TestLogEvent extends BaseOutputMessage {
     readonly type: 'test-log'
-    readonly level: 'trace' | 'debug' | 'info' | 'warn' | 'error'
+    readonly level: LogLevel
     readonly args: any[]
 
     // Test info
-    readonly id: number
+    readonly id: string
     readonly name: string
     readonly parentId?: number
 }
@@ -276,20 +302,22 @@ function createLogger() {
         }
 
         if (perfCount === 0) {
-            perfObs?.disconnect()
-            perfObs = undefined
+            if (perfObs) {
+                perfObs.disconnect()
+                perfObs = undefined
+            }
         } else if (!perfObs) {
             perfObs = createObserver(perfEvent.fire)
         }
     })
 
     return {
-        log: (...args: any[]) => logEvent.fire({ level: 'info', args }),
-        warn: (...args: any[]) => logEvent.fire({ level: 'warn', args }),
-        error: (...args: any[]) => logEvent.fire({ level: 'error', args }),
-        debug: (...args: any[]) => logEvent.fire({ level: 'debug', args }),
-        trace: (...args: any[]) => logEvent.fire({ level: 'trace', args }),
-        raw: (data: string | Uint8Array) => logEvent.fire({ level: 'raw', args: [data] }),
+        log: (...args: any[]) => logEvent.fire({ level: LogLevel.Info, args }),
+        warn: (...args: any[]) => logEvent.fire({ level: LogLevel.Warn, args }),
+        error: (...args: any[]) => logEvent.fire({ level: LogLevel.Error, args }),
+        debug: (...args: any[]) => logEvent.fire({ level: LogLevel.Debug, args }),
+        trace: (...args: any[]) => logEvent.fire({ level: LogLevel.Trace, args }),
+        raw: (data: string | Uint8Array) => logEvent.fire({ level: LogLevel.Info, args: [data], raw: true }),
 
         emit: emitter.emit.bind(emitter),
         emitDeployEvent: deployEvent.fire,

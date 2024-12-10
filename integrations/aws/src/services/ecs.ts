@@ -236,6 +236,8 @@ function createDefaultImage(id: string, bundle: lib.Bundle, regionName: string) 
     return repo
 }
 
+// Permissions reference: 
+// https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazonelasticcontainerservice.html
 function addEcsStatement(recv: any, action: string | string[], resource = '*') {
     addResourceStatement({
         service: 'ecs',
@@ -288,11 +290,4 @@ core.bindModel(ECS.ECS, {
         return core.createUnknown()
     }
 })
-
-// ECS is non-standard for permissions :(
-// https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazonelasticcontainerservice.html
-
-
-
-
 

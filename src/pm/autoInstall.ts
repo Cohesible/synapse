@@ -1,9 +1,10 @@
 import { createSynapseProviderRequirement, PackageJson } from './packageJson'
 import { addImplicitPackages } from './publish'
 import { SynapseConfiguration } from '../workspaces'
-import { getLatestVersion, getSpecifierComponents } from './packages'
+import { closeNpmRepo, getLatestVersion, getSpecifierComponents } from './packages'
 import { getLogger } from '../logging'
 import { isBuiltin } from 'node:module'
+import { pushDisposable } from '../execution'
 
 // Determines what's needed in `package.json` based on module specifiers
 // TODO: skip adding types entirely when running in "script mode"
@@ -20,6 +21,7 @@ export async function getNeededDependencies(deps: Set<string>, pkg: PackageJson,
     ])
 
     let shouldAddSynapse = false
+    let shouldCloseNpmRepo = false
     for (const spec of deps) {
         const components = getSpecifierComponents(spec)
 
@@ -59,9 +61,12 @@ export async function getNeededDependencies(deps: Set<string>, pkg: PackageJson,
             devDependencies[`@cohesible/${name}`] = `spr:#${name}`
         } else {
             // TODO: parallelize or defer by writing `latest` to version constraint
+            // TODO: this can cause issues when referencing transitive packages
             const latest = await getLatestVersion(nameWithScope).catch(err => {
                 getLogger().warn(`Failed to resolve specifier "${spec}"`, err)
             })
+
+            shouldCloseNpmRepo = true
 
             if (latest?.source) {
                 getLogger().log(`Resolved unbound specifier "${spec}" -> ${latest.source}`)
@@ -72,6 +77,11 @@ export async function getNeededDependencies(deps: Set<string>, pkg: PackageJson,
                 // TODO: check for `@types` if the package lacks types
             }
         }
+    }
+
+    // Cache any manifests
+    if (shouldCloseNpmRepo) {
+        pushDisposable(closeNpmRepo)
     }
 
     const devDeps = shouldAddSynapse 

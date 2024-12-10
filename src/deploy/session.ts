@@ -1,5 +1,5 @@
 import * as path from 'node:path'
-import { getLogger, runTask } from '../logging'
+import { getLogger, LogLevel, runTask } from '../logging'
 import { createMountedFs, getPublished, getDeploymentFs, getDataRepository, getDeploymentStore, readState, toFsFromIndex, createTempMountedFs, getFsFromHash, toFsFromHash, getProgramFs, getProgramHash, DataRepository } from '../artifacts'
 import { getAuth } from '../auth'
 import { getBackendClient } from '../backendClient'
@@ -25,7 +25,7 @@ import { ModuleLoader } from './server'
 import { Fs, SyncFs } from '../system'
 import { ModuleResolver } from '../runtime/resolver'
 import { getServiceRegistry } from './registry'
-import { getCurrentEnvFilePath, parseEnvFile } from '../runtime/env'
+import { maybeLoadEnvironmentVariables } from '../runtime/env'
 
 export async function loadBuildState(bt: BuildTarget, repo = getDataRepository()) {
     const mergedFs = await createMergedView(bt.programId, bt.deploymentId)
@@ -58,7 +58,7 @@ export async function loadBuildState(bt: BuildTarget, repo = getDataRepository()
         const deployables = (await getEntrypointsFile(getProgramFs(bt)))?.deployables
         const programDeployables = new Set<string>(Object.values(deployables ?? {}).map(f => path.relative(bt.workingDirectory, f)))
 
-        const importMap: ImportMap<SourceInfo> = {}
+        const importMap: ImportMap = {}
         for (const [k, v] of Object.entries(published)) {
             if (!programDeployables.has(k)) continue
 
@@ -160,24 +160,6 @@ export async function getModuleLoader(wrapConsole = true, useThisContext = false
     return createModuleLoader2()
 }
 
-// TODO: this isn't clean
-async function maybeLoadEnvironmentVariables(fs: Pick<Fs, 'readFile'>) {
-    const filePath = getCurrentEnvFilePath()
-    getLogger().debug(`Trying to load environment variables from "${filePath}"`)
-
-    const text = await fs.readFile(filePath, 'utf-8').catch(throwIfNotFileNotFoundError)
-    if (!text) {
-        return
-    }
-
-    const vars = parseEnvFile(text)
-    for (const [k, v] of Object.entries(vars)) {
-        process.env[k] = v
-    }
-
-    getLogger().debug(`Loaded environment variables: ${Object.keys(vars)}`)
-}
-
 export async function createSessionContext(programHash?: string): Promise<SessionContext> {
     const bt = getBuildTargetOrThrow()
     const deploymentId = bt.deploymentId ?? await runTask('projects', 'deployment', getOrCreateDeployment, 10)
@@ -194,11 +176,14 @@ export async function createSessionContext(programHash?: string): Promise<Sessio
     const resolvedProgramHash = programHash ?? await getProgramHashOrThrow()
     getLogger().debug(`Creating session context with program hash [deploymentId: ${deploymentId}]`, resolvedProgramHash)
 
-    const programBuildFs = await repo.getBuildFs(resolvedProgramHash)
+    const [terraformPath, programBuildFs] = await Promise.all([
+        getTerraformPath(),
+        repo.getBuildFs(resolvedProgramHash)
+    ])
+
     const tmpMountedFs = createTempMountedFs(programBuildFs.index, bt.workingDirectory)
 
     const fs = tmpMountedFs
-    const terraformPath = await getTerraformPath()
     const templateService = createTemplateService(fs, programHash)
 
     const workingDirectory = bt.workingDirectory
@@ -215,10 +200,10 @@ export async function createSessionContext(programHash?: string): Promise<Sessio
         const logTest = getLogger().emitTestLogEvent
         const logDeploy = getLogger().emitDeployLogEvent
 
-        function doLog(level: 'info' | 'warn' | 'error' | 'debug' | 'trace', args: any[]) {
+        function doLog(level: LogLevel, args: any[]) {
             const test = loaderContext.getContext('test')?.[0]
             if (test && typeof test === 'object' && typeof test.id === 'number') {
-                return logTest({ level, args, name: test.name, id: test.id, parentId: test.parentId })
+                return logTest({ level, args, name: test.name, id: `${test.fileName}:${test.id}`, parentId: test.parentId })
             }
 
             const resource = loaderContext.getContext('resource')?.[0]
@@ -230,11 +215,11 @@ export async function createSessionContext(programHash?: string): Promise<Sessio
         }
 
         const logMethods = {
-            log: (...args: any[]) => doLog('info', args),
-            warn: (...args: any[]) => doLog('warn', args),
-            error: (...args: any[]) => doLog('error', args),
-            debug: (...args: any[]) => doLog('debug', args),
-            trace: (...args: any[]) => doLog('trace', args),
+            log: (...args: any[]) => doLog(LogLevel.Info, args),
+            warn: (...args: any[]) => doLog(LogLevel.Warn, args),
+            error: (...args: any[]) => doLog(LogLevel.Error, args),
+            debug: (...args: any[]) => doLog(LogLevel.Debug, args),
+            trace: (...args: any[]) => doLog(LogLevel.Trace, args),
         }
         
         return wrapWithProxy(globalThis.console, logMethods)
@@ -243,24 +228,33 @@ export async function createSessionContext(programHash?: string): Promise<Sessio
     const consoleWrap = createConsoleWrap()
     const loaderContext = createContext({ deploymentId: deploymentId, programId: bt.programId }, backendClient, auth, consoleWrap)
 
-    const getSourceMapParser = memoize(async () => {
+    async function getSourceMapParser() {
         const selfDir = await getSelfDir()
         const sourceMapParser = createSourceMapParser(fs, resolver, workingDirectory, selfDir ? [selfDir] : undefined)
         loaderContext.registerSourceMapParser(sourceMapParser)
 
         return sourceMapParser
-    })
+    }
+
+    async function getEnv() {
+        return {
+            SYNAPSE_ENV: bt.environmentName,
+            ...(await templateService.getSecretBindings())
+        }
+    }
+
+    async function getPackageService() {
+        return createPackageService(resolver, repo, programHash ? await toFsFromHash(programHash) : undefined)
+    }
 
     await maybeLoadEnvironmentVariables(fs)
 
-    const env = {
-        SYNAPSE_ENV: bt.environmentName,
-        ...(await templateService.getSecretBindings())
-    }
+    const [env, sourceMapParser, pkgService] = await Promise.all([
+        getEnv(),
+        getSourceMapParser(),
+        getPackageService(),
+    ])
 
-    const sourceMapParser = await getSourceMapParser()
-
-    const pkgService = await createPackageService(resolver, repo, programHash ? await toFsFromHash(programHash) : undefined)
     const { stores, importMap } = await pkgService.loadIndex()
     const mountedFs = await createMountedFs(deploymentId, workingDirectory, stores)
     tmpMountedFs.addMounts(stores)
@@ -367,11 +361,23 @@ export async function createSession(ctx: SessionContext, opt?: DeployOptions) {
         return state
     }
 
-    // await loadState()
-
-    let templateHash: string
+    let isFirstRun = true
     let optionsHash: string
+    let templateHash: string
+
     async function shouldRun(opt?: DeployOptions) {
+        if (isFirstRun) {
+            isFirstRun = false
+            optionsHash = getHash(JSON.stringify({ ...opt }), 'base64url')
+            // We defer calculating the template hash because it's really not needed until subsequent operations
+
+            return true
+        }
+
+        if (!templateHash) {
+            templateHash = await ctx.templateService.getPreviousTemplateHash()
+        }
+
         const currentTemplateHash = await ctx.templateService.getTemplateHash()
         
         const currentOptionsHash = getHash(JSON.stringify({ ...opt }), 'base64url')
@@ -381,7 +387,6 @@ export async function createSession(ctx: SessionContext, opt?: DeployOptions) {
 
         if (templateHash && templateHash !== currentTemplateHash) {
             await session.reloadConfig()
-            // await loadState()
         }
 
         templateHash = currentTemplateHash
@@ -496,7 +501,7 @@ export async function createSession(ctx: SessionContext, opt?: DeployOptions) {
         }
     }
 
-    async function setTemplate(template: TfJson) {
+    async function setTemplate(template: TfJson | Buffer) {
         await ctx.templateService.setTemplate(template)
         await session.reloadConfig()
     }

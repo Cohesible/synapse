@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const js = @import("./lib/js.zig");
+const js = @import("js");
 const fs = std.fs;
 
 const NodeErrors = error{EEXIST, ENOENT, EINVAL};

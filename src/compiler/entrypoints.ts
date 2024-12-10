@@ -144,25 +144,12 @@ export function hasMainFunction(sf: ts.SourceFile, getTypeChecker?: () => ts.Typ
 
 // Module helpers
 
-const synapseScheme = 'synapse:'
-const providerScheme = 'synapse-provider:'
-export function findProviderImports(sourceFile: ts.SourceFile) {
-    const providers = new Set<string>()
-    for (const statement of sourceFile.statements) {
-        if (ts.isImportDeclaration(statement)) {
-            const spec = (statement.moduleSpecifier as ts.StringLiteral).text
-            if (spec.startsWith(providerScheme)) {
-                providers.add(spec.slice(providerScheme.length))
-            }
-        }
-    }
-    return providers
-}
-
 function findInterestingSpecifiers(sf: ts.SourceFile, resolveBareSpecifier: (spec: string) => string | undefined) {
     const zig = new Set<string>()
     const bare = new Set<string>()
-    for (const s of sf.statements) {
+    for (let i = 0; i < sf.statements.length; i++) {
+        const s = sf.statements[i]
+
         if (!ts.isImportDeclaration(s) && !ts.isExportDeclaration(s)) continue
         if (!s.moduleSpecifier) continue
 
@@ -294,8 +281,10 @@ function createSpecifierResolver(cmd: Pick<ts.ParsedCommandLine, 'options' | 'fi
     return { mappings, resolveBareSpecifier, getPerFileMappings }
 }
 
-
-
+// FIXME: this is used for auto-install, we _need_ to track the source of all bare specs
+// Why? Because it's a huge pain to track down problematic deps otherwise.
+//
+// That's the problem with auto-install: too fragile to be magical 
 export async function findAllBareSpecifiers(config: ResolvedProgramConfig, host: ts.CompilerHost) {
     const bare = new Set<string>()
     const workingDir = getWorkingDir()
@@ -316,8 +305,6 @@ export async function findAllBareSpecifiers(config: ResolvedProgramConfig, host:
             continue
         }
 
-        // We're probably double parsing files. Not sure if the
-        // standalone compiler host does any caching.
         const sf = host.getSourceFile(f, target, err => getLogger().error(err))
         if (!sf) {
             continue

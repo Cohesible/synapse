@@ -153,8 +153,10 @@ export interface AcquiredLock extends AsyncDisposable {
 //# resource = true
 /** @internal */
 export declare class SimpleLock {
-    lock(id: string): Promise<AcquiredLock>
+    lock(id: string, timeout?: number): Promise<AcquiredLock>
     unlock(id: string): Promise<void>
+
+    tryLock(id: string): Promise<AcquiredLock | undefined>
 }
 
 //# resource = true

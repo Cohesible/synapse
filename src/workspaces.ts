@@ -1,12 +1,10 @@
 import * as os from 'node:os'
 import * as path from 'node:path'
-import * as fs from 'node:fs/promises'
 import { Fs, SyncFs } from './system'
 import { DeployOptions } from './deploy/deployment'
-import { Remote, findRepositoryDir, findRepositoryDirSync, getCurrentBranch, getDefaultBranch, listRemotes } from './git'
+import { Remote, findRepositoryDir, findRepositoryDirSync, getDefaultBranch, listRemotes } from './git'
 import { getLogger } from './logging'
 import { getCiType, getHash, keyedMemoize, makeRelative, memoize, throwIfNotFileNotFoundError, tryReadJson, tryReadJsonSync } from './utils'
-import { glob } from './utils/glob'
 import { getBuildTarget, getBuildTargetOrThrow, getFs, isInContext } from './execution'
 import * as projects from '@cohesible/resources/projects'
 import * as registry from '@cohesible/resources/registry'
@@ -169,6 +167,7 @@ interface BuildTargetOptions {
 
 const getCurrentBranchCached = keyedMemoize(async (dir: string) => {
     // Reading the HEAD file directly is a bit faster than calling `git`
+    // TODO: use mtime to optimize even more
     const headPath = path.resolve(dir, '.git', 'HEAD')
     const head = await getFs().readFile(headPath, 'utf-8').catch(throwIfNotFileNotFoundError)
     if (!head) {
@@ -256,13 +255,17 @@ async function findProgram(cwd: string, rootDir: string, projectId: string): Pro
         throw new Error(`Current directory "${cwd}" is not inside project directory: ${rootDir}`)
     }
 
-    const pkg = await getPackageJson(getFs(), cwd, false)
+    const [pkg, branchName, state, defaultBranch] = await Promise.all([
+        getPackageJson(getFs(), cwd, false),
+        getCurrentBranchCached(rootDir),
+        getProjectState(projectId),
+        getDefaultBranchCached(projectId),
+    ])
+
     const workingDirectory = pkg?.directory ?? cwd
     const programName = pkg?.data.name ?? getProgramIdNoPkg(workingDirectory, rootDir)
-    const branchName = await getCurrentBranchCached(rootDir)
     const relativeWorkingDir = cwd === rootDir ? undefined : relPath
 
-    const state = await getProjectState(projectId)
     const base = {
         programName,
         workingDirectory,
@@ -273,7 +276,6 @@ async function findProgram(cwd: string, rootDir: string, projectId: string): Pro
         return base
     }
 
-    const defaultBranch = await getDefaultBranchCached(projectId)
     if (branchName !== defaultBranch) {
         (state.branches as any) ??= {}
     }
@@ -331,23 +333,6 @@ export function toProgramRef(bt: Pick<BuildTarget, 'programId' | 'projectId' | '
     return bt.projectId ? `${bt.projectId}+:+${base}` : base
 }
 
-// TODO: this should only match if the target source file is included by the config
-async function tryFindTsConfig(dir: string, recurse = false) {
-    const config = await getFs().readFile(path.resolve(dir, 'tsconfig.json'), 'utf-8').catch(throwIfNotFileNotFoundError)
-    if (config) {
-        return { directory: dir, data: config }
-    }
-    
-    if (!recurse) {
-        return
-    }
-
-    const nextDir = path.dirname(dir)
-    if (nextDir !== dir) {
-        return tryFindTsConfig(nextDir)
-    }
-}
-
 async function initProjectlessProgram(id: string, workingDirectory: string) {
     const state = await getOrCreateProjectState('global')
     if (state && !state.programs[id]) {
@@ -378,33 +363,25 @@ function getProgramIdFromDir(dir: string) {
 async function findProjectlessProgram(cwd: string, target?: string) {
     const targetDir = target ? path.dirname(target) : cwd
     const pkg = await getPackageJson(getFs(), targetDir, false)
-    if (!pkg) {
-        const tsConfig = await tryFindTsConfig(targetDir, false)
-        if (tsConfig) {
-            const programId = getProgramIdFromDir(tsConfig.directory)
+    if (pkg) {
+        const programId = getProgramIdFromDir(pkg.directory)
 
-            return initProjectlessProgram(programId, tsConfig.directory)
-        }
-
-        if (!target) {
-            const programId = getProgramIdFromDir(cwd)
-
-            return initProjectlessProgram(programId, cwd)
-            // throw new Error(`No program found in cwd: ${cwd}`)
-        }
-
-        if (!(await getFs().fileExists(target))) {
-            throw new Error(`Target file not found: ${target}`)
-        }
-
-        const programId = getProgramIdFromDir(target)
-
-        return initProjectlessProgram(programId, path.dirname(target))
+        return initProjectlessProgram(programId, pkg.directory)
     }
 
-    const programId = getProgramIdFromDir(pkg.directory)
+    if (!target) {
+        const programId = getProgramIdFromDir(cwd)
 
-    return initProjectlessProgram(programId, pkg.directory)
+        return initProjectlessProgram(programId, cwd)
+    }
+
+    if (!(await getFs().fileExists(target))) {
+        throw new Error(`Target file not found: ${target}`)
+    }
+
+    const programId = getProgramIdFromDir(target)
+
+    return initProjectlessProgram(programId, path.dirname(target))
 }
 
 export async function findDeployment(programId: string, projectId: string, environmentName?: string, branchName?: string): Promise<string | undefined> {
@@ -431,38 +408,6 @@ export async function findDeployment(programId: string, projectId: string, envir
     }
 
     return (environment as any).process ?? environment.deploymentId
-}
-
-function findAppByDeployment(branch: Branch, deploymentId: string) {
-    for (const [k, v] of Object.entries(branch.apps)) {
-        for (const env of Object.values(v.environments)) {
-            if (env.deploymentId === deploymentId || (env as any).process === deploymentId) {
-                return k
-            }
-        }
-    }
-}
-
-async function repairPrograms(projId: string) {
-    const ents = await getEntities()
-    const state = await getProjectState(projId)
-    if (!state) {
-        return
-    }
-
-    const defaultBranch = await getDefaultBranchCached(projId)
-    for (const [k, v] of Object.entries(ents.deployments)) {
-        if (v.projectId !== projId) continue
-
-        if (!v.branchName || v.branchName === defaultBranch) {
-            const prog = state.programs[v.programId]
-            if (prog && !prog.appId) {
-                prog.appId = findAppByDeployment(state, k)
-            }
-        }
-    }
-
-    await setProjectState(state)
 }
 
 // TODO: add flag to disable auto-init
@@ -625,83 +570,6 @@ async function getDefaultBranchCached(projectId: string) {
     return defaultBranch
 }
 
-async function migratePrograms(state: ProjectState) {
-    if (state.branches) {
-        return state
-    }
-
-    const branches = new Map<string, Branch>()
-    function addProgram(name: string, info: projects.ProgramInfo, branchName: string, isLegacy?: boolean) {
-        const branch = branches.get(branchName) ?? {
-            apps: {},
-            programs: {},
-        }
-        branches.set(branchName, branch)
-        if (info.appId) {
-            branch.apps[info.appId] = state.apps[info.appId]
-        }
-        branch.programs[name] = isLegacy ? { ...info, isLegacy } as any : info
-    }
-
-    function getOldProgramIdNoPkg(workingDirectory: string, rootDir: string) {
-        const base = path.relative(rootDir, workingDirectory)
-        if (!base) {
-            return 'dir___root'
-        }
-    
-        return `dir__${base}`
-    }
-
-    const rootDir = state.id !== 'global' ? await getProjectDirectory(state.id) : '/'
-    const defaultBranch = await getDefaultBranchCached(state.id)
-    for (const [k, v] of Object.entries(state.programs)) {
-        const workingDir = v.workingDirectory ? path.resolve(rootDir, v.workingDirectory) : rootDir
-
-        if (!(await getFs().fileExists(workingDir))) {
-            getLogger().log(`Program "${k}" no longer exists`, workingDir)
-            continue
-        }
-
-        const pkg = await getPackageJson(getFs(), workingDir, false)
-
-        const newId = pkg?.data.name || getProgramIdNoPkg(workingDir, rootDir)
-        if (k === newId) {
-            addProgram(k, v, defaultBranch)
-            continue
-        }
-
-        const oldId = pkg?.data.name || getOldProgramIdNoPkg(workingDir, rootDir)
-        const cleaned = k.replace(oldId, '')
-        if (!cleaned.endsWith('_')) {
-            addProgram(k, v, defaultBranch, true)
-            addProgram(newId, v, defaultBranch)
-            continue
-        }
-
-        const branchName = cleaned.slice(0, -1)
-        addProgram(k, v, branchName, true)
-        addProgram(newId, v, branchName)
-    }
-
-    const defaultData = branches.get(defaultBranch)
-    if (defaultData) {
-        Object.assign(state, defaultData)
-        branches.delete(defaultBranch)
-    }
-
-    if (!state.branches) {
-        Object.assign(state, { branches: {} })
-    }
-
-    for (const [k, v] of branches) {
-        state.branches![k] = v
-    }
-
-    await updateProjectState(state, [...branches.keys()])
-
-    return state
-}
-
 async function updateProjectState(state: ProjectState, updatedBranches: string[] = []) {
     await setProjectState(state)
 
@@ -845,35 +713,42 @@ function getStateFilePath(projectId: string) {
     return path.resolve(getUserSynapseDirectory(), 'projects', `${projectId}.json`)
 }
 
-function migrateState(state: ProjectState): ProjectState {
-    if (!state.apps) {
-        return Object.assign(state, { apps: {} })
+async function _getProjectState(projectId: string, fs = getFs()): Promise<ProjectState | undefined> {
+    return tryReadJson<ProjectState>(fs, getStateFilePath(projectId))
+}
+
+const projectStates = new Map<string, Promise<ProjectState | undefined> | ProjectState>()
+
+function getProjectState(projectId: string, fs = getFs()): Promise<ProjectState | undefined> | ProjectState | undefined {
+    if (projectStates.has(projectId)) {
+        return projectStates.get(projectId)
     }
-    return state
-}
 
-async function migrateState2(state: ProjectState): Promise<ProjectState> {
-    state = migrateState(state)
-    await migratePrograms(state)
-
-    return state
-}
-
-async function getProjectState(projectId: string, fs = getFs()): Promise<ProjectState | undefined> {
-    return tryReadJson<ProjectState>(fs, getStateFilePath(projectId)).then(s => s ? migrateState2(s) : undefined)
+    const p = _getProjectState(projectId, fs)
+    projectStates.set(projectId, p)
+    return p
 }
 
 async function getOrCreateProjectState(projectId: string): Promise<ProjectState> {
-    return await getProjectState(projectId) ?? {
+    const state = await getProjectState(projectId)
+    if (state) {
+        return state
+    }
+
+    const newState: ProjectState = {
         id: projectId,
         apps: {},
         programs: {},
         packages: {},
         branches: {},
     }
+    projectStates.set(projectId, newState)
+
+    return newState
 }
 
 async function setProjectState(newState: ProjectState, fs = getFs()) {
+    projectStates.set(newState.id, newState)
     await fs.writeFile(getStateFilePath(newState.id), JSON.stringify(newState, undefined, 4))
 }
 
@@ -883,7 +758,7 @@ function getProjectStateSync(projectId: string, fs: SyncFs = getFs()) {
         throw new Error(`No project state found: ${projectId}`)
     }
 
-    return migrateState(state)
+    return state
 }
 
 function findProgramByDeployment(state: ProjectState, deploymentId: string, branchName?: string) {

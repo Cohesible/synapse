@@ -12,6 +12,8 @@ const commandsDirective = '!commands'
 const finallyCommand = '@finally'
 const expectFailCommand = '@expectFail'
 const skipCleanCommand = '@skipClean'
+const renameCommand = '@rename'
+const expectEqualCommand = '@expectEqual'
 
 function parseCommands(text: string) {
     const lines = text.split('\n')
@@ -53,12 +55,13 @@ export async function runInternalTestFile(fileName: string, opt?: RunTestOptions
     return runTest(fileName, commands, opt)
 }
 
-function renderCommands(commands: string[], synapseCmd = process.env.SYNAPSE_CMD) {
+function renderCommands(fileName: string, commands: string[], synapseCmd = process.env.SYNAPSE_CMD) {
     if (synapseCmd) {
         commands = commands.map(cmd => cmd.replaceAll('synapse', synapseCmd))
     }
 
     let shouldClean = true
+    let hasRenames = false
     const inner: string[] = []
     const statements: string[] = []
     for (let i = 0; i < commands.length; i++) {
@@ -70,6 +73,28 @@ function renderCommands(commands: string[], synapseCmd = process.env.SYNAPSE_CMD
 
         if (c.startsWith(skipCleanCommand)) {
             shouldClean = false
+            continue
+        }
+
+        if (c.startsWith(renameCommand)) {
+            const [from, to] = parseShell(c.slice(renameCommand.length + 1))
+            if (!from || !to) {
+                throw new Error(`Missing rename instructions`)
+            }
+
+            // TODO: escape
+            inner.push(`sed -i '' -e 's/${from}/${to}/g' "${fileName}"`)
+            hasRenames = true
+            continue
+        }
+
+        if (c.startsWith(expectEqualCommand)) {
+            const [actual, expected] = parseShell(c.slice(expectEqualCommand.length + 1))
+            if (!actual || !expected) {
+                throw new Error(`Expected two arguments`)
+            }
+
+            inner.push(`if [[ "${actual}" != "${expected}" ]]; then echo "Unexpected output: ${actual}"; false; fi`)
             continue
         }
 
@@ -97,7 +122,7 @@ function renderCommands(commands: string[], synapseCmd = process.env.SYNAPSE_CMD
         ...statements,
     ].join('; ')
 
-    return { cmd, shouldClean }
+    return { cmd, shouldClean, hasRenames }
 }
 
 function getSynapseCmd() {
@@ -123,6 +148,7 @@ async function cleanFixtures(dirs: Iterable<string>, synapseCmd = process.env.SY
     }
 }
 
+// TODO: this doesn't clean tests that use `SYNAPSE_ENV`
 function parseDirectories(fileName: string, commands: string[]) {
     const workingDir = path.dirname(fileName)
     const dirs = new Set<string>([workingDir])
@@ -137,29 +163,52 @@ function parseDirectories(fileName: string, commands: string[]) {
     return dirs
 }
 
+async function createBackup(fileName: string) {
+    const data = await getFs().readFile(fileName)
+
+    async function restore() {
+        await getFs().writeFile(fileName, data)
+    }
+
+    return { restore }
+}
+
 async function runTest(fileName: string, commands: string[], opt?: RunTestOptions) {
     // Force `bash` on windows
     const shell = process.platform === 'win32' ? 'bash' : undefined
-    const { cmd, shouldClean } = renderCommands(commands, opt?.synapseCmd)
+    const { cmd, shouldClean, hasRenames } = renderCommands(fileName, commands, opt?.synapseCmd)
+
+    // Needed for CI
+    const env = { ...process.env, SYNAPSE_ENV: undefined }
 
     async function runCommands() {
         if (opt?.snapshot) {
-            const runner = createNpmLikeCommandRunner(path.dirname(fileName), undefined, ['inherit', 'pipe', 'inherit'], shell)
+            const runner = createNpmLikeCommandRunner(path.dirname(fileName), env, ['inherit', 'pipe', 'inherit'], shell)
             const result = await runner(cmd)
             return
         }
     
-        const runner = createNpmLikeCommandRunner(path.dirname(fileName), undefined, 'inherit', shell)
+        const runner = createNpmLikeCommandRunner(path.dirname(fileName), env, 'inherit', shell)
         await runner(cmd)
     }
 
-    try {
-        await runCommands()
-    } finally {
-        if (shouldClean) {
-            const dirs = parseDirectories(fileName, commands)
-            await cleanFixtures(dirs, opt?.synapseCmd)
+    async function runWithClean() {
+        try {
+            await runCommands()
+        } finally {
+            if (shouldClean) {
+                const dirs = parseDirectories(fileName, commands)
+                await cleanFixtures(dirs, opt?.synapseCmd)
+            }
         }
+    }
+    
+    const backup = hasRenames ? await createBackup(fileName) : undefined
+
+    try {
+        await runWithClean()
+    } finally {
+        await backup?.restore()
     }
 }
 
@@ -182,6 +231,41 @@ async function findTests(testDir: string, patterns = ['**/*.ts']) {
     return maybeTests.filter(isNonNullable)
 }
 
+function parseShell(cmd: string) {
+    const args: string[] = []
+    let cur = ''
+    let quoteChar: string | undefined
+    for (let i = 0; i < cmd.length; i++) {
+        const c = cmd[i]
+        if (c === ' ' && !quoteChar) {
+            args.push(cur)
+            cur = ''
+        } else if (c === '"' || c === "'") {
+            if (quoteChar === undefined) {
+                quoteChar = c
+            } else if (quoteChar === c) {
+                quoteChar = undefined
+            } else {
+                cur += c
+            }
+        } else if (c == '#' && !quoteChar) {
+            break
+        } else {
+            cur += c
+        }
+    }
+    
+    if (cur) {
+        if (quoteChar) {
+            throw new Error(`Missing quote: ${quoteChar}`)
+        }
+        args.push(cur)
+        cur = ''
+    }
+
+    return args
+}
+
 export async function main(...patterns: string[]) {
     const testDir = path.resolve(getWorkingDir(), 'test', 'fixtures')
     const tests = await findTests(testDir, patterns.length === 0 ? undefined : patterns)
@@ -195,7 +279,7 @@ export async function main(...patterns: string[]) {
         }
     }
 
-    console.log(`${tests.length - failures.length} tests passed`)
+    console.log(`${tests.length - failures.length} test fixtures passed`)
 
     if (failures.length > 0) {
         for (const [fileName, e] of failures) {

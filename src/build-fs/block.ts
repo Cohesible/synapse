@@ -1,23 +1,3 @@
-
-// import { u8, u32, u64, SizedArray } from '../zig/c/types'
-
-// // Not as clean as `u8[32]` :/
-// // SizedArray<u8, 32>
-
-// type Sha256Hash = SizedArray<u8, 32>
-
-// interface EncodedBlock {
-//     readonly numHashes: u32
-//     readonly hashes: SizedArray<Sha256Hash, number> // dependent type on `numHashes`
-//     // dataSegment
-// }
-
-// interface EncodedObject {
-//     readonly dataStart: u32
-//     // `dataEnd` is found by checking the start of the next object, or the end of the block if there is no next object
-// }
-
-
 // Binary block format for build artifacts
 // 4-bytes - # of hash LUT entries
 // <hashes>

@@ -33,11 +33,6 @@ function getBootstrapClient() {
 
     return Object.assign(localClient, {
         getState: async (id: string) => {
-            // XXX: horrible horrible hack
-            if (id.endsWith('--lib--Bundle')) {
-                id += '--Closure'
-            }
-
             getLogger().log(`Getting state for resource`, id)
             const state = await readState()
             const r = state?.resources?.find(x => id === `${x.type}.${x.name}`)

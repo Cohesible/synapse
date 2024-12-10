@@ -1,6 +1,6 @@
 import ts from 'typescript'
 import * as path from 'node:path'
-import { Mutable, makeRelative, memoize, resolveRelative, sortRecord, strcmp, throwIfNotFileNotFoundError, tryReadJson } from '../utils'
+import { Mutable, getHash, makeRelative, memoize, resolveRelative, sortRecord, strcmp, throwIfNotFileNotFoundError, tryReadJson } from '../utils'
 import { createTranspiler } from '../bundler'
 import { createrLoader } from '../loader'
 import { ResourceTransformer, generateModuleStub, getFqnComponents } from './transformer'
@@ -13,7 +13,7 @@ import { PackageService, createPackageService, resolveBareSpecifier, resolveDefe
 import { SourceMapHost, emitChunk } from '../static-solver/utils'
 import { getLogger } from '../logging'
 import { createSourceMapParser, getArtifactSourceMap, hydratePointers } from '../runtime/loader'
-import { Artifact, CompiledChunk, LocalMetadata, ModuleBindingResult, getArtifactFs, getDataRepository, getProgramFs, getTargets, readInfraMappings, readModuleManifest, setTargets, toFs, writeInfraMappings, writeModuleManifest, } from '../artifacts'
+import { Artifact, CompiledChunk, LocalMetadata, ModuleBindingResult, Sources, getArtifactFs, getDataRepository, getProgramFs, getTargets, readInfraMappings, readModuleManifest, readSources, setTargets, toFs, writeInfraMappings, writeModuleManifest, writeSources, } from '../artifacts'
 import { ModuleResolver, createModuleResolver } from '../runtime/resolver'
 import { SourceMapV3 } from '../runtime/sourceMaps'
 import { DeclarationFileHost, createDeclarationFileHost } from './declarations'
@@ -21,12 +21,13 @@ import { ResourceTypeChecker } from './resourceGraph'
 import { coerceToPointer, DataPointer, isDataPointer, pointerPrefix, toAbsolute } from '../build-fs/pointers'
 import { getBuildTargetOrThrow, getCurrentVersion, getFs } from '../execution'
 import { resolveValue } from '../runtime/modules/serdes'
-import type { TfJson } from '../runtime/modules/terraform'
+import type { TemplateMetadata, TfJson } from '../runtime/modules/terraform'
 import { getCurrentPkg, getPackageJson } from '../pm/packageJson'
 import { getOutputFilename } from './config'
 import { getFileHasher } from './incremental'
 import { transformImports } from './esm'
 import { createBasicDataRepo } from '../runtime/rootLoader'
+import { maybeLoadEnvironmentVariables } from '../runtime/env'
 
 
 interface SynthOptions {
@@ -528,7 +529,8 @@ export class CompilerHost {
         const programFs = getProgramFs()
         const outfile = this.getOutputFilename(sourceFile.fileName)
 
-        const stub = generateModuleStub(this.rootDir, this.graphCompiler, ts.getOriginalNode(sourceFile) as ts.SourceFile)
+        const sf = ts.getOriginalNode(sourceFile) as ts.SourceFile
+        const stub = generateModuleStub(this.rootDir, this.graphCompiler, sf)
         const { text, sourcemap } = emitChunk(this.sourceMapHost, stub, undefined, { emitSourceMap, removeComments: true })
         const res = await transpiler.transpile(
             sourceFile.fileName,
@@ -603,23 +605,6 @@ type CompilationMode =
     | 'infra-stub'
     | 'no-synth'
 
-type Sources = Record<string, {
-    hash: string
-    outfile: string
-    isTsArtifact?: boolean
-}>
-
-const sourcesFileName = `[#compile]__sources__.json`
-async function writeSources(fs: Pick<Fs, 'writeFile'>, sources: Sources) {
-    await fs.writeFile(sourcesFileName, JSON.stringify(sources))
-}
-
-export async function readSources(fs: Pick<Fs, 'readFile'> = getProgramFs()): Promise<Sources | undefined> {
-    const s = await tryReadJson<Record<string, string> | Sources>(fs, sourcesFileName.slice('[#compile]'.length))
-
-    return s as Sources | undefined
-}
-
 const pointersFileName = '[#compile]__pointers__.json'
 async function writePointersFile(fs: Pick<JsonFs, 'writeJson'>, pointers: Record<string, Record<string, string>>): Promise<void> {
     await fs.writeJson(pointersFileName, pointers)
@@ -647,8 +632,13 @@ export async function synth(entrypoints: string[], deployables: string[], opt: S
         sources = [], 
     } = opt
 
-    const afs = await getArtifactFs()
-    const deploymentId = await getOrCreateDeployment()
+    let loadEnvPromise = maybeLoadEnvironmentVariables(getProgramFs())
+
+    const [afs, deploymentId] = await Promise.all([
+        getArtifactFs(),
+        getOrCreateDeployment(),
+    ])
+
     const bt = getBuildTargetOrThrow()
     ;(bt as Mutable<typeof bt>).deploymentId = deploymentId
     process.env.SYNAPSE_ENV = bt.environmentName // XXX: not clean
@@ -660,13 +650,15 @@ export async function synth(entrypoints: string[], deployables: string[], opt: S
     const dataRepo = createBasicDataRepo(repo)
 
     const moduleResolver = createModuleResolver(vfs, bt.workingDirectory)
-    const { deferredTargets, infraFiles, resolver, pointers } = await runTask('init', 'resolver', async () => {
+    const { deferredTargets, infraFiles, resolver, pointers, sourceMapping } = await runTask('init', 'resolver', async () => {
         const pkgService = await createPackageService(moduleResolver)
-        const { stores, deferredTargets, infraFiles, pkgResolver, pointers } = await pkgService.loadIndex()
+        const { stores, deferredTargets, infraFiles, pkgResolver, pointers, sourceMapping } = await pkgService.loadIndex()
         store.setDeps(stores)
 
-        return { stores, deferredTargets, infraFiles, resolver: pkgResolver, pointers }
+        return { stores, deferredTargets, infraFiles, resolver: pkgResolver, pointers, sourceMapping }
     }, 1)
+
+    const loadedEnvVars = await loadEnvPromise
 
     // We do this after loading the index to account for any compiled `package.json`
     const targets = resolveDeferredTargets(moduleResolver, deferredTargets) // This could become expensive with enough symbols
@@ -730,7 +722,7 @@ export async function synth(entrypoints: string[], deployables: string[], opt: S
         return sf
     }
 
-    const solver = createCapturedSolver(getSourceFile)
+    const solver = createCapturedSolver(getSourceFile, () => runtime.tfModule)
     let permsCount = 0
     // FIXME: `thisArg` is a hack used for the specific case of checking ctor perms
     // would be cleaner to have a different function handle this case
@@ -749,18 +741,16 @@ export async function synth(entrypoints: string[], deployables: string[], opt: S
         resolver,
         moduleResolver,
         bt,
-        deploymentId,
         sourcemapParser,
-        { 
+        {
             ...opt.compilerOptions,
-            backend: {},
             outDir: opt.outDir,
             workingDirectory: bt.workingDirectory,
         }
     )
 
     const getInfraSource = (fileName: string, id: string, virtualLocation: string) => getSource(fileName, id, virtualLocation, 'infra')
-    const runtime = loader.createRuntime(sources, getInfraSource, solvePerms)
+    const runtime = loader.createRuntime(sources, getInfraSource, solvePerms, sourceMapping)
 
     // The target module is always the _source_ file
     const workingDirectory = opt.compilerOptions?.workingDirectory ?? process.cwd()
@@ -773,19 +763,9 @@ export async function synth(entrypoints: string[], deployables: string[], opt: S
         return resolved
     })
 
-    function addSynapseVersion(template: TfJson) {
-        const version = getCurrentVersion()
-        const ext = (template as Mutable<TfJson>)['//'] ??= {}
-        ext.synapseVersion = `${version.semver}${version.revision ? `-${version.revision}` : ''}`
-
-        return template
-    }
-
-    const { terraform, permissions } = opt.esm 
+    const { terraform, permissions, envVars } = opt.esm 
         ? await loader.synthEsm(targetModules, runtime)
         : loader.synth(targetModules, runtime)
-
-    const template = addSynapseVersion(terraform.main)
 
     // if (permissions.length > 0) {
     //     getLogger().log(`Required permissions:`, permissions)
@@ -793,11 +773,53 @@ export async function synth(entrypoints: string[], deployables: string[], opt: S
 
     getLogger().emitCompileEvent({
         entrypoint: '',
-        template,
+        template: {},
     })
 
-    return template
+    const version = getCurrentVersion()
+    const synapseVersion = `${version.semver}${version.revision ? `-${version.revision}` : ''}`
+
+    function maybePruneEnvVars() {
+        if (!envVars) {
+            return
+        }
+
+        const keys = loadedEnvVars ? Object.keys(loadedEnvVars) : []
+        keys.push('SYNAPSE_ENV')
+
+        const prunedEnvVars: Record<string, string | undefined> = {}
+        for (const k of keys.filter(x => x in envVars)) {
+            prunedEnvVars[k] = envVars[k]
+        }
+
+        return Object.keys(prunedEnvVars).length > 0 ? prunedEnvVars : undefined
+    }
+
+    function finalize() {
+        const prunedEnvVars = maybePruneEnvVars()
+
+        return terraform.finalize({ 
+            synapseVersion, 
+            deployTarget: opt?.deployTarget,
+            envVarHashes: prunedEnvVars ? getEnvVarHashes(prunedEnvVars) : undefined,
+        })
+    }
+
+    return runTask('emit', 'finalize synth', finalize, 1)
 }
+
+export function getEnvVarHash(value: string | undefined) {
+    return (value === null || value === undefined) ? null : getHash(value)
+}
+
+function getEnvVarHashes(envVars: Record<string, string | undefined>) {
+    const hashes: Record<string, string | null> = {}
+    for (const [k, v] of Object.entries(envVars)) {
+        hashes[k] = getEnvVarHash(v)
+    }
+
+    return sortRecord(hashes)
+}   
 
 interface Program {
     graphCompiler: ReturnType<typeof createGraphCompiler>

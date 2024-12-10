@@ -30,25 +30,6 @@ interface CpuProfile {
     readonly timeDeltas: number[]
 }
 
-interface ProfileOptions {
-    readonly name?: string // filename
-    readonly interval?: number // in microseconds (default: 1000)
-}
-
-export function getCommandLineOptions(opt?: ProfileOptions) {
-    const args = ['--cpu-prof']
-
-    if (opt?.name) {
-        args.push('--cpu-prof-name', opt.name)
-    }
-
-    if (opt?.interval) {
-        args.push('--cpu-prof-interval', String(opt.interval))
-    }
-
-    return args
-}
-
 interface ParsedCallFrame extends Omit<CallFrame, 'url'> {
     readonly url?: URL
     readonly originalFrame: CallFrame
@@ -199,27 +180,8 @@ export async function loadCpuProfile(fs: Fs & SyncFs, fileName: string, workingD
     const sourcemapParser = createSourceMapParser(fs, undefined, workingDirectory)
     const data: CpuProfile = JSON.parse(await fs.readFile(path.resolve(workingDirectory, fileName), 'utf-8'))
     const duration = data.endTime - data.startTime // nanoseconds
-    const totalSamples = data.samples.reduce((a, b) => a + b, 0)
 
     const nodes = new Map(data.nodes.map(n => [n.id, parseNode(sourcemapParser, n, rootMappings)] as const))
-
-    const totalHits = new Map<number, number>()
-    function getTotalHits(node: ParsedNode) {
-        if (totalHits.has(node.id)) {
-            return totalHits.get(node.id)!
-        }
-
-        let t = node.hitCount
-        if (node.children) {
-            for (const id of node.children) {
-                t += getTotalHits(nodes.get(id)!)
-            }
-        }
-
-        totalHits.set(node.id, t)
-
-        return t
-    }
 
     const byFile = new Map<string, ParsedNode[]>()
     for (const n of nodes.values()) {

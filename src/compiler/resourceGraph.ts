@@ -218,6 +218,10 @@ export function createResourceGraph(
         return components?.specifier === 'synapse:core' && components.name === 'using'
     }
 
+    function isSingletonCall(components: SymbolNameComponents) {
+        return components?.specifier === 'synapse:core' && components.name === 'singleton'
+    }
+
     function isDefineResource(node: ts.Expression) {
         if (!ts.isCallExpression(node)) {
             return false
@@ -429,6 +433,10 @@ export function createResourceGraph(
                 return getNodeType((node.parent as ts.CallExpression).arguments[1])
             }
 
+            if (isSingletonCall(components)) {
+                return visitCallLikeExpression((node.parent as ts.CallExpression).arguments[0], node.parent)
+            }
+
             const isLocal = components.fileName === normalizeFileName(node.getSourceFile().fileName)
             if (!isLocal) {
                 return getExternalNodeType(components.name, components)
@@ -455,29 +463,33 @@ export function createResourceGraph(
             return getNodeType(valueDecl)
         }
 
+        function visitCallLikeExpression(node: ts.Expression, parent: ts.Node): TypeInfo | undefined {
+            const type = checkNode(node)
+            if (type?.intrinsic) {
+                const kind = toString(getNameComponentsFromNode(node)!)
+                addInstantiations(parent, { kind })
+
+                return { instanceType: kind, callable: type.callable, members: type.members }
+            }
+
+            if (type?.instantiations) {
+                addInstantiations(parent, ...type.instantiations)
+            }
+
+            if (type?.callable) {
+                calledCallables.set(parent, type)
+            }
+
+            return type
+        }
+
         function visitExpression(node: ts.Expression): TypeInfo | undefined {
             if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
                 if (node.arguments) {
                     node.arguments.forEach(visitExpression)
                 }
 
-                const type = checkNode(node.expression)
-                if (type?.intrinsic) {
-                    const kind = toString(getNameComponentsFromNode(node.expression)!)
-                    addInstantiations(node, { kind })
-
-                    return { instanceType: kind, callable: type.callable, members: type.members }
-                }
-
-                if (type?.instantiations) {
-                    addInstantiations(node, ...type.instantiations)
-                }
-
-                if (type?.callable) {
-                    calledCallables.set(node, type)
-                }
-
-                return type
+                return visitCallLikeExpression(node.expression, node)
             } else if (ts.isFunctionExpression(node) || ts.isClassExpression(node) || ts.isArrowFunction(node)) {
                 return getNodeType(node)
             } else if (ts.isAwaitExpression(node) || ts.isParenthesizedExpression(node)) {

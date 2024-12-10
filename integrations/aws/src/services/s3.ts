@@ -24,11 +24,15 @@ export class Bucket implements storage.Bucket {
     public readonly name: string
     public readonly id: string
 
-    public constructor() {
-        this.resource = new aws.S3Bucket({
-            bucketPrefix: 'synapse-',
-            forceDestroy: !lib.isProd(),
-        })
+    public constructor(opt?: { bucket?: aws.S3Bucket }) {
+        if (opt?.bucket) {
+            this.resource = opt.bucket
+        } else {
+            this.resource = new aws.S3Bucket({
+                bucketPrefix: 'synapse-',
+                forceDestroy: !lib.isProd(),
+            })
+        }
         this.id = this.resource.arn
         this.name = this.resource.bucket
 
@@ -75,7 +79,8 @@ export class Bucket implements storage.Bucket {
 
             return { size: resp.ContentLength!, contentType: resp.ContentType }
         } catch (e) {
-            if ((e as any).name === 'NotFound') {
+            // I think `headObject` uses a different exception? 
+            if ((e as any).name === 'NotFound' || (e as any).errorType === '403') {
                 return
             }
             return throwIfNotNoSuchKey(e)

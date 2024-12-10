@@ -5,24 +5,29 @@ import { TemplateService, parseModuleName } from '../templates'
 import { getDeploymentFs, readResourceState } from '../artifacts'
 import { SessionContext } from '../deploy/deployment'
 import { isDataPointer } from '../build-fs/pointers'
-import { keyedMemoize, memoize, sortRecord, tryReadJson } from '../utils'
+import { keyedMemoize, memoize, sortRecord, strcmp, tryReadJson } from '../utils'
 import { PackageService } from '../pm/packages'
 
 interface TestResult {
     id: number
     name: string
     hash: string
-    parentId?: number
 }
 
 interface TestResultsCache {
     files: Record<string, TestResult[]>
+    hashes: Record<string, string>
 }
 
 const testResultsKey = '__testResults__.json'
 
 async function getCachedTestResults(fs: Pick<Fs, 'readFile'>): Promise<TestResultsCache | undefined> {
-    return tryReadJson(fs, testResultsKey)
+    const data = await tryReadJson<TestResultsCache>(fs, testResultsKey)
+    // XXX: temporary backwards compat
+    if (data && !data.hashes) {
+        data.hashes = {}
+    }
+    return data
 }
 
 async function setCachedTestResults(fs: Pick<Fs, 'writeFile'>, data: TestResultsCache): Promise<void> {
@@ -34,6 +39,10 @@ async function setCachedTestResults(fs: Pick<Fs, 'writeFile'>, data: TestResults
     return await fs.writeFile(testResultsKey, JSON.stringify({ ...data, files: sorted }))
 }
 
+export async function clearCachedTestResults(fs: Pick<Fs, 'writeFile'> = getTestFs()): Promise<void> {
+    await fs.writeFile(testResultsKey, JSON.stringify({ files: {}, hashes: {} }))
+}
+
 // Tests are effectively treated as separate deployments
 const getTestFs = () => getDeploymentFs(undefined, undefined, undefined, true)
 
@@ -43,17 +52,15 @@ export function createTestRunner(
     opt?: { noCache?: boolean }
 ) {
     const useCache = !opt?.noCache
-    const getCache = memoize(async () => await getCachedTestResults(getTestFs()) ?? { files: {} })
+    const getCache = memoize(async () => await getCachedTestResults(getTestFs()) ?? { files: {}, hashes: {} })
 
     async function saveCache() {
-        if (!useCache) {
-            return
+        if (getCache.cached) {
+            await setCachedTestResults(getTestFs(), await getCache())
         }
-
-        await setCachedTestResults(getTestFs(), await getCache())
     }
 
-    function maybeGetHash(test: ResolvedTest) {
+    async function maybeGetHash(test: ResolvedTest) {
         // Older versions won't have `pointer`
         // And we don't attempt to forcibly update
         const p = test.resolved.pointer
@@ -61,7 +68,7 @@ export function createTestRunner(
             return
         }
 
-        return pkgService.getHashWithDeps(p)
+        return pkgService.getHashWithDeps(p, (await getCache()).hashes)
     }
 
     async function updateCache(test: TestItem) {
@@ -69,7 +76,7 @@ export function createTestRunner(
             return
         }
 
-        const hash = maybeGetHash(test)
+        const hash = await maybeGetHash(test)
         if (!hash) {
             return
         }
@@ -101,7 +108,7 @@ export function createTestRunner(
             return
         }
 
-        const currentHash = maybeGetHash(test)
+        const currentHash = await maybeGetHash(test)
         if (!currentHash) {
             return
         }
@@ -118,10 +125,10 @@ export function createTestRunner(
         getLogger().emitTestEvent({
             reason,
             status,
-            id: info.id,
+            id: `${info.fileName}:${info.id}`,
             name: info.name,
             itemType: info.type,
-            parentId: info.parentId,
+            parentId: info.parentId !== undefined ? `${info.fileName}:${info.parentId}` : undefined,
         } as TestEvent)
     }
 
@@ -145,19 +152,27 @@ export function createTestRunner(
         }
     }
 
+    function compareTestItem(a: TestItem, b: TestItem) {
+        if (a.fileName !== b.fileName) {
+            return strcmp(a.fileName, b.fileName)
+        }
+
+        return a.id - b.id
+    }
+
     async function runSuite(suite: ResolvedSuite) {
         emitStatus(suite, 'running')
 
         const items: TestItem[] = [
             ...suite.tests,
             ...suite.suites,
-        ].sort((a, b) => a.id - b.id)
+        ].sort(compareTestItem)
 
-        const results: { id: number; error: Error }[] = []
+        const results: { id: string; error: Error }[] = []
         for (const item of items) {
             const error = item.type === 'test' ? await runTest(item) : await runSuite(item)
             if (error !== undefined) {
-                results.push({ id: item.id, error })
+                results.push({ id: `${item.fileName}:${item.id}`, error })
             }
         }
 
@@ -218,8 +233,9 @@ export function createTestRunner(
         async function _getSuiteWithTests(k: string): Promise<ResolvedSuite> {
             const v = suites[k]
             const resolved = await resolveSuite(k)
+            const fileName = v.fileName
             const suiteTests = Object.values(tests)
-                .filter(v => v.parentId === resolved.id)
+                .filter(v => v.fileName === fileName && v.parentId === resolved.id)
                 .map(async info => {
                     const index = resolved.tests.findIndex(t => t.id === info.id)
                     if (index === -1) {
@@ -234,7 +250,7 @@ export function createTestRunner(
                 })
 
             const childrenSuites = Object.entries(suites)
-                .filter(([_, v]) => v.parentId === resolved.id)
+                .filter(([_, v]) => v.fileName === fileName && v.parentId === resolved.id)
                 .map(([k]) => getSuiteWithTests(k))
             
             return { 
@@ -262,7 +278,7 @@ export function createTestRunner(
 }
 
 interface BaseTestItem {
-    id: number
+    id: number // `id` is _always_ relative to the file
     name: string
     fileName: string
     parentId?: number

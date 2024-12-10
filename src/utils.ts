@@ -363,249 +363,6 @@ export function isSymbolOfType<T extends ts.Node>(
     return !!sym?.valueDeclaration && fn(sym.valueDeclaration)
 }
 
-function getScopeNode(node: ts.Node) {
-    const parent = ts.findAncestor(node, p => {
-        switch (p.kind) {
-            case ts.SyntaxKind.SourceFile:
-            case ts.SyntaxKind.ClassDeclaration:
-            case ts.SyntaxKind.MethodDeclaration:
-            case ts.SyntaxKind.FunctionDeclaration:
-                return true
-
-            case ts.SyntaxKind.Block:
-                if (p.parent.kind === ts.SyntaxKind.IfStatement) {
-                    return true
-                }
-        }
-
-        return false
-    })
-    if (!parent) {
-        failOnNode(`No enclosing element found`, node)
-    }
-
-    return parent
-}
-
-function getNameForThis(node: ts.Node) {
-    const parent = ts.findAncestor(node, p => {
-        switch (p.kind) {
-            case ts.SyntaxKind.ClassExpression:
-            case ts.SyntaxKind.ClassDeclaration:
-            case ts.SyntaxKind.FunctionExpression:
-            case ts.SyntaxKind.FunctionDeclaration:
-                return true
-
-            // case ts.SyntaxKind.GetAccessor:
-            // case ts.SyntaxKind.SetAccessor:
-            // case ts.SyntaxKind.MethodDeclaration:
-            //     if (p.parent.kind === ts.SyntaxKind.ObjectLiteralExpression) {
-            //         return true
-            //     }
-
-            default:
-                return false
-        }
-    })
-
-    if (!parent) {
-        failOnNode(`Failed to get container declaration`, node)
-    }
-
-    // TODO: search for a name for the object literal
-    // switch (parent.kind) {
-    //     case ts.SyntaxKind.GetAccessor:
-    //     case ts.SyntaxKind.SetAccessor:
-    //     case ts.SyntaxKind.MethodDeclaration:
-    //         return getName(parent.parent)
-    // }
-
-    return getName(parent)
-}
-
-// doesn't handle aliased identifiers yet
-export function getName(node: ts.Node): string | undefined {
-    if (ts.isIdentifier(node)) {
-        return node.text
-    }
-
-    // We could use the string literal 'this' instead of finding the containing decl.
-    // Although this could be problematic when child classes override parent methods.
-    if (node.kind === ts.SyntaxKind.ThisKeyword) {
-        return getNameForThis(node)
-    }
-
-    if (ts.isVariableDeclaration(node) || ts.isPropertyDeclaration(node)) {
-        // if (!ts.isIdentifier(node.name)) {
-        //     failOnNode(`Could not get name of node`, node)
-        // }
-
-        return getName(node.name)
-    }
-
-    if (ts.isClassDeclaration(node) || ts.isFunctionDeclaration(node) || ts.isMethodDeclaration(node)) {
-        if (!node.name || !ts.isIdentifier(node.name)) {
-            failOnNode(`Could not get name of declaration node`, node)
-        }
-
-        return getName(node.name)
-    }
-
-    if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
-        const parts = splitExpression(node.expression)
-        const names = parts.map(getName).filter(isNonNullable)
-
-        return names.join('--')
-    }
-
-    if (ts.isConstructorDeclaration(node)) {
-        const parent = ts.findAncestor(node, ts.isClassDeclaration)
-        if (!parent) {
-            failOnNode('No class declaration found for constructor', node)
-        }
-
-        return getName(parent)!
-    }
-
-    if (ts.isPropertyAccessExpression(node)) {
-        return [getName(node.expression), getName(node.name)].join('--')
-    }
-
-    if (ts.isFunctionExpression(node)) {
-        if (node.name) {
-            return getName(node.name)
-        }
-
-        return '__anonymous'
-    }
-
-    if (ts.isClassExpression(node)) {
-        if (node.name) {
-            return getName(node.name)
-        }
-
-        return '__anonymous'
-    }
-
-    if (ts.isExpressionWithTypeArguments(node)) {
-        const parent = ts.findAncestor(node, ts.isClassDeclaration)
-        if (!parent) {
-            failOnNode('No class declaration found for extends clause', node)
-        }
-
-        return getName(parent)
-    }
-
-    if (ts.isObjectLiteralElement(node)) {
-        if (!node.name) {
-            return
-        }
-
-        return getName(node.name)
-    }
-
-    if (ts.isGetAccessorDeclaration(node)) {
-        return getName(node.name)
-    }
-
-    if (node.kind === ts.SyntaxKind.SuperKeyword) {
-        const parent = ts.findAncestor(node, ts.isClassDeclaration)
-        const superClass = parent ? getSuperClassExpressions(parent)?.pop() : undefined
-        if (!superClass) {
-            failOnNode('No class declaration found when using `super` keyword', node)
-        }
-
-        return getName(superClass)
-    }
-}
-
-function getNameWithDecl(node: ts.Node): string {
-    const baseName = getName(node)
-    if (!baseName) {
-        failOnNode('No name', node)
-    }
-
-    const parent = ts.findAncestor(node, p => {
-        switch (p.kind) {
-            case ts.SyntaxKind.PropertyAssignment:
-            case ts.SyntaxKind.PropertyDeclaration:
-            case ts.SyntaxKind.VariableDeclaration:
-                return true
-
-            case ts.SyntaxKind.ClassDeclaration:
-            case ts.SyntaxKind.FunctionDeclaration:
-            case ts.SyntaxKind.ExpressionStatement:
-                return 'quit'
-        }
-
-        return false
-    })
-
-    const parentName = parent ? getName(parent) : undefined
-    if (parentName !== undefined) {
-        return [parentName, baseName].join('--')
-    }
-
-    // This is an anonymous instantiation
-    return baseName
-}
-
-// Which nodes should be named?
-// `CallExpression` and `NewExpression` (instantiations)
-// `VariableDeclaration` and `PropertyDeclaration` (assignments)
-//
-// Anonymous instantiations of the same type within the same scope must be numbered
-// according to their order of appearance moving from top to bottom
-//
-// These are only qualified w.r.t to a single instantiation scope
-
-
-const cachedNames = new Map<ts.Node, string>()
-const scopeNames = new Map<ts.Node, Set<string>>()
-export function getInstantiationName(node: ts.Node) {
-    node = ts.getOriginalNode(node)
-
-    if (cachedNames.has(node)) {
-        return cachedNames.get(node)!
-    }
-
-    const name = getNameWithinScope(node)
-    cachedNames.set(node, name)
-
-    return name
-
-    function getNameWithinScope(node: ts.Node) {
-        // Variable statements/declarations must be unique within a scope
-        if (ts.isVariableStatement(node)) {
-            return getName(node.declarationList.declarations[0])!
-        } else if (ts.isVariableDeclaration(node)) {
-            return getName(node)!
-        } else if (ts.isClassDeclaration(node)) {
-            return getName(node)!
-        } else if (ts.isPropertyDeclaration(node)) {
-            return getName(node)!
-        }
-    
-        const scope = ts.getOriginalNode(getScopeNode(node))
-        const name = getNameWithDecl(node)
-        if (!scopeNames.has(scope)) {
-            scopeNames.set(scope, new Set())
-        }
-        const currentNames = scopeNames.get(scope)!
-
-        // we only need to do this with anonymous instantiations
-        // if there is a variable or property decl then this is unncessary
-        let maybeName = name
-        let count = 0
-        while (currentNames.has(`${maybeName}${count === 0 ? '' : `_${count}`}`)) count++
-
-        const finalName = `${maybeName}${count === 0 ? '' : `_${count}`}`
-        currentNames.add(finalName)
-
-        return finalName
-    }
-}
-
 export function getNodeLocation(node: ts.Node) {
     const sf = node.getSourceFile()
     if (!sf) {
@@ -694,65 +451,6 @@ export function isDeclared(node: ts.Node) {
 
 export function isSymbolAssignmentLike(node: ts.Node) {
     return ts.isVariableDeclaration(node) || ts.isPropertyDeclaration(node) || ts.isPropertyAssignment(node)
-}
-
-// Handles these cases:
-// * Properties e.g. { <name>: <node> }
-// * Functions e.g. <node function <name> { ... }>
-// * Classes e.g. <node class <name> { ... }>
-// * Variable declarations e.g. [const|let|var] <name> = <node> 
-// * Inheritance e.g. `<name> extends <node>
-export function inferName(node: ts.Node): string | undefined {
-    if (ts.isIdentifier(node) || ts.isPrivateIdentifier(node)) {
-        return node.text
-    }
-
-    // if (isAssignmentLike(node)) {
-    //     return inferName(node.name)
-    // }
-
-    if (ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) {
-        if (!node.name) {
-            return 'default'
-        }
-
-        return inferName(node.name)
-    }
-
-    if (ts.isFunctionExpression(node) || ts.isClassExpression(node)) {
-        if (node.name) {
-            return inferName(node.name)
-        }
-
-        return inferName(node.parent)
-    }
-
-    if (ts.isArrowFunction(node)) {
-        return inferName(node.parent)
-    }
-
-    if (node.parent && isSymbolAssignmentLike(node.parent)) {
-        const name = node.parent.name
-        if (ts.isIdentifier(name) || ts.isPrivateIdentifier(name) || ts.isStringLiteralLike(name)) {
-            return name.text
-        }
-
-        // TODO: bindings, computed names
-        return
-    }
-
-    if (node.parent?.parent && ts.isHeritageClause(node.parent.parent)) {
-        const name = node.parent.parent.parent.name
-        if (!name) {
-            return 'default'
-        }
-
-        return name.text
-    }
-
-    if (node.parent.kind === ts.SyntaxKind.ParenthesizedExpression) {
-        return inferName(node.parent)
-    }
 }
 
 function getUtil(): typeof import('node:util') {
@@ -852,6 +550,7 @@ export interface KeyedMemoziedFunction<T, K extends string[]> {
     (...keys: K): T
     delete(...keys: K): boolean
     keys(): IterableIterator<K>
+    clear(): void
 }
 
 export function keyedMemoize<T, K extends string[] = string[]>(fn: (...keys: K) => T): KeyedMemoziedFunction<T, K> {
@@ -887,6 +586,7 @@ export function keyedMemoize<T, K extends string[] = string[]>(fn: (...keys: K) 
         { 
             delete: { value: deleteEntry },
             keys: { value: () => mapped.values() },
+            clear: { value: () => mapped.clear() },
         }
     )
 }
@@ -1087,16 +787,6 @@ export function toAmbientDeclarationFile(moduleId: string, sourceFile: ts.Source
     return { id: moduleId, text, sourcemap }
 }
 
-// XXX: must be a function, otherwise `Symbol.asyncDispose` won't be initialized
-function getAsyncDispose(): typeof Symbol.asyncDispose {
-    if (!Symbol.asyncDispose) {
-        const asyncDispose = Symbol.for('Symbol.asyncDispose')
-        Object.defineProperty(Symbol, 'asyncDispose', { value: asyncDispose, enumerable: true })
-    }
-
-    return Symbol.asyncDispose
-}
-
 export function isErrorLike(o: unknown): o is Error {
     return !!o && typeof o === 'object' && typeof (o as any).name === 'string' && typeof (o as any).message === 'string'
 }
@@ -1203,9 +893,7 @@ export async function acquireFsLock(filePath: string, maxLockDuration = 10_000) 
             })
         }
 
-        return {
-            [getAsyncDispose()]: unlock
-        }
+        return { [Symbol.asyncDispose]: unlock }
     }
 
     async function unlock() {
@@ -1253,6 +941,30 @@ export function createTrie<T, K extends Iterable<string> = string>() {
         for (const k of key) {
             node = node.children[k]
             if (!node) break
+            yield node.value
+        }
+    }
+
+    function traverseAll(key: K) {
+        let node = root
+        const result: T[] = []
+        for (const k of key) {
+            node = node.children[k]
+            if (!node) break
+            if (node.value !== undefined) {
+                result.push(node.value)
+            }
+        }
+
+        return result
+    }
+
+    function* traversePair(key: K) {
+        let node = root
+
+        for (const k of key) {
+            node = node.children[k]
+            if (!node) break
             yield [k, node.value] as const
         }
     }
@@ -1260,7 +972,7 @@ export function createTrie<T, K extends Iterable<string> = string>() {
     function ancestor(key: K) {
         const keys: string[] = []
         let result: T | undefined
-        for (const [k, v] of traverse(key)) {
+        for (const [k, v] of traversePair(key)) {
             keys.push(k)
             result = v === undefined ? result : v
         }
@@ -1296,7 +1008,7 @@ export function createTrie<T, K extends Iterable<string> = string>() {
         return { next }
     }
 
-    return { get, insert, traverse, keys, ancestor, createIterator }
+    return { get, insert, traverse, traverseAll, keys, ancestor, createIterator }
 }
 
 
@@ -1877,15 +1589,6 @@ export function getHash(data: string | Buffer | Uint8Array, enc = defaultHashEnc
 
     const hash = (crypto as any).createHash(alg).update(data)
     return enc !== 'none' ? hash.digest(enc) : hash.digest()
-}
-
-export function getArrayHash(data: (string | Buffer | Uint8Array)[], enc: 'hex' = 'hex', alg: 'sha256' | 'sha512' = 'sha256') {
-    const hash = crypto.createHash(alg)
-    hash.update(`__array${data.length}__`)
-    for (let i = 0; i < data.length; i++) {
-        hash.update(data[i])
-    }
-    return hash.digest(enc)
 }
 
 export async function tryFindFile(fs: Pick<Fs, 'readFile'>, fileName: string, startDir: string, endDir?: string) {

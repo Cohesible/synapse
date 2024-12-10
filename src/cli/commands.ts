@@ -14,6 +14,7 @@ import { tryUpgrade } from './updater'
 import { getLogger, runTask } from '../logging'
 import { passthroughZig, downloadNodeLib } from '../zig/compile'
 import { internalBundle } from './buildInternal'
+import { installVsCodeZigExtension } from '../zig/installer'
 
 
 interface TypeMap {
@@ -357,7 +358,7 @@ for (const os of oses) {
 
 const hostTargetType = createEnumType(pairs[0], ...pairs.slice(1))
 
-const supportedIntegrations = ['local', 'aws', 'azure', 'gcp'] as const
+const supportedIntegrations = ['local', 'aws', 'azure', 'gcp', 'internal-test'] as const
 
 const varargsFiles = {
     name: 'files',
@@ -476,7 +477,8 @@ registerTypedCommand(
         args: [varargsFiles],
         options: [
             { name: 'rollback-if-failed', type: 'boolean', hidden: true }, 
-            { name: 'plan-depth', type: 'number', hidden: true }, 
+            { name: 'plan-depth', type: 'number', hidden: true },
+            { name: 'expect-no-changes', type: 'boolean', hidden: true }, // For tests
             { name: 'debug', type: 'boolean', hidden: true },
             ...deployOptions, 
         ],
@@ -498,6 +500,7 @@ registerTypedCommand(
                 forceRefresh: opt['refresh'],
                 planDepth: opt['plan-depth'],
                 debug: opt['debug'],
+                expectNoChanges: opt['expect-no-changes'],
             })
         }
 
@@ -567,7 +570,7 @@ registerTypedCommand(
 registerTypedCommand(
     'rollback',
     {
-        internal: true,
+        hidden: true,
         options: [
             ...buildTargetOptions, 
             { name: 'sync-after', type: 'boolean', hidden: true },
@@ -649,7 +652,6 @@ registerTypedCommand(
             { name: 'dry-run', type: 'boolean', hidden: true },
             { name: 'skip-install', type: 'boolean', hidden: true },
             { name: 'archive', type: 'string', hidden: true },
-            { name: 'new-format', type: 'boolean', hidden: true },
             { name: 'overwrite', type: 'boolean', hidden: true },
             { name: 'visibility', type: createEnumType('public', 'private'), hidden: true },
             { name: 'ref', type: 'string', hidden: true },
@@ -662,7 +664,6 @@ registerTypedCommand(
             dryRun: opt['dry-run'],
             skipInstall: opt['skip-install'],
             archive: opt['archive'],
-            newFormat: opt['new-format'],
             environmentName: opt['environment'],
             overwrite: opt['overwrite'],
             visibility: opt['visibility'],
@@ -738,7 +739,7 @@ registerTypedCommand(
 )
 
 registerTypedCommand(
-    'migrate',  
+    'detect-refactors',  
     {
         description: 'Finds resources that may have been renamed and moves them for the next deployment.',
         args: [varargsFiles],
@@ -747,6 +748,7 @@ registerTypedCommand(
             { name: 'outfile', type: 'string' },
             ...buildTargetOptions
         ],
+        aliases: ['migrate'], // Legacy
     },
     async (...args) => {
         const [files, opt] = unpackArgs(args)
@@ -754,7 +756,6 @@ registerTypedCommand(
         await synapse.migrateIdentifiers(files, opt)
     }
 )
-
 
 registerTypedCommand(
     'status',  
@@ -923,7 +924,7 @@ registerTypedCommand(
 registerTypedCommand(
     'upgrade',  
     {
-        options: [{ name: 'force', type: 'boolean' }],
+        options: [{ name: 'force', type: 'boolean' }, { name: 'tag', type: 'string' }],
         requirements: { program: false }
     },
     async (...args) => {
@@ -938,7 +939,11 @@ registerTypedCommand(
         args: [],
         options: [
             { name: 'packages', type: 'boolean', description: 'Clears the packages cache' },
-            { name: 'tests', type: 'boolean', description: 'Cleans the tests cache' }
+            { name: 'tests', type: 'boolean', description: 'Cleans the tests cache' },
+            { name: 'program', type: 'boolean', hidden: true },
+
+            // TODO: expose this with proper UI surrounding the hazards
+            { name: 'deployment', type: 'boolean', hidden: true }
         ],
         requirements: { program: true },
     },
@@ -984,14 +989,22 @@ registerTypedCommand(
         options: [
             { name: 'lazy-load', type: 'string', allowMultiple: true }, 
             { name: 'no-sea', type: 'boolean' },
-            { name: 'synapse-path', type: 'string' }
+            { name: 'minify', type: 'boolean' },
+            { name: 'synapse-path', type: 'string' },
+
+            // Cross-compilation (currently broken due to v8 heap snapshots and/or code caches not being portable)
+            { name: 'os', type: createEnumType('windows', 'linux', 'darwin'), hidden: true },
+            { name: 'arch', type: createEnumType('x64', 'aarch64'), hidden: true },
         ],
     },
     (...args) => {
         const [files, opt] = unpackArgs(args)
         
         return synapse.buildExecutables(files, {
+            os: opt['os'],
+            arch: opt['arch'],
             sea: !opt['no-sea'],
+            minify: opt['minify'],
             lazyLoad: opt['lazy-load'],
             synapsePath: opt['synapse-path'],
         })
@@ -1092,6 +1105,7 @@ const internalBundleOptions = [
     { name: 'stagingDir', type: 'string' },
     { name: 'downloadOnly', type: 'boolean' },
     { name: 'preserveSource', type: 'boolean' },
+    { name: 'integrationsOnly', type: 'boolean' },
     { name: 'libc', type: 'string' },
     { name: 'integration', type: 'string', allowMultiple: true },
     { name: 'seaPrep', type: 'boolean' },
@@ -1153,8 +1167,13 @@ registerTypedCommand(
 
 registerTypedCommand(
     'load-moved', 
-    { internal: true, args: [{ name: 'moves', type: 'string' }] },
-    (filename) => synapse.loadMoved(filename),
+    { 
+        hidden: true, 
+        args: [{ name: 'moves', type: 'string' }],
+    },
+    async (filename) => {
+        await synapse.loadMoved(filename, false)
+    },
 )
 
 registerTypedCommand(
@@ -1176,6 +1195,15 @@ registerTypedCommand(
         args: [{ name: 'target', type: 'string'}],
     },
     (target, opt) => synapse.inspectBlock(target, opt)
+)
+
+registerTypedCommand(
+    'fs-stats',  
+    {
+        internal: true,
+        args: [],
+    },
+    () => synapse.printFsStats()
 )
 
 registerTypedCommand(
@@ -1344,6 +1372,15 @@ registerTypedCommand(
 
         return passthroughZig(opt.targetArgs ?? [])
     }
+)
+
+registerTypedCommand(
+    'install-vscode-zig-extension',
+    { 
+        hidden: true,
+        requirements: { program: false },
+    },
+    () => installVsCodeZigExtension()
 )
 
 export function isEnumType(type: ArgType): type is EnumType {

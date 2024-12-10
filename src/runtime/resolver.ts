@@ -2,7 +2,7 @@ import * as path from 'node:path'
 import { isBuiltin } from 'node:module'
 import { SyncFs } from '../system'
 import { getSpecifierComponents, resolveBareSpecifier, resolvePrivateImport } from '../pm/packages'
-import { createTrie, isRelativeSpecifier, keyedMemoize, throwIfNotFileNotFoundError } from '../utils'
+import { createTrie, isRelativeSpecifier, keyedMemoize, memoize, throwIfNotFileNotFoundError } from '../utils'
 import { ImportMap, SourceInfo } from './importMaps'
 import { PackageJson } from '../pm/packageJson'
 import { isDataPointer } from '../build-fs/pointers'
@@ -20,15 +20,15 @@ interface Mapping {
     readonly locationType?: LocationType
 }
 
-export interface MapNode<T = unknown> {
+export interface MapNode {
     readonly location: string
     readonly locationType?: LocationType
     readonly mappings: Record<string, Mapping>
-    readonly source?: T
+    readonly source?: SourceInfo
 }
 
-function createLookupTable<T = unknown>() {
-    const trie = createTrie<MapNode<T>, string[]>()
+function createLookupTable() {
+    const trie = createTrie<MapNode, string[]>()
     const keys = new Map<ImportMap[string], string>()
 
     function getMapKey(map: ImportMap[string]) {
@@ -56,7 +56,7 @@ function createLookupTable<T = unknown>() {
         return trimmed
     }
 
-    function updateNode(key: string[], map: ImportMap<T>, location: string, rootKey = key, locationType?: LocationType, source?: T, visited = new Set<ImportMap<T>>) {
+    function updateNode(key: string[], map: ImportMap, location: string, rootKey = key, locationType?: LocationType, source?: SourceInfo, visited = new Set<ImportMap>) {
         if (visited.has(map)) return
         visited.add(map)
 
@@ -87,15 +87,10 @@ function createLookupTable<T = unknown>() {
     }
 
     function lookup(specifier: string, location: string): Mapping | undefined {
-        const key = getLocationKey(location)
-        const stack: (readonly [string, MapNode | undefined])[] = []
-        for (const n of trie.traverse(key)) {
-            stack.push(n)
-        }
+        const stack = trie.traverseAll(getLocationKey(location))
 
         while (stack.length > 0) {
-            const [k, m] = stack.pop()!
-            const v = m?.mappings[specifier]
+            const v = stack.pop()!.mappings[specifier]
             if (v) {
                 return v
             }
@@ -105,7 +100,7 @@ function createLookupTable<T = unknown>() {
     function resolve(location: string) {
         const key = getLocationKey(location)
         const stack: (MapNode | undefined)[] = []
-        for (const [k, v] of trie.traverse(key)) {
+        for (const v of trie.traverse(key)) {
             stack.push(v)
         }
 
@@ -123,19 +118,48 @@ function createLookupTable<T = unknown>() {
         return [last.location, ...suffix].join(path.sep)
     }
 
-    function registerMapping(map: ImportMap<T>, location: string = '/') {
+    function registerMapping(map: ImportMap, location: string = '/') {
         const key = getLocationKey(location)
         updateNode(key, map, location)
     }
 
     function getSource(location: string) {
         const key = getLocationKey(location)
-        const stack: (MapNode<T> | undefined)[] = []
-        for (const [k, v] of trie.traverse(key)) {
+        const stack: (MapNode | undefined)[] = []
+        for (const v of trie.traverse(key)) {
             stack.push(v)
         }
 
         return stack[stack.length - 1]
+    }
+
+    function getSourceWithRemainder(location: string) {
+        const key = getLocationKey(location)
+        const stack = trie.traverseAll(key)
+
+        const node = stack[stack.length - 1]
+        if (!node) {
+            return
+        }
+
+        let specifier: string | undefined
+        let virtualLocation: string | undefined
+        if (stack.length > 1) {
+            const prior = stack[stack.length - 2].mappings
+            for (const k of Object.keys(prior)) {
+                if (prior[k].physicalLocation === node.location) {
+                    specifier = k
+                    virtualLocation = prior[k].virtualLocation
+                    break
+                }
+            }
+        }
+
+        return {
+            node,
+            specifier,
+            remainder: virtualLocation ? location.slice(virtualLocation.length + 1) : undefined, 
+        }
     }
 
     function inspect() {
@@ -152,7 +176,7 @@ function createLookupTable<T = unknown>() {
         visit()
     }
 
-    return { lookup, resolve, registerMapping, getSource, inspect }
+    return { lookup, resolve, registerMapping, getSource, getSourceWithRemainder, inspect }
 }
 
 export interface PatchedPackage {
@@ -173,7 +197,7 @@ export type ModuleTypeHint =  'cjs' | 'esm' | 'native' | 'pointer' | 'builtin' |
 
 export type ModuleResolver = ReturnType<typeof createModuleResolver>
 export function createModuleResolver(fs: Pick<SyncFs, 'readFileSync' | 'fileExistsSync'>, workingDirectory: string, includeTs = false) {
-    const lookupTable = createLookupTable<SourceInfo>()
+    const lookupTable = createLookupTable()
     const globals: Record<string, string> = {}
     const resolvedSubpaths = new Map<string, string>()
 
@@ -483,11 +507,13 @@ export function createModuleResolver(fs: Pick<SyncFs, 'readFileSync' | 'fileExis
         }
     }
 
-    function getInverseGlobalsMap() {
+    function _getInverseGlobalsMap() {
         return Object.fromEntries(Object.entries(globals).map(e => e.reverse())) as Record<string, string>
     }
 
-    function getSource(location: string): (MapNode<SourceInfo> & { subpath?: string }) | undefined {
+    const getInverseGlobalsMap = memoize(_getInverseGlobalsMap)
+
+    function getSource(location: string): (MapNode & { subpath?: string }) | undefined {
         const source = lookupTable.getSource(location)
         if (!source) {
             return
@@ -499,6 +525,24 @@ export function createModuleResolver(fs: Pick<SyncFs, 'readFileSync' | 'fileExis
         }
 
         return source
+    }
+
+    function reverseLookup(location: string): { specifier: string; fileName?: string; source?: SourceInfo; location?: string } | undefined {
+        if (getInverseGlobalsMap()[location]) {
+            return { specifier: getInverseGlobalsMap()[location] }
+        }
+
+        const res = lookupTable.getSourceWithRemainder(location)
+        if (!res?.specifier) {
+            return
+        }
+
+        return {
+            specifier: res.specifier, 
+            location: res.node.location,
+            fileName: res.remainder ? res.remainder : undefined,
+            source: res.node.source,
+        }
     }
 
     return { 
@@ -519,6 +563,7 @@ export function createModuleResolver(fs: Pick<SyncFs, 'readFileSync' | 'fileExis
 
         // MISC
         getSource,
+        reverseLookup,
     }
 }
 

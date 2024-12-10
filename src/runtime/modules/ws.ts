@@ -1,3 +1,4 @@
+//@internal
 //# moduleId = synapse:ws
 //# transform = persist
 

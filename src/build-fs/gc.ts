@@ -3,7 +3,7 @@ import { DataRepository, getDataRepository } from '../artifacts'
 import { getFs, runWithContext, throwIfCancelled } from '../execution'
 import { ensureDirSync, watchForFile } from '../system'
 import { acquireFsLock, getCiType, throwIfNotFileNotFoundError } from '../utils'
-import { BuildFsStats, collectStats, diffSets, getEventLogger, mergeRepoStats, printStats } from './stats'
+import { BuildFsStats, collectAllStats, diffSets, getEventLogger, mergeRepoStats, printStats } from './stats'
 import { colorize, getDisplay, printLine } from '../cli/ui'
 import { getLogger } from '../logging'
 import { startGcProcess } from './gcWorker'
@@ -129,16 +129,6 @@ interface GcTrigger extends AsyncDisposable {
     cancel(): void
 }
 
-// XXX: must be a function, otherwise `Symbol.asyncDispose` won't be initialized
-function getAsyncDispose(): typeof Symbol.asyncDispose {
-    if (!Symbol.asyncDispose) {
-        const asyncDispose = Symbol.for('Symbol.asyncDispose')
-        Object.defineProperty(Symbol, 'asyncDispose', { value: asyncDispose, enumerable: true })
-    }
-
-    return Symbol.asyncDispose
-}
-
 export function maybeCreateGcTrigger(alwaysRun = false): GcTrigger | undefined {
     if (!alwaysRun && getCiType()) {
         return
@@ -193,7 +183,7 @@ export function maybeCreateGcTrigger(alwaysRun = false): GcTrigger | undefined {
 
     return {
         cancel,
-        [getAsyncDispose()]: dispose,
+        [Symbol.asyncDispose]: dispose,
     }
 }
 
@@ -292,7 +282,7 @@ export async function cleanDataRepo(repo = getDataRepository(getFs()), dryRun = 
     }
 
     const fs = getFs()
-    const stats = await collectStats(repo, settings.maxCommits)
+    const stats = await collectAllStats(repo, settings.maxCommits)
     const stubs = new Set<string>()
 
     const exclude = new Set<string>()

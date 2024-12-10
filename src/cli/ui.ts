@@ -406,7 +406,7 @@ interface ViewData {
     }
 }
 
-export enum ControlKey {
+export const enum ControlKey {
     Backspace = 8,
     Enter = 13,
     UpArrow,

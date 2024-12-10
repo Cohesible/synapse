@@ -1,7 +1,6 @@
 import * as path from 'node:path'
 import { Fs } from '../system'
-import { keyedMemoize } from '../utils'
-import { getLogger } from '../logging'
+import { keyedMemoize, throwIfNotFileNotFoundError } from '../utils'
 
 interface Wildcard {
     readonly type: 'wildcard'
@@ -29,7 +28,7 @@ type GlobComponent =
     | Wildcard
     | CharacterSet
 
-enum ParseState {
+const enum ParseState {
     Initial,
     Set,
 }
@@ -304,11 +303,7 @@ async function multiGlob(fs: GlobHost, dir: string, patterns: Exclude<GlobCompon
     const matchedDirectoriesAll = new Map<string, boolean>()
     const matchedDirectories = new Map<string, number[]>()
 
-    const getStats = keyedMemoize((fileName: string) => fs.stat(fileName).catch(e => {
-        if ((e as any).code !== 'ENOENT') {
-            throw e
-        }
-    }))
+    const getStats = keyedMemoize((fileName: string) => fs.stat(fileName).catch(throwIfNotFileNotFoundError))
 
     function matchFile(index: number, name: string, filePath: string) {
         const included = !options.get(index)?.exclude

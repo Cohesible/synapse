@@ -18,10 +18,11 @@ export function copyGlobalThis(): Context {
         'console', // We want to add our own
     ])
 
-    const descriptors = Object.entries(Object.getOwnPropertyDescriptors(globalThis)).filter(([k]) => !keys.has(k) && !propDenyList.has(k))
-
-    for (const [k, v] of descriptors) {
-        Object.defineProperty(globals, k, v)
+    const descriptors = Object.getOwnPropertyDescriptors(globalThis)
+    for (const k of Object.keys(descriptors)) {
+        if (!keys.has(k) && !propDenyList.has(k)) {
+            Object.defineProperty(globals, k, descriptors[k])
+        }
     }
 
     globals.ArrayBuffer = ArrayBuffer

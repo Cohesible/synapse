@@ -4,7 +4,7 @@ import { ParsedPlan, getChangeType, mapResource } from '../../deploy/deployment'
 import { DeployEvent, DeploySummaryEvent, FailedDeployEvent } from '../../logging'
 import { SymbolNode, SymbolGraph, renderSymbol, MergedGraph, renderSymbolLocation } from '../../refactoring'
 import { Color, colorize, format, getDisplay, getSpinnerFrame, printLine, Spinner, spinners, stripAnsi, print, ControlKey } from '../ui'
-import { keyedMemoize } from '../../utils'
+import { keyedMemoize, sortRecord } from '../../utils'
 import { getWorkingDir } from '../../workspaces'
 import { resourceIdSymbol } from '../../deploy/server'
 import { CancelError } from '../../execution'
@@ -57,9 +57,8 @@ function getStatusIcon(status: SymbolState['status'], spinner: Spinner, duration
 }
 
 function isOnlyUpdatingDefs(state: SymbolState) {
-    for (const k of Object.keys(state.resources)) {
-         // XXX
-        if (!k.endsWith('--definition')) {
+    for (const v of Object.values(state.resources)) {
+        if (v.resourceType.closureKindHint !== 'definition') {
             return false
         }
     }
@@ -72,7 +71,7 @@ export function printSymbolTable(symbols: Iterable<[sym: SymbolNode, state: Symb
     for (const [k, v] of symbols) {
         if (isOnlyUpdatingDefs(v)) continue
 
-        const text = renderSymbolWithState(k.value, v, undefined, spinners.empty)
+        const text = renderSymbolWithState(k.value, v, spinners.empty)
         texts.set(k, text)
     }
 
@@ -89,7 +88,7 @@ export function printSymbolTable(symbols: Iterable<[sym: SymbolNode, state: Symb
         if (isOnlyUpdatingDefs(v)) continue
 
         const relPath = path.relative(getWorkingDir(), k.value.fileName)
-        const left = renderSymbolWithState(k.value, v, undefined, spinners.empty)
+        const left = renderSymbolWithState(k.value, v, spinners.empty)
         const right = renderSymbolLocation({ ...k.value, fileName: relPath }, true)
         const leftWidth = stripAnsi(left).length
         //const padding = headerSize - leftWidth
@@ -133,10 +132,9 @@ export function renderMove(
     return `${fromRendered} --> ${toRendered}`
 }
 
-export function renderSymbolWithState(
+function renderSymbolWithState(
     sym: SymbolNode['value'],
     state: SymbolState,
-    workingDir = getWorkingDir(), 
     spinner = spinners.braille
 ) {
     const actionColor = getColor(state.action)
@@ -285,11 +283,7 @@ export async function createDeployView(graph: MergedGraph, mode: 'deploy' | 'des
 
             const r = getRow(`${symbol.value.id}`)
             const t = +setInterval(() => {
-                const s = renderSymbolWithState(
-                    symbol.value,
-                    state,
-                    getWorkingDir(),
-                )
+                const s = renderSymbolWithState(symbol.value, state)
 
                 r.update(s)
             }, 250)
@@ -310,11 +304,7 @@ export async function createDeployView(graph: MergedGraph, mode: 'deploy' | 'des
             const state = res.state
             addRenderInterval(res.symbol, res.state)
 
-            const s = renderSymbolWithState(
-                res.symbol.value,
-                state,
-                getWorkingDir(),
-            )
+            const s = renderSymbolWithState(res.symbol.value, state)
 
             if (state.resources[ev.resource].status === 'complete') {
                 if (!state.resources[ev.resource].internal) {
@@ -459,14 +449,20 @@ function summarizePlan(plan: ParsedPlan): DeployEvent['action'] | 'no-op' {
     return action
 }
 
-export function groupSymbolInfoByFile(info: Map<SymbolNode, SymbolState>): Record<string, [SymbolNode, SymbolState][]> {
-    const groups: Record<string, [SymbolNode, SymbolState][]> = {}
+type ByFile = Record<string, [SymbolNode, SymbolState][]>
+
+export function groupSymbolInfoByPkg(info: Map<SymbolNode, SymbolState>): Record<string, ByFile> {
+    const byPkg: Record<string, ByFile> = {}
     for (const [k, v] of info) {
-        const g = groups[k.value.fileName] ??= []
+        const pkg = k.value.packageRef ?? k.value.specifier ?? '' // `''` is the root
+        const files = byPkg[pkg] ??= {}
+        const g = files[k.value.fileName] ??= []
         g.push([k, v])
     }
 
-    return groups
+    // Sort with the root first
+
+    return sortRecord(byPkg)
 }
 
 export function getPlannedChanges(plan: ParsedPlan) {

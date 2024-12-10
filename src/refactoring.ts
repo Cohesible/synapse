@@ -1,8 +1,8 @@
-import type { TerraformSourceMap, Symbol, TfJson } from './runtime/modules/terraform'
-import { createMinHeap, createTrie, isNonNullable, keyedMemoize, levenshteinDistance } from './utils'
+import type { TerraformSourceMap, Symbol, TfJson, TemplateMetadata } from './runtime/modules/terraform'
+import { createMinHeap, createTrie, isNonNullable, keyedMemoize, levenshteinDistance, strcmp } from './utils'
 import { getLogger } from './logging'
 import { parseModuleName } from './templates'
-import { TfState } from './deploy/state'
+import { TfResource, TfState } from './deploy/state'
 
 interface Node<T = unknown> {
     readonly value: T
@@ -451,6 +451,7 @@ export interface ResolvedScope {
     callSite: Symbol
     assignment?: Symbol
     namespace?: Symbol[]
+    declaration?: Symbol[]
 }
 
 export function getRenderedStatementFromScope(scope: ResolvedScope): string {
@@ -467,7 +468,7 @@ export function getRenderedStatementFromScope(scope: ResolvedScope): string {
     return name
 }
 
-export function getKeyFromScopes(scopes: ResolvedScope[]) {
+export function getKeyFromScopes(scopes: ResolvedScope[], includeModule = false) {
     if (scopes.length === 0) {
         throw new Error('No scopes provided')
     }
@@ -483,11 +484,42 @@ export function getKeyFromScopes(scopes: ResolvedScope[]) {
         parts.push(s.callSite.name)
     }
 
+    const root = includeModule ? scopes[0]?.callSite : undefined
+    if (root) {
+        const prefix = root.packageRef ?? root.specifier
+        parts.unshift(`${prefix ? `#${prefix}` : ''}${root.fileName}`)
+    }
+
     return parts.join('--')
+}
 
-    //const moduleName = scopes[0].callSite.fileName
+export function isOldSourceMapFormat(m: TerraformSourceMap) {
+    const v = Object.values(m.resources)[0]
+    if (!v) {
+        return false
+    }
 
-    //return `${moduleName}_${parts.join('--')}`
+    const keys = Object.keys(v)
+    
+    return keys.length === 1 && keys[0] === 'scopes'
+}
+
+export function deleteSourceMapResource(m: TerraformSourceMap, k: string) {
+    if (isOldSourceMapFormat(m)) {
+        return delete m.resources[k]
+    }
+
+    const { type, name } = getResourceTypeAndName(k)
+    if (m.resources[type]) {
+        return delete m.resources[type][name]
+    }
+}
+
+function getResourceTypeAndName(key: string) {
+    const [type, ...rest] = key.split('.')
+    const name = rest.join('.')
+
+    return { type, name }
 }
 
 export type SymbolGraph = ReturnType<typeof createSymbolGraph>
@@ -498,13 +530,15 @@ export function createSymbolGraph(sourceMap: TerraformSourceMap, resources: Reco
     const nodes = new Map<number, SymbolNode>()
     const resourceToNode = new Map<string, SymbolNode>() // Top scope
     const symbolMap = new Map<Symbol, SymbolNode>()
+    const shouldUseOldFormat = isOldSourceMapFormat(sourceMap)
 
-    type Scope = { isNewExpression?: boolean; callSite: number; assignment?: number; namespace?: number[] }
+    type Scope = { isNewExpression?: boolean; callSite: number; assignment?: number; namespace?: number[]; declaration?: number[] }
 
     function resolveScope(scope: Scope): ResolvedScope {
         return {
             callSite: sourceMap.symbols[scope.callSite],
             namespace: scope.namespace?.map(id => sourceMap.symbols[id]),
+            declaration: scope.declaration?.map(id => sourceMap.symbols[id]),
             assignment: scope.assignment ? sourceMap.symbols[scope.assignment] : undefined,
             isNewExpression: scope.isNewExpression,
         }
@@ -541,8 +575,33 @@ export function createSymbolGraph(sourceMap: TerraformSourceMap, resources: Reco
         return node
     }
 
+    function getScopes(key: string): TerraformSourceMap['resources'][string][string]['scopes'] | undefined {
+        if (shouldUseOldFormat) {
+            return (sourceMap.resources as any)[key]?.scopes
+        }
+
+        const { type, name } = getResourceTypeAndName(key)
+
+        return sourceMap.resources[type]?.[name]?.scopes
+    }
+
+    function getEntries(): [key: string, value: TerraformSourceMap['resources'][string][string]][] {
+        if (shouldUseOldFormat) {
+            return Object.entries(sourceMap.resources) as any
+        }
+
+        const result: any[] = []
+        for (const [k, v] of Object.entries(sourceMap.resources)) {
+            for (const [k2, v2] of Object.entries(v)) {
+                result.push([`${k}.${k2}`, v2])
+            }
+        }
+
+        return result
+    }
+
     function getCallsites(resource: string) {
-        const scopes = sourceMap.resources[resource]?.scopes
+        const scopes = getScopes(resource)
         if (!scopes) {
             return
         }
@@ -550,7 +609,7 @@ export function createSymbolGraph(sourceMap: TerraformSourceMap, resources: Reco
         return scopes.map(s => sourceMap.symbols[s.callSite]) 
     }
 
-    for (const [k, v] of Object.entries(sourceMap.resources)) {
+    for (const [k, v] of getEntries()) {
         if (v.scopes.length === 0) {
             // This only happens for generated "export" files
             getLogger().warn(`Resource "${k}" has no scopes`)
@@ -561,7 +620,8 @@ export function createSymbolGraph(sourceMap: TerraformSourceMap, resources: Reco
         const rName = rest.join('.')
         const config = resources[k]
         if (!config) {
-            throw new Error(`Missing resource in source map: ${k}`)
+            continue
+            //throw new Error(`Missing resource in source map: ${k}`)
         }
 
         const r: Resource = {
@@ -594,9 +654,9 @@ export function createSymbolGraph(sourceMap: TerraformSourceMap, resources: Reco
     }
 
     root.children.sort((a, b) => {
-        const d = (a as SymbolNode).value.fileName.localeCompare((b as SymbolNode).value.fileName)
+        const d = strcmp((a as SymbolNode).value.fileName, ((b as SymbolNode).value.fileName))
         if (d === 0) {
-            return (a as SymbolNode).value.name.localeCompare((b as SymbolNode).value.name)
+            return strcmp((a as SymbolNode).value.name, ((b as SymbolNode).value.name))
         }
         return d
     })
@@ -618,20 +678,46 @@ export function createSymbolGraph(sourceMap: TerraformSourceMap, resources: Reco
         return false
     }
 
-    function getResourceType(key: string): { kind: 'terraform' | 'synapse' | 'custom', name: string } {
+    function getCustomResourceTypeName(type: any) {
+        // Legacy format
+        if (type.includes('--')) {
+            return type.split('--').at(-2) 
+        }
+
+        const scopes = getScopes(`synapse_resource.${type}`)
+        if (!scopes || scopes.length === 0) {
+            return
+        }
+
+        return sourceMap.symbols[scopes.at(-1)!.callSite].name
+    }
+
+    function getClosureKindHint(name: string): string | undefined {
+        const config = getConfig(`synapse_resource.${name}`)
+        if (!config) {
+            throw new Error(`Synapse resource not found: ${name}`)
+        }
+
+        return (config as any).input?.kindHint
+    }
+
+    function getResourceType(key: string): { kind: 'terraform' | 'synapse' | 'custom', name: string, closureKindHint?: string } {
         const parts = key.split('.')
         const type = parts[0] === 'data' ? parts[1] : parts[0]
-        const csType = type === 'synapse_resource' ? resources[key]?.type : undefined
-        if (!csType) {
+        const name = parts[0] === 'data' ? parts[2] : parts[1]
+        const synapseType = type === 'synapse_resource' ? resources[key]?.type : undefined
+        if (!synapseType) {
             return { kind: 'terraform', name: type }
         }
     
-        const userType = (csType === 'Example' || csType === 'ExampleData' || csType === 'Custom' || csType === 'CustomData') 
-            ? resources[key].input.type.split('--').at(-2) 
+        const userType = synapseType === 'Custom' || synapseType === 'CustomData'
+            ? getCustomResourceTypeName(resources[key].input.type)
             : undefined
 
         if (!userType) {
-            return { kind: 'synapse', name: csType }
+            const closureKindHint = synapseType === 'Closure' ? getClosureKindHint(name) : undefined
+
+            return { kind: 'synapse', name: synapseType, closureKindHint }
         }
 
         return { kind: 'custom', name: userType }
@@ -708,6 +794,19 @@ export function createSymbolGraph(sourceMap: TerraformSourceMap, resources: Reco
         return resources[key]
     }
 
+    function getResourceKeys() {
+        return Object.keys(resources)
+    }
+
+    function _getAbsoluteKey(key: string) {
+        const scopes = getScopes(key)
+        if (!scopes) {
+            return key
+        }
+
+        return getKeyFromScopes(scopes.map(resolveScope), true)
+    }
+
     return {
         getConfig,
         getSymbols,
@@ -717,8 +816,9 @@ export function createSymbolGraph(sourceMap: TerraformSourceMap, resources: Reco
         getResourceType,
         matchSymbolNodes,
         getTestInfo,
-
         getCallsites,
+        getResourceKeys,
+        getAbsoluteKey: keyedMemoize(_getAbsoluteKey),
     }
 }
 
@@ -1292,7 +1392,7 @@ export function createGraphSolver(
         }
     
         for (const arr of m.values()) {
-            arr.sort((a, b) => a.value.name.localeCompare(b.value.name))
+            arr.sort((a, b) => strcmp(a.value.name, b.value.name))
         }
 
         return m
@@ -1726,6 +1826,10 @@ export function createGraphSolver(
                     })
                 }
             }
+
+            if (pq.length === 0) {
+                return s.ops
+            }
         }
     }
 
@@ -1780,178 +1884,17 @@ export function detectRefactors(
     return [...moves.entries()].map(([k, v]) => ({ from: k, to: v.to, fromSymbol: v.fromSymbol, toSymbol: v.toSymbol }))
 }
 
-function mapScope(scope: { callSite: number; assignment?: number; namespace?: number[] }, sourcemap: TerraformSourceMap) {
-    return {
-        callSite: sourcemap.symbols[scope.callSite],
-        assignment: scope.assignment ? sourcemap.symbols[scope.assignment] : undefined,
-        namespace: scope.namespace ? scope.namespace.map(x => sourcemap.symbols[x]) : undefined,
-    }
-}
-
-function mapScopes(sourcemap: TerraformSourceMap) {
-    return Object.fromEntries(Object.entries(sourcemap.resources).map(([k, v]) => [k, v.scopes.map(x => mapScope(x, sourcemap))]))
-}
-
-
-// A "resource symbol" is composed of multiple identifiers that form
-// the origin point for one or more resources.
-interface ResourceSymbol {
-    readonly id: number
-    readonly pos: number
-    readonly name: string
-    readonly fileName: string
-    readonly resources: Resource[]
-    readonly namespace?: { readonly name: string; readonly pos: number }[]
-    readonly assignment?: { readonly name: string; readonly pos: number }
-}
-
-export function renderSymbolLocation(sym: Pick<Symbol, 'line' | 'column' | 'fileName'>, includePosition = false) {
+export function renderSymbolLocation(sym: Pick<Symbol, 'line' | 'column' | 'fileName' | 'specifier' | 'packageRef'>, includePosition = false) {
     const pos = `:${sym.line + 1}:${sym.column + 1}`
+    const ref = sym.packageRef ?? sym.specifier
 
-    return `${sym.fileName}${includePosition ? pos : ''}`
+    return `${sym.fileName}${includePosition ? pos : ''}${ref ? ` (${ref})` : ''}`
 }
 
 export function renderSymbol(sym: Symbol, includeFileName = true, includePosition = false) {
     const suffix = includeFileName ? ` ${renderSymbolLocation(sym, includePosition)}` : ''
 
     return `${sym.name}${suffix}`
-}
-
-export function evaluateMoveCommands(template: TfJson, state: TfState) {
-    const commands = template['//']?.moveCommands
-    if (!commands || commands.length === 0) {
-        return
-    }
-
-    const resources: Record<string, Record<string, any>> = {}
-    for (const [k, v] of Object.entries(template.resource)) {
-        for (const [k2, v2] of Object.entries(v)) {
-            const byType = resources[k2] ??= {}
-            byType[k] = v2
-        }
-    }
-
-    function findResources(params: { prefix: string; suffix: string; types: string[]; middle?: string }) {
-        const matched: TfState['resources'] = []
-        for (const r of state.resources) {
-            if (!r.name.startsWith(params.prefix) || !r.name.endsWith(params.suffix)) {
-                continue
-            }
-
-            if (params.middle) {
-                const sliced = r.name.slice(params.prefix.length, -params.suffix.length)
-                if (!sliced.includes(params.middle)) {
-                    continue
-                }
-            }
-
-            if (params.types.includes(r.type)) {
-                matched.push(r)
-            }
-        }
-
-        return matched
-    }
-
-    const conflictedTo = new Set<string>()
-    const conflictedFrom = new Set<string>()
-
-    const moved: { from: string; to: string }[] = []
-    for (const cmd of commands) {
-        const matchedTemplates: Record<string, Record<string, any>> = {}
-        for (const [k, v] of Object.entries(resources)) {
-            if (k.startsWith(cmd.scope) && !conflictedTo.has(k)) {
-                matchedTemplates[k] = v
-            }
-        }
-
-        function getPrefixAndSuffix(key: string) {
-            if (cmd.type === 'fixup') {
-                const parts = cmd.scope.split('--')
-                const index = -3
-                if (parts.at(index) !== cmd.name) {
-                    throw new Error(`Invalid fixup: ${cmd.name} in scope ${cmd.scope}`)
-                }
-
-                const prevScope = parts.slice(0, index).concat(parts.slice(index + 1, -1)).join('--')
-
-                return {
-                    prefix: prevScope,
-                    suffix: key.slice(cmd.scope.length),
-                }
-            }
-
-            if (cmd.name.startsWith('this.')) {
-                const [module, ...rem] = cmd.scope.split('_') 
-                const scope = rem.join('_')
-
-                const parts = scope.split('--')
-                const middle = [parts.at(-2), cmd.name.slice('this.'.length)].join('--')
-                if (parts.length === 2) {
-                    return {
-                        prefix: module + '_',
-                        middle,
-                        suffix: key.slice(cmd.scope.length),
-                    }
-                }
-
-                return {
-                    prefix: module + '_' + parts.slice(0, -2).join('--'),
-                    middle,
-                    suffix: key.slice(cmd.scope.length),
-                }
-            }
-
-            const prevScope = [...cmd.scope.split('--').slice(0, -1), cmd.name].join('--')
-
-            return {
-                prefix: prevScope,
-                suffix: key.slice(cmd.scope.length),
-            }
-        }
-
-        for (const [k, v] of Object.entries(matchedTemplates)) {
-            const matchedResources = findResources({
-                ...getPrefixAndSuffix(k),
-                types: Object.keys(v),
-            })
-
-            for (const r of matchedResources) {
-                if (conflictedFrom.has(`${r.type}.${r.name}`)) continue
-
-                // This can happen if we already create a new resource instead of moving it
-                if (state.resources.find(x => x.type === r.type && x.name === k)) continue
-
-                const from = `${r.type}.${r.name}`
-                const to = `${r.type}.${k}`
-                if (from === to) continue
-
-                const conflicts: number[] = []
-                for (let i = 0; i < moved.length; i++) {
-                    if ((moved[i].from === from || moved[i].to === to) && !(moved[i].from === from && moved[i].to === to)) {
-                        conflicts.push(i)
-                    }
-                }
-
-                if (conflicts.length > 0) {
-                    getLogger().debug(`skipping refactor match due conflicting move: ${from} ---> ${to}`)
-
-                    for (const index of conflicts.reverse()) {
-                        const { from, to } = moved[index]
-                        conflictedFrom.add(from)
-                        conflictedTo.add(to)
-                        moved.splice(index, 1)
-                    }
-
-                    continue
-                }
-
-                moved.push({ from, to })
-            }
-        }
-    }
-
-    return moved
 }
 
 interface Move {
@@ -1970,6 +1913,17 @@ function getMoveWithSymbols(move: Move, oldGraph: SymbolGraph, newGraph: SymbolG
     const fromSymbol = oldGraph.findSymbolFromResourceKey(move.from)?.value
     const toSymbol = newGraph.findSymbolFromResourceKey(move.to)?.value
     if (!fromSymbol || !toSymbol) {
+        // XXX: fallback in case the old template is actually stale
+        // We need to look at the last used template _per-resource_ because
+        // we allow users to deploy resources piecemeal
+        if (toSymbol) {
+            return {
+                ...move,
+                fromSymbol: toSymbol,
+                toSymbol,
+            }
+        }
+
         return
     }
 
@@ -2162,6 +2116,120 @@ function createJsonPathScanner(expression: string) {
     }
 
     return { scan }
+}
+
+export function findAutomaticMoves(state: TfState, oldGraph: SymbolGraph, newGraph: SymbolGraph) {
+    const grouped = new Map<string, Set<string>>()
+    const resources = new Map<string, TfResource>()
+
+    function getGroupKey(resourceKey: string, graph: SymbolGraph) {
+        const ty = graph.getResourceType(resourceKey)
+        switch (ty.kind) {
+            case 'terraform':
+                return ty.name
+            case 'synapse':
+                return `synapse_resource.${ty.name}${ty.closureKindHint ? `.${ty.closureKindHint}` : ''}`
+            case 'custom':
+                return `custom.${ty.name}`
+        }
+    }
+
+    function addToGroup(graph: SymbolGraph, groups: Map<string, Set<string>>, key: string) {
+        const groupKey = getGroupKey(key, graph)
+        const group = groups.get(groupKey) ?? new Set()
+        group.add(key)
+        groups.set(groupKey, group)
+    }
+
+    for (const r of state.resources) {
+        const key = `${r.type}.${r.name}`
+        if (!oldGraph.hasResource(key)) continue
+
+        resources.set(key, r)
+        addToGroup(oldGraph, grouped, key)
+    }
+
+    // TODO: don't look for multiple matches, this only exists for legacy deployments
+    function findAbsMatches(absolute: string, group: Iterable<string>) {
+        const matches: string[] = []
+        for (const r of group) {
+            if (oldGraph.getAbsoluteKey(r) === absolute) {
+                matches.push(r)
+            }
+        }
+
+        return matches
+    }
+
+    // TODO: remove this, abs keys should be unique for all future deployments
+    const dupes = new Map<string, string>()
+    const dupeSet = new Set<string>()
+    for (const k of newGraph.getResourceKeys()) {
+        const abs = newGraph.getAbsoluteKey(k)
+        const v = dupes.get(abs)
+        if (v === undefined) {
+            dupes.set(abs, k)
+        } else {
+            dupeSet.add(k)
+            dupeSet.add(v)
+        }
+    }
+
+    const moved: { from: string; to: string }[] = []
+    const unmatched = new Map<string, Set<string>>()
+    for (const k of newGraph.getResourceKeys()) {
+        if (dupeSet.has(k)) continue
+
+        const groupKey = getGroupKey(k, newGraph)
+        const g = grouped.get(groupKey)
+        if (!g) {
+            addToGroup(newGraph, unmatched, k)
+            continue
+        }
+
+        if (g.has(k)) {
+            g.delete(k)
+            if (g.size === 0) {
+                grouped.delete(groupKey)
+            }
+            continue
+        }
+
+        // Search for a match using the absolute key
+        const abs = newGraph.getAbsoluteKey(k)
+        const matches = findAbsMatches(abs, g)
+        if (matches.length === 1) {
+            moved.push({ from: matches[0], to: k })
+        } else {
+            addToGroup(newGraph, unmatched, k)
+        }
+    }
+
+    // We might have resources that were not matched with anything in the new template
+    // All matches up until now are treated as _exact_. So if there's only a single unmatched
+    // resource in a group with only a single unmatched resource in the template, we can
+    // safely match them without worrying about breaking anything.
+    //
+    // Even if the match is "wrong", the worst that can happen is a resource that would 
+    // otherwise be orphaned (and thus eventually destroyed) is updated or replaced.
+    for (const [k, v] of grouped) {
+        if (v.size !== 1) continue
+
+        const u = unmatched.get(k)
+        if (u?.size !== 1) continue
+        
+        moved.push({ from: [...v][0], to: [...u][0] })
+        grouped.delete(k)
+        unmatched.delete(k)
+    }
+
+    return {
+        moved,
+        unmatched: {
+            state: grouped,
+            template: unmatched,
+        }
+    }
 }
 
 // TODO:

@@ -2,14 +2,15 @@ import * as nodeUtil from 'node:util'
 import { bold, colorize, dim, getDisplay, renderDuration } from '../ui'
 import { CompilerOptions } from '../../compiler/host'
 import { ResolvedProgramConfig } from '../../compiler/config'
-import { getLogger } from '../../logging'
-import { getPreviousDeploymentProgramHash, getTemplateWithHashes, readState } from '../../artifacts'
+import { getLogger, levelToString } from '../../logging'
+import { getPreviousDeploymentProgramHash, getTemplate, getTemplateFromProgramHash, readState } from '../../artifacts'
 import { TfJson } from '../../runtime/modules/terraform'
 import { getBuildTarget } from '../../execution'
 import { getWorkingDir } from '../../workspaces'
-import { SymbolNode, createMergedGraph, createSymbolGraphFromTemplate, evaluateMoveCommands } from '../../refactoring'
+import { SymbolNode, createMergedGraph, createSymbolGraphFromTemplate } from '../../refactoring'
 import { TfState } from '../../deploy/state'
 import { renderCmdSuggestion } from '../commands'
+import { strcmp } from '../../utils'
 
 
 // Useful events
@@ -180,7 +181,7 @@ export function createCompileView(inputOptions?: CompilerOptions & { hideLogs?: 
             view.writeLine(`Synthesis logs:`)
         }
 
-        const formatted = `${dim(`[${ev.level}]`)} ${nodeUtil.format(...ev.args)}` // TODO: show source file + line # + col #
+        const formatted = `${dim(`[${levelToString(ev.level)}]`)} ${nodeUtil.format(...ev.args)}` // TODO: show source file + line # + col #
         const lines = formatted.split('\n')
         for (const l of lines) {
             view.writeLine(`  ${l}`)
@@ -201,7 +202,7 @@ export async function getPreviousDeploymentData() {
     const programHash = await getPreviousDeploymentProgramHash()
     const [state, oldTemplate] = await Promise.all([
         readState(),
-        programHash ? getTemplateWithHashes(programHash) : undefined,
+        programHash ? getTemplateFromProgramHash(programHash) : undefined,
     ])
 
     return {
@@ -230,8 +231,6 @@ function showSimplePlanSummary(template: TfJson, target: string, entrypoints: st
     const printLine = getDisplay().getOverlayedView().writeLine
 
     const graph = createSymbolGraphFromTemplate(template)
-    const oldGraph = previousData?.oldTemplate ? createSymbolGraphFromTemplate(previousData?.oldTemplate.template) : undefined
-    const mergedGraph = oldGraph ? createMergedGraph(graph, oldGraph) : undefined
 
     const sorted = graph.getSymbols().sort((a, b) => {
         if (a.value.fileName !== b.value.fileName) {
@@ -248,7 +247,7 @@ function showSimplePlanSummary(template: TfJson, target: string, entrypoints: st
     function getResourceCounts(sym: SymbolNode['value']) {
         const byType: Record<string, number> = {}
         for (const r of sym.resources) {
-            if (r.subtype === 'Closure' && r.name.endsWith('--definition')) continue
+            if (r.subtype === 'Closure' && graph.getResourceType(`${r.type}.${r.name}`)?.closureKindHint === 'definition') continue
             if (r.subtype === 'Closure' && (sym.name === 'describe' || sym.name === 'suite')) continue
 
             const ty = graph.getResourceType(`${r.type}.${r.name}`)
@@ -261,7 +260,7 @@ function showSimplePlanSummary(template: TfJson, target: string, entrypoints: st
             }
         }
 
-        return Object.entries(byType).sort((a, b) => a[0].localeCompare(b[0]))
+        return Object.entries(byType).sort((a, b) => strcmp(a[0], (b[0])))
     }
 
     const counts = new Map<SymbolNode, ReturnType<typeof getResourceCounts>>()
@@ -288,7 +287,6 @@ function showSimplePlanSummary(template: TfJson, target: string, entrypoints: st
 
     printLine()
 
-    // entrypoint && !entrypoint.startsWith('--') ? `${cliName} test ${entrypoint}` : 
     const isUpdate = !!previousData?.state && previousData.state.resources.length > 0
     const deployCmd = renderCmdSuggestion('deploy')
     const verb = isUpdate ? 'update' : 'start'
@@ -303,19 +301,18 @@ function showSimplePlanSummary(template: TfJson, target: string, entrypoints: st
 
     printLine()    
 
-    const previousTarget = previousData?.oldTemplate?.template['//']?.deployTarget
+    const previousTarget = previousData?.oldTemplate?.['//']?.deployTarget
     if (previousTarget && previousTarget !== target) {
         printLine(colorize('yellow', `Previous deployment used a different target: ${previousTarget}`))
     }
 
-    if (previousData?.state) {
-        const moves = evaluateMoveCommands(template, previousData?.state)
-        if (moves && moves.length > 0) {
-            getLogger().debug('Evaluated moves', moves)
-            printLine(colorize('yellow', 'Detected possible refactors.'))
-            printLine(`Run ${renderCmdSuggestion('migrate')} to proceed.`)
-        }
-    }
+    // if (previousData?.state) {
+    //     if (moves && moves.length > 0) {
+    //         getLogger().debug('Evaluated moves', moves)
+    //         printLine(colorize('yellow', 'Detected possible refactors.'))
+    //         printLine(`Run ${renderCmdSuggestion('migrate')} to proceed.`)
+    //     }
+    // }
 }
 
 interface ShowWhatICanDoNextProps {

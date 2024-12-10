@@ -11,8 +11,9 @@ import { openBlock } from '../build-fs/block'
 import { homedir } from 'node:os'
 import { getDataRepository } from '../artifacts'
 import { getFs, setContext } from '../execution'
+import { isNullHash } from '../build-fs/pointers'
 
-async function findImportMap(dir: string): Promise<ImportMap<SourceInfo> | undefined> {
+async function findImportMap(dir: string): Promise<ImportMap | undefined> {
     const fileName = path.resolve(dir, 'import-map.json')
 
     try {
@@ -39,7 +40,7 @@ async function findDataDir(dir: string): Promise<string | undefined> {
     }
 }
 
-async function getImportMap(targetPath: string): Promise<ImportMap<SourceInfo> | undefined> {
+async function getImportMap(targetPath: string): Promise<ImportMap | undefined> {
     const importMapFilePath = process.env['JS_IMPORT_MAP_FILEPATH']
     if (!importMapFilePath) {
         return findImportMap(path.dirname(targetPath))
@@ -96,6 +97,10 @@ function findDataRepoSync(dir: string): { dataDir: string; repo: BasicDataReposi
             }
 
             function getMetadata(hash: string, storeHash: string) {
+                if (isNullHash(storeHash)) {
+                    return undefined
+                }
+
                 const store = JSON.parse(getDataSync(storeHash, 'utf-8'))
                 const m = store.type === 'flat' ? store.artifacts[hash] : undefined
         

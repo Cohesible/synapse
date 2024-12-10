@@ -1,9 +1,9 @@
 import * as path from 'node:path'
 import * as perf from 'node:perf_hooks'
 import { formatWithOptions } from 'node:util'
-import { LogEvent, Logger, PerfDetail } from '../logging'
+import { Logger, LogLevel, PerfDetail, levelToString } from '../logging'
 import { FsEntityStats, openHandle } from '../system'
-import { memoize } from '../utils'
+import { isNonNullable, memoize, throwIfNotFileNotFoundError } from '../utils'
 import { getExecutionId, getFs } from '../execution'
 import { getLogsDirectory } from '../workspaces'
 import { isDataPointer } from '../build-fs/pointers'
@@ -32,7 +32,7 @@ const print = (...args: any[]) => formatWithOptions({ colors: false, depth: 4 },
 
 export function logToFile(
     logger: Logger,
-    logLevel: Exclude<LogEvent['level'], 'raw'> = 'debug',
+    logLevel = LogLevel.Debug,
     fileName = path.resolve(getLogsDirectory(), `${getExecutionId()}.log`),
 ) {
     // Log entries are buffered in-mem until the file handle is ready
@@ -73,17 +73,15 @@ export function logToFile(
     }))
 
     listeners.push(logger.onLog(ev => {
-        if (ev.level === 'raw') { // This is for terraform logs
+        if (ev.raw) { // This is for terraform logs
             enqueue(ev.args[0])
         } else {
-            if (compareLogLevel(ev.level, logLevel) > 0) { 
-                return
+            if (ev.level <= logLevel) { 
+                // Timestamps are always printed using UTC
+                const timestamp = ev.timestamp.toISOString()
+                const entry = `${timestamp} [${levelToString(ev.level)}] ${print(...ev.args)}\n`
+                enqueue(entry)
             }
-
-            // Timestamps are always printed using UTC
-            const timestamp = ev.timestamp.toISOString()
-            const entry = `${timestamp} [${ev.level.toUpperCase()}] ${print(...ev.args)}\n`
-            enqueue(entry)
         }
     }))
 
@@ -102,12 +100,7 @@ export function logToFile(
 export async function listLogFiles() {
     const fs = getFs()
     const logsDir = getLogsDirectory()
-    const files = await fs.readDirectory(logsDir).catch(e => {
-        if ((e as any).code !== 'ENOENT') {
-            throw e
-        }
-        return []
-    })
+    const files = await fs.readDirectory(logsDir).catch(throwIfNotFileNotFoundError) ?? []
 
     return files.filter(f => f.type === 'file').map(f => path.resolve(logsDir, f.name))
 }
@@ -120,13 +113,13 @@ export async function getMostRecentLogFile() {
 
 export async function getSortedLogs() {
     const files = await listLogFiles()
-    const stats: (FsEntityStats & { filePath: string })[] = []
-    for (const f of files) {
+
+    async function stat(f: string) {
         try {
-            stats.push({
+            return {
                 filePath: f,
                 ...(await getFs().stat(f)),
-            })
+            }
         } catch (e) {
             if ((e as any).code === 'EPERM') {
                 // File is probably open somewhere else
@@ -134,15 +127,23 @@ export async function getSortedLogs() {
                 throw e
             }
         }
-
     }
 
-    return stats.sort((a, b) => b.ctimeMs - a.ctimeMs)
+    const promises: Promise<(FsEntityStats & { filePath: string }) | undefined>[] = []
+    for (const f of files) {
+        promises.push(stat(f))
+    }
+
+    const stats = await Promise.all(promises)
+
+    return stats.filter(isNonNullable).sort((a, b) => b.ctimeMs - a.ctimeMs)
 }
+
+const maxLogs = 10
 
 export async function purgeOldLogs() {
     const sorted = await getSortedLogs()
-    for (const f of sorted.slice(25)) {
+    for (const f of sorted.slice(maxLogs)) {
         if (f.filePath.endsWith('analytics.log')) continue // XXX
         await getFs().deleteFile(f.filePath).catch(e => {
             if ((e as any).code !== 'ENOENT') {
@@ -154,45 +155,26 @@ export async function purgeOldLogs() {
     }
 }
 
-const levels = new Set(['error', 'warn', 'info', 'debug', 'trace'])
-
-function logLevelOrder(logLevel: Exclude<LogEvent['level'], 'raw'>): number {
-    switch (logLevel) {
-        case 'error':
-            return 0
-        case 'warn':
-            return 1
-        case 'info':
-            return 2
-        case 'debug':
-            return 3
-        case 'trace':
-            return 4
-    }
-}
-
-export type LogLevel = Exclude<LogEvent['level'], 'raw'>
 export function validateLogLevel(level: string): LogLevel | undefined {
-    if (levels.has(level)) {
-        return level as LogLevel
+    switch (level) {
+        case 'error':   return LogLevel.Error
+        case 'warn':    return LogLevel.Warn
+        case 'info':    return LogLevel.Info
+        case 'debug':   return LogLevel.Debug
+        case 'trace':   return LogLevel.Trace
     }
 }
 
-function compareLogLevel(a: LogLevel, b: typeof a) {
-    return logLevelOrder(a) - logLevelOrder(b)
-}
-
-export function logToStderr(logger: Logger, logLevel: LogLevel = 'debug') {
+export function logToStderr(logger: Logger, logLevel = LogLevel.Debug) {
     const stream = process.stderr
     const print = (...args: any[]) => formatWithOptions({ colors: stream.isTTY, depth: 4 }, ...args)
-    const level = logLevelOrder(logLevel)
 
     logger.onLog(ev => {
-        if (ev.level === 'raw') { // This is for terraform logs
+        if (ev.raw) { // This is for terraform logs
             stream.write(ev.args[0])
-        } else if (logLevelOrder(ev.level) <= level) {
+        } else if (ev.level <= logLevel) {
             const timestamp = ev.timestamp.toISOString()
-            stream.write(`${timestamp} [${ev.level.toUpperCase()}] ${print(...ev.args)}\n`)
+            stream.write(`${timestamp} [${levelToString(ev.level)}] ${print(...ev.args)}\n`)
         }
     })
 
@@ -226,8 +208,8 @@ export function logToStderr(logger: Logger, logLevel: LogLevel = 'debug') {
     })
 
     logger.onTestLog(ev => {
-        if (logLevelOrder(ev.level) <= level) {
-            stream.write(`> (${ev.name}) [${ev.level.toUpperCase()}] ${print(...ev.args)}\n`)
+        if (ev.level <= logLevel) {
+            stream.write(`> (${ev.name}) [${levelToString(ev.level)}] ${print(...ev.args)}\n`)
         }
     })
 

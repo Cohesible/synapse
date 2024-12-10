@@ -4,7 +4,7 @@ import { FileHandle, Fs, FsEntity, FsEntityStats, JsonFs, SyncFs, watchForFile }
 import type { ExternalValue, PackageInfo } from './runtime/modules/serdes'
 import { getLogger, runTask } from './logging'
 import { Mutable, acquireFsLock, createRwMutex, createTrie, deepClone, getHash, isNonNullable, keyedMemoize, memoize, sortRecord, throwIfNotFileNotFoundError, tryReadJson } from './utils'
-import type { TerraformPackageManifest, TfJson } from './runtime/modules/terraform'
+import type { TemplateMetadata, TerraformPackageManifest, TfJson } from './runtime/modules/terraform'
 import { BuildTarget, isRemoteDisabled, getBuildDir, getProgramInfoFromDeployment, getRemoteProjectId, getRootDir, getRootDirectory, getTargetDeploymentIdOrThrow, getWorkingDir, resolveProgramBuildTarget, toProgramRef } from './workspaces'
 import {  NpmPackageInfo } from './pm/packages'
 import { TargetsFile, readPointersFile } from './compiler/host'
@@ -17,14 +17,7 @@ import { printLine } from './cli/ui'
 import { createBlock, getBlockInfo, openBlock } from './build-fs/block'
 import { FlatImportMap, SourceInfo } from './runtime/importMaps'
 import { RemoteArtifactRepository, createRemoteArtifactRepo } from './build-fs/remote'
-
-export interface GlobalMetadata {
-    /** @deprecated */
-    readonly multiPart?: {
-        readonly parts: string[]
-        readonly chunkSize: number
-    }
-}
+import { deserializeBinaryTemplate } from './deserializer'
 
 export interface LocalMetadata {
     readonly name?: string
@@ -43,7 +36,7 @@ export interface LocalMetadata {
     // TODO: use a generic `data` field for everything except dependencies/pointers
 }
 
-export interface ArtifactMetadata extends GlobalMetadata, Omit<LocalMetadata, 'dependencies'> {
+export interface ArtifactMetadata extends Omit<LocalMetadata, 'dependencies'> {
     readonly dependencies?: Record<string, string[]>
 }
 
@@ -56,16 +49,6 @@ export interface Head {
     readonly isRollback?: boolean
     readonly previousCommit?: string
     readonly commitHash?: string
-}
-
-export interface SerializedTemplate {
-    readonly '//'?: string
-    readonly provider: string
-    readonly resource: Record<string, string>
-    readonly data: Record<string, string>
-    readonly terraform: string
-    readonly locals: Record<string, string>
-    readonly moved?: { from: string; to: string }[]
 }
 
 export interface SerializedState {
@@ -171,7 +154,6 @@ interface ArtifactStoreState3 {
     readonly mode: 'denormalized'
     readonly workingMetadata: DenormalizedStoreManifest['artifacts']
 }
-
 
 type ArtifactStoreState = ArtifactStoreState2 | ArtifactStoreState3
 
@@ -493,27 +475,6 @@ function createArtifactStore(root: RootArtifactStore, state = initArtifactStoreS
         }
     }
 
-    async function splitArtifact(data: Uint8Array) {
-        const parts: [string, Buffer][] = []
-        for await (const part of createChunkStream(Buffer.from(data))) {
-            parts.push([part.hash, part.chunk])
-        }
-
-        return { parts, chunkSize }
-    }
-
-    async function writeMultipart(hash: string, data: Uint8Array, metadata: ArtifactMetadata) {
-        const { parts, chunkSize } = await splitArtifact(data)
-
-        setMetadata(hash, {
-            ...metadata,
-            multiPart: { parts: parts.map(x => x[0]), chunkSize },
-        })
-
-        await root.writeData(hash, data)
-        await Promise.all(parts.map(([hash, data]) => write(hash, data)))
-    }
-
     function write(hash: string, data: Uint8Array, metadata: ArtifactMetadata = {}) {
         setMetadata(hash, metadata)
 
@@ -739,7 +700,7 @@ async function dump(repo: DataRepository, index: BuildFsIndex & { id?: string },
 
     async function worker(k: string, v: BuildFsFile) { 
         const oldHash = oldIndex?.files[k]?.hash
-        if (!shouldIgnoreOld && oldHash === v.hash) {
+    if (!shouldIgnoreOld && oldHash === v.hash) {
             return
         }
 
@@ -749,7 +710,12 @@ async function dump(repo: DataRepository, index: BuildFsIndex & { id?: string },
         }
 
         const fp = await repo.resolveArtifact(v.hash, { noWrite: true })
-        if (k.endsWith('.json') && opt?.prettyPrint) {
+
+        if (k === 'template.bin') {
+            const data = await repo.readData(v.hash)
+            const template = deserializeBinaryTemplate(Buffer.isBuffer(data) ? data : Buffer.from(data))
+            await fs.writeFile(destPath, JSON.stringify(template, undefined, 4))
+        } else if (k.endsWith('.json') && opt?.prettyPrint) {
             const data = JSON.parse(decode(await repo.readData(v.hash), 'utf-8'))
             await fs.writeFile(destPath, JSON.stringify(data, undefined, 4))
         } else if (opt?.link) {
@@ -851,7 +817,11 @@ function fixWindowsPath(p: string) {
 }
 
 /** @internal */
-export function createBuildFsFragment(repo: DataRepository, index: BuildFsIndex, copier = createCopier(repo)) {
+export function createBuildFsFragment(
+    repo: DataRepository, 
+    index: BuildFsIndex, 
+    copier = createCopier(repo),
+) {
     const opened: Record<string, OpenedBuildFs> = {}
     const mounts: Record<string, ReadonlyBuildFs> = {}
     const dependencies: Record<string, string> = { ...index.dependencies }
@@ -2072,7 +2042,7 @@ function createStructuredArtifactWriter(key: string, writer: Pick<BuildFsV2, 'wr
 export interface InstallationAttributes {
     readonly packageLockTimestamp: number
     readonly packages: Record<string, NpmPackageInfo & { isSynapsePackage?: boolean }>
-    readonly importMap?: FlatImportMap<SourceInfo>
+    readonly importMap?: FlatImportMap
     readonly mode: 'all' | 'types' | 'none'
 }
 
@@ -2673,7 +2643,6 @@ function sortAndPruneMetadata(manifest: ArtifactStoreManifest) {
             if (v.dependencies) {
                 const sortedDeps = sortRecord(v.dependencies)
                 for (const [k2, v2] of Object.entries(sortedDeps)) {
-                    // sortedDeps[k2] = v2.sort((a, b) => a.localeCompare(b))
                     sortedDeps[k2] = v2.sort()
                 }
                 Object.assign(v, { dependencies: sortedDeps })
@@ -2778,40 +2747,6 @@ export function pruneBuild(build: BuildFsIndex, toRemove: string[]): BuildFsInde
     return index
 }
 
-interface CompressedMetadata {
-    readonly hashes: string[]
-    readonly data: Record<string, Record<string, ArtifactMetadata>>
-}
-
-function compressMetadata(metadata: Record<string, Record<string, ArtifactMetadata>>) {
-    const hashes = new Map<string, number>()
-    function indexHash(hash: string) {
-        if (hashes.has(hash)) {
-            return hashes.get(hash)!
-        }
-
-        const id = hashes.size
-        hashes.set(hash, id)
-
-        return id
-    }
-
-    const data: Record<string, Record<string, ArtifactMetadata>> = {}
-    for (const [k, v] of Object.entries(metadata)) {
-        const inner: typeof v = data[indexHash(k)] = {}
-        for (const [k2, v2] of Object.entries(v)) {
-            const d = inner[indexHash(k2)] = deepClone(v2)
-            if (d.dependencies) {
-                for (const [k3, arr] of Object.entries(d.dependencies)) {
-                    d.dependencies[indexHash(k3)] = arr.map(indexHash) as any as string[]
-                }
-            }
-        }
-    }
-
-    return { hashes: [...hashes.keys()], data }
-}
-
 interface NormalizedData {
     readonly hash: string
     readonly metadata: ArtifactMetadata
@@ -2871,7 +2806,6 @@ function createNormalizer(repo: DataRepository, opt?: NormalizerOptions) {
 
         const dependencies = (metadata.dependencies || metadata.pointers) ? {} as Record<string, string[]> : undefined
         for (const [k, v] of Object.entries(sortRecord(deps))) {
-            // dependencies![k] = [...v].sort((a, b) => a.localeCompare(b))
             dependencies![k] = [...v].sort()
         }
 
@@ -4373,57 +4307,43 @@ export async function setTargets(fs: Pick<Fs, 'writeFile'>, targets: TargetsFile
     return await fs.writeFile('[#compile]__targets__.json', JSON.stringify(sortRecord(targets)))
 }
 
-function isSerializedTemplate(template: TfJson | SerializedTemplate): template is SerializedTemplate {
-    return typeof template['provider'] === 'string'
+export async function getBinaryTemplate(fs: Pick<BuildFsFragment, 'readFile'>) {
+    const binaryTemplate = await fs.readFile('template.bin').catch(throwIfNotFileNotFoundError)
+
+    return binaryTemplate
 }
 
-export async function getTemplate(fs: Pick<BuildFsFragment, 'readFile' | 'readData'>): Promise<TfJson | undefined> {
-    const rawTemplate = await tryReadJson<SerializedTemplate | TfJson>(fs, 'template.json')
-    if (!rawTemplate) {
-        return
+async function _getTemplate(fs: Pick<BuildFsFragment, 'readFile'>): Promise<TfJson | undefined> {
+    const binaryTemplate = await getBinaryTemplate(fs)
+    if (binaryTemplate) {
+        const tfjson = deserializeBinaryTemplate(Buffer.isBuffer(binaryTemplate) ? binaryTemplate : Buffer.from(binaryTemplate))
+
+        return tfjson
     }
 
-    if (isSerializedTemplate(rawTemplate)) {
-        return deserializeTemplate(fs, rawTemplate)
+    return tryReadJson<TfJson>(fs, 'template.json')
+}
+
+export async function getTemplate(fs: Pick<BuildFsFragment, 'readFile'>): Promise<TfJson | undefined> {
+    const rawTemplate = await _getTemplate(fs)
+    if (!rawTemplate) {
+        return
     }
 
     return rawTemplate
 }
 
-export interface TemplateWithHashes {
-    readonly template: TfJson
-    readonly hashes: SerializedTemplate
+const templates = new Map<Pick<BuildFsFragment, 'readFile'>, Promise<TfJson | undefined>>()
+export function getCurrentTemplate(fs: Pick<BuildFsFragment, 'readFile'> = getProgramFs()) {
+    if (templates.has(fs)) {
+        return templates.get(fs)!
+    }
+
+    const p = getTemplate(fs)
+    templates.set(fs, p)
+
+    return p
 }
-
-// Mostly useful for quickly finding changes in templates
-export async function getTemplateWithHashes(programHash?: string): Promise<TemplateWithHashes | undefined> {
-    if (!programHash) {
-        const hashes = await tryReadJson<SerializedTemplate>(getProgramFs(), 'template.json')
-        if (!hashes) {
-            return
-        }
-
-        return {
-            template: isSerializedTemplate(hashes) ? await deserializeTemplate(getProgramFs(), hashes) : hashes,
-            hashes,
-        }
-    }
-
-    const repo = getDataRepository()
-    const { index } = await repo.getBuildFs(programHash)
-    const bfs = createBuildFsFragment(repo, index)
-
-    const hashes = await tryReadJson<SerializedTemplate>(bfs, 'template.json')
-    if (!hashes) {
-        return
-    }
-
-    return {
-        template: isSerializedTemplate(hashes) ? await deserializeTemplate(bfs.root, hashes) : hashes,
-        hashes,
-    }
-}
-
 
 const manifestPath = '[#compile]__runtimeManifest__.json'
 const mappingsPath = '[#compile]__infraMapping__.json'
@@ -4488,87 +4408,39 @@ export async function getModuleMappings(fs: Pick<JsonFs, 'readJson'>) {
     return Object.fromEntries(Object.values(m).map(v => [v.id, { path: v.path, types: v.types, internal: v.internal }]))
 }
 
-export async function readInfraMappings(fs: Pick<Fs, 'readFile'>): Promise<Record<string, string>> {
-    const d = await tryReadJson<Record<string, string>>(fs, mappingsPath)
 
-    return d ?? {}
+const infraMappings = new Map<Pick<Fs, 'readFile'> | Pick<Fs, 'writeFile'>, Promise<Record<string, string>> | Record<string, string>>()
+
+export function readInfraMappings(fs: Pick<Fs, 'readFile'>): Promise<Record<string, string>> | Record<string, string> {
+    if (infraMappings.has(fs)) {
+        return infraMappings.get(fs)!
+    }
+
+    const p = tryReadJson<Record<string, string>>(fs, mappingsPath).then(x => x ?? {})
+    infraMappings.set(fs, p)
+
+    return p
 }
 
 export async function writeInfraMappings(fs: Pick<Fs, 'writeFile'>, mappings: Record<string, string>) {
+    infraMappings.set(fs, mappings)
     await fs.writeFile(mappingsPath, JSON.stringify(mappings))
 }
-
 
 export async function getPublished(fs: Pick<Fs, 'readFile'>) {
     return tryReadJson<Record<string, string>>(fs, 'published.json')
 }
 
-
-function expandResources(resources: Record<string, Record<string, any>>) {
-    const result: Record<string, Record<string, any>> = {}
-    for (const [k, v] of Object.entries(resources)) {
-        const [type, ...rest] = k.split('.')
-        const name = rest.join('.')
-        const group = result[type] ??= {}
-        group[name] = v
-    }
-    return result
-}
-
-function flattenResources(resources: Record<string, Record<string, any>>) {
-    const result: Record<string, any> = {}
-    for (const [k, v] of Object.entries(resources)) {
-        for (const [k2, v2] of Object.entries(v)) {
-            result[`${k}.${k2}`] = v2
-        }
-    }
-    return result
-}
-
-const compressTemplates = false
-
-export async function writeTemplate(template: TfJson, fs: Pick<BuildFsV2, 'writeFile' | 'writeData'> = getProgramFs()): Promise<void> {
-    if (!compressTemplates) {
-        await fs.writeFile('template.json', JSON.stringify(template))
+export async function writeTemplate(template: TfJson | Buffer, fs: Pick<BuildFsV2, 'writeFile'> = getProgramFs()): Promise<void> {
+    if (template instanceof Buffer) {
+        await fs.writeFile('template.bin', template)
     } else {
-        const { result, dependencies } = await serializeTemplate(fs, template)
-        await fs.writeFile('template.json', JSON.stringify(result), { metadata: { dependencies: dependencies } })
+        await fs.writeFile('template.json', JSON.stringify(template))
     }
-}
-
-async function serializeTemplate(fs: Pick<BuildFsV2, 'writeData'>, template: TfJson) {
-    // Serialization could be done automatically but breaking things up too much
-    // makes compression less efficient
-    const writer = createStructuredArtifactWriter('[#synth]', fs)
-    const builder = writer.createBuilder<TfJson, SerializedTemplate>()
-    builder.writeJson('provider', template.provider)
-    builder.writeJson('terraform', template.terraform)
-
-    if (template.resource) {
-        builder.writeTree('resource', flattenResources(template.resource))
-    }
-
-    if (template.locals) {
-        builder.writeTree('locals', template.locals)
-    }
-
-    if (template.data) {
-        builder.writeTree('data', flattenResources(template.data))
-    }
-
-    if (template.moved) {
-        builder.writeJson('moved', template.moved)
-    }
-
-    if (template['//']) {
-        builder.writeJson('//', template['//'])
-    }
-
-    return builder.build()
 }
 
 export async function readState(fs: Pick<BuildFsV2, 'readFile' | 'readData'> = getDeploymentFs()) {
-    const rawState = await tryReadJson<SerializedState>(fs, '__full-state__.json') ?? (await tryReadJson<SerializedState>(fs, 'full-state.json'))
+    const rawState = await tryReadJson<SerializedState>(fs, '__full-state__.json')
     if (!rawState) {
         return
     }
@@ -4621,29 +4493,6 @@ async function readTree(tree: Record<string, string>, reader: Pick<BuildFsFragme
     return mapTree(tree, x => readJson(x, reader))
 }
 
-async function deserializeTemplate(reader: Pick<BuildFsFragment, 'readData'>, template: SerializedTemplate): Promise<TfJson> {
-    const builder = createAsyncObjectBuilder<TfJson>()
-    builder.addResult('provider', readJson(template.provider, reader))
-    builder.addResult('terraform', readJson(template.terraform, reader))
-    if (template.resource) {
-        builder.addResult('resource', readTree(template.resource, reader).then(expandResources))
-    }
-    if (template.data) {
-        builder.addResult('data', readTree(template.data, reader).then(expandResources))
-    }
-    if (template.locals) {
-        builder.addResult('locals', readTree(template.locals, reader))
-    }
-    if (template.moved) {
-        builder.addResult('moved', template.moved)
-    }
-    if (template['//']) {
-        builder.addResult('//', readJson(template['//'], reader))
-    }
-
-    return builder.build()
-}
-
 export type HashedModuleBinding = Omit<ModuleBindingResult, 'id'> & {
     hash: string
 }
@@ -4656,13 +4505,14 @@ export interface Snapshot {
     moduleManifest?: Record<ModuleBindingResult['id'], HashedModuleBinding>
     store?: ReadonlyBuildFs
     types?: TypesFileData
+    modules?: Record<string, string> // maps `.js` files to source
 }
 
 export function resolveSnapshot(snapshot: Snapshot) {
     if (snapshot.pointers) {
-        for (const [k, v] of Object.entries(snapshot.pointers)) {
-            for (const [k2, v2] of Object.entries(v)) {
-                snapshot.pointers[k][k2] = toDataPointer(v2)
+        for (const v of Object.values(snapshot.pointers)) {
+            for (const k2 of Object.keys(v)) {
+                v[k2] = toDataPointer(v[k2])
             }
         }
     }
@@ -4935,6 +4785,9 @@ export async function loadSnapshot(location: string): Promise<Snapshot | undefin
 
     const moduleManifest = moduleMappings ? await mapModuleManifest(merged.index, programFs, moduleMappings) : undefined
 
+    const sourcesFile = await readSources(programFs)
+    const modules = sourcesFile ? Object.fromEntries(Object.entries(sourcesFile).map(([k, v]) => [v.outfile, k])) : undefined
+
     return {
         published,
         targets,
@@ -4943,6 +4796,7 @@ export async function loadSnapshot(location: string): Promise<Snapshot | undefin
         moduleManifest,
         pointers,
         types,
+        modules,
     }
 }
 
@@ -4981,16 +4835,51 @@ export async function createSnapshot(fsIndex: BuildFsIndex, programId: string, d
         }
     }
 
+    const sourcesFile = await readSources(programFs)
+    const modules = sourcesFile ? Object.fromEntries(Object.entries(sourcesFile).map(([k, v]) => [v.outfile, k])) : undefined
+
     const snapshot = {
         published,
         storeHash: committed.hash,
         targets: await getTargets(programFs),
         pointers,
         moduleManifest,
-        types: await getTypesFile(programFs)
+        types: await getTypesFile(programFs),
+        modules,
     } satisfies Snapshot
 
     return { snapshot, committed }
+}
+
+export type Sources = Record<string, {
+    hash: string
+    outfile: string
+    isTsArtifact?: boolean
+}>
+
+const sourcesFileName = `[#compile]__sources__.json`
+const sourcesCache = new Map<Pick<Fs, 'readFile'> | Pick<Fs, 'writeFile'>, Promise<Sources | undefined> | Sources>()
+
+export async function writeSources(fs: Pick<Fs, 'writeFile'>, sources: Sources) {
+    sourcesCache.set(fs, sources)
+    await fs.writeFile(sourcesFileName, JSON.stringify(sources))
+}
+
+async function _readSources(fs: Pick<Fs, 'readFile'> = getProgramFs()): Promise<Sources | undefined> {
+    const s = await tryReadJson<Record<string, string> | Sources>(fs, sourcesFileName.slice('[#compile]'.length))
+
+    return s as Sources | undefined
+}
+
+export function readSources(fs: Pick<Fs, 'readFile'> = getProgramFs()): Promise<Sources | undefined> | Sources {
+    if (sourcesCache.has(fs)) {
+        return sourcesCache.get(fs)!
+    }
+
+    const p = _readSources(fs)
+    sourcesCache.set(fs, p)
+
+    return p
 }
 
 export async function linkFs(vfs: BuildFsIndex & { id?: string }, dest: string, clean = false) {
@@ -5447,10 +5336,9 @@ export async function putState(state: TfState, procFs = getDeploymentFs()) {
     await writeState(procFs, state)
 }
 
-export async function saveMoved(moved: { from: string; to: string }[], template?: SerializedTemplate | TfJson) {
+export async function saveMoved(moved: { from: string; to: string }[]) {
     const fs = getProgramFs()
-    template ??= await fs.readJson('[#synth]template.json')
-    await fs.writeJson('[#synth]template.json', { ...template, moved })
+    await fs.writeJson('[#synth]moved.json', { moved })
 }
 
 export async function getPreviousDeploymentProgramHash() {
@@ -5485,15 +5373,23 @@ export async function getPreviousDeploymentProgramHash() {
 
 export async function getMoved(programHash?: string): Promise<{ from: string; to: string }[] | undefined> {
     const fs = !programHash ? getProgramFs() : await getFsFromHash(programHash)
-    const template: SerializedTemplate | TfJson | undefined = await tryReadJson(fs, '[#synth]template.json')
+    const moved: Pick<TfJson, 'moved'> | undefined = await tryReadJson(fs, '[#synth]moved.json')
 
-    return template?.moved
+    return moved?.moved
 }
 
 export async function getProgramHash(bt = getBuildTargetOrThrow(), repo = getDataRepository()) {
     const head = await repo.getHead(toProgramRef(bt))
 
     return head?.storeHash
+}
+
+export async function getTemplateFromProgramHash(programHash: string) {
+    const repo = getDataRepository()
+    const { index } = await repo.getBuildFs(programHash)
+    const bfs = createBuildFsFragment(repo, index)
+
+    return _getTemplate(bfs)
 }
 
 export async function maybeRestoreTemplate(head?: Head) {

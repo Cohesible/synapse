@@ -6,13 +6,30 @@ import { Export } from 'synapse:lib'
 import { createSynapseClass } from 'synapse:terraform'
 import { using, defer, getCurrentId, contextType, maybeGetContext, importArtifact } from 'synapse:core'
 
-// Starting at one to guard against erroneous falsy checks on the id
-let idCounter = 1
+const ids = new Map<string, number>()
+function nextId() {
+    const moduleId = __getCallerModuleId()
+    if (!moduleId) {
+        throw new Error('Missing caller module id')
+    }
+
+    if (!ids.has(moduleId)) {
+        // Start at 1
+        ids.set(moduleId, 2)
+
+        return 1
+    }
+
+    const count = ids.get(moduleId)!
+    ids.set(moduleId, count + 1)
+
+    return count
+}
 
 export function test(name: string, fn: () => Promise<void> | void): void {
     const suite = maybeGetContext(TestSuite)
     if (suite) {
-        suite.addTest(new Test(idCounter++, name, fn, suite.hooks))
+        suite.addTest(new Test(nextId(), name, fn, suite.hooks))
     } else {
         addDeferredTestItem({ type: 'test', name, fn })
     }
@@ -22,7 +39,7 @@ export function suite(name: string, fn: () => void): void {
     const suite = maybeGetContext(TestSuite)
     if (suite) {
         const id = getCurrentId()
-        const child = new TestSuite(idCounter++, name)
+        const child = new TestSuite(nextId(), name)
         visitTestSuite(id, child, fn)
     } else {
         addDeferredTestItem({ type: 'suite', name, fn })
@@ -173,7 +190,7 @@ function visitTestSuite(id: string, suite: TestSuite, fn: () => void) {
     const handler = using(suite, () => {
         fn()
 
-        return new Export({ suite }, { 
+        return new Export({ suite }, {
             id: id + '--test-suite',
             testSuiteId: suite.id,
         })
@@ -219,29 +236,30 @@ function addDeferredTestItem(item: DeferredTestItem) {
     deferredTestsItems.set(caller, arr)
 
     defer(() => {
-        const suite = new TestSuite(idCounter++, caller)
+        const suite = new TestSuite(nextId(), caller)
 
         using(suite, () => {
-            for (const item of arr) {
-                if (item.type === 'test') {
-                    suite.addTest(new Test(idCounter++, item.name, item.fn, suite.hooks))
-                } else {
-                    const id = getCurrentId()
-                    const child = new TestSuite(idCounter++, item.name)
-                    visitTestSuite(id, child, item.fn)
-                }
-            }
-
-            const handler = new Export({ suite }, { 
+            // Instantiate the suite _before_ visiting the items to minimize churn from shifting
+            const handler = new Export({ suite }, {
                 id: caller + '--test-suite',
                 testSuiteId: suite.id,
             })
-    
+
             new TestSuiteResource({ 
                 id: suite.id, 
                 name: suite.name, 
                 handler: handler.destination,
             })
+
+            for (const item of arr) {
+                if (item.type === 'test') {
+                    suite.addTest(new Test(nextId(), item.name, item.fn, suite.hooks))
+                } else {
+                    const id = getCurrentId()
+                    const child = new TestSuite(nextId(), item.name)
+                    visitTestSuite(id, child, item.fn)
+                }
+            }
         })
     })
 }

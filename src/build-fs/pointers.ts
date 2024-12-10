@@ -31,46 +31,46 @@ function hasPointerPrefix(s: string) {
     return true
 }
 
+// Using a class seems to have good instantiation performance here
+class Pointer extends String {
+    readonly [pointerSymbol] = true
+    private _storeHash: string | undefined
+    readonly ref: string
+
+    constructor(
+        private readonly hash: string, 
+        private readonly source: { id: string; close: () => string } | string
+    ) {
+        const ref = `${pointerPrefix}${hash}`
+        super(ref)
+        this.ref = ref
+
+        if (typeof source === 'string') {
+            this._storeHash = source
+        }
+    }
+
+    getStoreHash() {
+        return this._storeHash ??= (this.source as Exclude<typeof this.source, string>).close()
+    }
+
+    resolve() {
+        const storeHash = this.getStoreHash()
+
+        return { hash: this.hash, storeHash }
+    }
+
+    isResolved() {
+        return this._storeHash !== undefined
+    }
+
+    isContainedBy(storeId: string) {
+        return !!this._storeHash ? false : storeId === (this.source as Exclude<typeof this.source, string>).id
+    }
+}
+
 export function createPointer(hash: string, source: { id: string; close: () => string } | string): DataPointer {
-    let _storeHash: string | undefined
-    if (typeof source === 'string') {
-        _storeHash = source
-    }
-
-    function getStoreHash() {
-        return _storeHash ??= (source as Exclude<typeof source, string>).close()
-    }
-
-    function resolve() {
-        const storeHash = getStoreHash()
-
-        return { hash, storeHash }
-    }
-
-    function isResolved() {
-        return _storeHash !== undefined
-    }
-
-    function isContainedBy(storeId: string) {
-        return !!_storeHash ? false : storeId === (source as Exclude<typeof source, string>).id
-    }
-
-    // function toString() {
-    //     console.trace('Unexpected implicit coercion to a string')
-    //     return ref
-    // }
-
-    const ref = `${pointerPrefix}${hash}`
-
-    return Object.assign(ref, {
-        ref,
-        hash,
-        // toString,
-        resolve,
-        isResolved,
-        isContainedBy,
-        [pointerSymbol]: true as const,
-    })
+    return new Pointer(hash, source) as any as DataPointer
 }
 
 export function toAbsolute(pointer: DataPointer) {
@@ -97,23 +97,67 @@ interface PointersObject {
 
 export type Pointers = ValueMap<string>
 
-function extractString(str: string): string | [string, string] {
-    if (!str.startsWith(pointerPrefix) || str === pointerPrefix) {
-        return str
+const sepOffset = pointerPrefix.length + 64
+const maxPointerLength = pointerPrefix.length + 129
+
+function extractString(str: string): [hash: string, storeHash: string] | undefined {
+    if (str.length !== sepOffset || str.length !== maxPointerLength || !str.startsWith(pointerPrefix)) {
+        return
     }
 
-    const prefixLen = pointerPrefix.length
-    const len = str.length - prefixLen
-    if (len === 64) {
-        return [str.slice(prefixLen), ''] // We're missing the metadata component
+    if (str.length === sepOffset) {
+        return [str.slice(pointerPrefix.length), ''] // We're missing the metadata component
     }
 
-    const sepIndex = 64 + prefixLen
-    if (str[sepIndex] !== ':' || len !== 129) {
+    if (str[sepOffset] !== ':') {
         throw new Error(`Malformed object pointer: ${str}`)
     }
 
-    return [str.slice(sepIndex + 1), str.slice(prefixLen, sepIndex)]
+    return [str.slice(sepOffset + 1), str.slice(pointerPrefix.length, sepOffset)]
+}
+
+type PointersVisitor = (o: any) => [obj: any, pointers: Pointers] | undefined
+
+function extractArray(arr: any[], visit: PointersVisitor): [obj: any[], pointers: PointersArray] | undefined {
+    const pointers: PointersArray = []
+    const value = arr.map((x, i) => {
+        const r = visit(x)
+        if (!r) {
+            return x
+        }
+
+        pointers[i] = r[1]
+
+        return r[0]
+    })
+
+    if (pointers.length === 0) {
+        return
+    }
+
+    return [value, pointers]
+}
+
+function extractObject(obj: Record<string, any>, visit: PointersVisitor): [obj: any, pointers: Pointers] | undefined {
+    let didExtract = false
+    const p: PointersObject = {}
+    const o: Record<string, any> = {}
+    for (const k of Object.keys(obj)) {
+        const r = visit(obj[k])
+        if (!r) {
+            o[k] = obj[k]
+        } else {
+            o[k] = r[0]
+            p[k] = r[1]
+            didExtract = true
+        }
+    }
+
+    if (!didExtract) {
+        return
+    }
+
+    return [o, p]
 }
 
 export function extractPointers(obj: any): [obj: any, pointers?: Pointers, summary?: Record<string, string[]>] {
@@ -123,62 +167,24 @@ export function extractPointers(obj: any): [obj: any, pointers?: Pointers, summa
         set.add(hash)
     }
 
-    function extractArray(arr: any[]): { value: any[], pointers?: PointersArray } {
-        const pointers: PointersArray = []
-        const value = arr.map((x, i) => {
-            const r = visit(x)
-            if (r[1]) {
-                pointers[i] = r[1]
-            }
-    
-            return r[0]
-        })
-    
-        return { value, pointers: pointers.length > 0 ? pointers : undefined }
-    }
-    
-    function extractObject(obj: any[]):  [obj: any, pointers?: Pointers] {
-        let didExtract = false
-        const p: PointersObject = {}
-        const o: Record<string, any> = {}
-        for (const [k, v] of Object.entries(obj)) {
-            const r = visit(v)
-            if (r[1]) {
-                p[k] = r[1]
-                didExtract = true
-            }
-            o[k] = r[0]
-        }
-    
-        if (!didExtract) {
-            return [o]
-        }
-    
-        return [o, p]
-    }
-    
-
-    function visit(obj: any): [obj: any, pointers?: Pointers] {
+    function visit(obj: any): [obj: any, pointers: Pointers] | undefined {
         if (typeof obj === 'string') {
             const r = extractString(obj)
-            if (r === obj) {
-                return [r]
+            if (r === undefined) {
+                return
             }
 
-            const s = (r as [string, string])[1]
-            if (s) {
-                addToSummary(r[0], s)
-            }
+            addToSummary(r[0], r[1])
 
             // if (keepPrefix) {
             //     return [`${pointerPrefix}${r[0]}`, r[1]]
             // }
 
-            return r as [string, string]
+            return r
         }
     
         if (typeof obj !== 'object' || obj === null) {
-            return [obj]
+            return
         }
     
         if (isDataPointer(obj)) {
@@ -192,18 +198,24 @@ export function extractPointers(obj: any): [obj: any, pointers?: Pointers, summa
             return [r.hash, r.storeHash]
         }
     
-        if (Array.isArray(obj)) {
-            const r = extractArray(obj)
-    
-            return [r.value, r.pointers]
+        if (Array.isArray(obj)) {    
+            return extractArray(obj, visit)
         }
     
-        return extractObject(obj)
+        return extractObject(obj, visit)
     }
 
     const r = visit(obj)
+    if (!r) {
+        return [obj, undefined, {}]
+    }
 
-    return [r[0], r[1], Object.fromEntries(Object.entries(summary).map(([k, v]) => [k, Array.from(v)]))]
+    // Mutate `summary` in-place
+    for (const k of Object.keys(summary)) {
+        (summary as any)[k] = Array.from(summary[k])
+    }
+
+    return [r[0], r[1], summary as any as Record<string, string[]>]
 }
 
 function addMetadataHash(p: string, m: string) {
@@ -260,8 +272,8 @@ export function applyPointers(obj: any, pointers: Pointers): any {
         throw new Error(`Malformed pointers structure: ${pointers}`) // FIXME
     }
 
-    for (const [k, v] of Object.entries(pointers)) {
-        obj[k] = applyPointers(obj[k], v)
+    for (const k of Object.keys(pointers)) {
+        obj[k] = applyPointers(obj[k], (pointers as PointersObject)[k])
     }
 
     return obj
@@ -276,12 +288,21 @@ export function toDataPointer(s: string) {
         throw new Error(`Not a data pointer: ${s}`)
     }
 
-    const [storeHash, hash] = s.slice(pointerPrefix.length).split(':')
-    if (!hash) {
+    if (s.length !== maxPointerLength || s[sepOffset] !== ':') {
         throw new Error(`Malformed pointer: ${s}`)
     }
 
-    return createPointer(hash, storeHash)
+    return createPointer(
+        s.slice(sepOffset + 1), 
+        s.slice(pointerPrefix.length, sepOffset)
+    )
+}
+
+export function toDataPointerChecked(s: string) {
+    return createPointer(
+        s.slice(sepOffset + 1), 
+        s.slice(pointerPrefix.length, sepOffset)
+    )
 }
 
 function isProbablyPointer(o: any) {
@@ -397,19 +418,3 @@ export function isNullMetadataPointer(pointer: DataPointer) {
 
     return isNullHash(storeHash)
 }
-
-// Caching the `startsWith` check does appear to be faster
-// But there's no easy/fast way to hold a weak ref to a string primitive
-//
-//
-// const f = new Map()
-// const isPointer = (s: string) => {
-//     const o = f.get(s)
-//     if (o !== undefined) {
-//         return o
-//     }
-
-//     const r = s.startsWith('pointer:')
-//     f.set(s, r)
-//     return r
-// }

@@ -1,29 +1,24 @@
 import * as path from 'node:path'
 import * as vm from 'node:vm'
-import * as util from 'node:util'
 import { createRequire, isBuiltin } from 'node:module'
 import * as terraform from './runtime/modules/terraform'
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { runTask, getLogger } from './logging'
+import { runTask, getLogger, LogLevel } from './logging'
 import { PackageResolver, PackageService } from './pm/packages'
 import { BuildTarget, LocalWorkspace, getV8CacheDirectory, getWorkingDir } from './workspaces'
-
-
-// BUG: ReferenceError: runtime is not defined
-// `scopes.ts` cannot handle multiple imports from the same module (?)
-import type { ArtifactFs, Scope } from './runtime/modules/core'
+import type { Scope } from './runtime/modules/core'
 import { ReplacementSymbol, TargetsFile } from './compiler/host'
-import { SyncFs } from './system'
 import { Module, ModuleCreateOptions, SourceMapParser, createGetCredentials, createModuleLinker, createScriptModule, createSyntheticCjsModule, getArtifactOriginalLocation, registerSourceMapParser } from './runtime/loader'
-import { Artifact, BuildFsFragment, createArtifactFs, toFs } from './artifacts'
-import { Mutable, dedupe, isNonNullable, isWindows, makeRelative, memoize, wrapWithProxy } from './utils'
+import { BuildFsFragment } from './artifacts'
+import { Mutable, dedupe, getHash, isNonNullable, isWindows, makeRelative, memoize, wrapWithProxy } from './utils'
 import { ModuleResolver } from './runtime/resolver'
 import { createAuth, getAuth } from './auth'
 import { CodeCache, createCodeCache } from './runtime/utils'
 import { getFs } from './execution'
 import { coerceToPointer, isDataPointer, pointerPrefix, toAbsolute } from './build-fs/pointers'
 import { createNpmLikeCommandRunner } from './pm/publish'
-import { createUnknown } from './static-solver'
+import { createUnknown, isUnknown } from './static-solver'
+import { diffLines } from './utils/diffs'
 
 function getReplacementsForTarget(data: TargetsFile[string], target: string): Record<string, ReplacementSymbol> {
     const replacements: Record<string, ReplacementSymbol> = {}
@@ -40,8 +35,6 @@ function getReplacementsForTarget(data: TargetsFile[string], target: string): Re
 
 export interface LoaderOptions {
     deployTarget?: string
-    backend?: {
-    }
     outDir?: string
     workingDirectory?: string
 
@@ -63,17 +56,54 @@ interface SynthLogger {
 function createSynthLogger(p: typeof process, c: typeof console): SynthLogger {
     const logEvent = getLogger().emitSynthLogEvent
     const logMethods = {
-        log: (...args: any[]) => logEvent({ level: 'info', args }),
-        warn: (...args: any[]) => logEvent({ level: 'warn', args }),
-        error: (...args: any[]) => logEvent({ level: 'error', args }),
-        debug: (...args: any[]) => logEvent({ level: 'debug', args }),
-        trace: (...args: any[]) => logEvent({ level: 'trace', args }),
+        log: (...args: any[]) => logEvent({ level: LogLevel.Info, args }),
+        warn: (...args: any[]) => logEvent({ level: LogLevel.Warn, args }),
+        error: (...args: any[]) => logEvent({ level: LogLevel.Error, args }),
+        debug: (...args: any[]) => logEvent({ level: LogLevel.Debug, args }),
+        trace: (...args: any[]) => logEvent({ level: LogLevel.Trace, args }),
     }
     
     const consoleWrap = wrapWithProxy(c, logMethods)
     // TODO: wrap process
 
     return { console: consoleWrap, stdout: p.stdout, stderr: p.stderr }
+}
+
+function wrapProcess(proc: typeof process) {
+    // We'll track values globally for now because synthesis is still global
+    const capturedEnv = new Map<string, string | undefined>()
+
+    function capture(key: PropertyKey) {
+        const val = proc.env[key as any]
+        if (typeof key !== 'string' || (typeof val !== 'string' && typeof val !== 'undefined')) {
+            return val
+        }
+
+        // Only remember the first value in case it gets mutated
+        if (!capturedEnv.has(key)) {
+            capturedEnv.set(key, val)
+        }
+
+        return val
+    }
+
+    const env = new Proxy(proc.env, {
+        get: (_, key) => capture(key),
+        has: (_, key) => {
+            if (typeof key !== 'string') {
+                return key in proc.env
+            }
+
+            capture(key)
+
+            return key in proc.env
+        }
+    })
+
+    return {
+        process: wrapWithProxy(proc, { env }),
+        getCapturedEnvVars: () => capturedEnv.size === 0 ? undefined : Object.fromEntries(capturedEnv),
+    } 
 }
 
 export function createrLoader(
@@ -85,7 +115,6 @@ export function createrLoader(
     packageResolver: PackageResolver,
     moduleResolver: ModuleResolver,
     buildTarget: BuildTarget,
-    deploymentId: string,
     sourcemapParser: SourceMapParser,
     options: LoaderOptions = {}
 ) {
@@ -95,6 +124,10 @@ export function createrLoader(
         outDir = workingDirectory,
     } = options
     
+    if (!deployTarget) {
+        throw new Error(`Missing deploy target`)
+    }
+
     const codeCache = createCodeCache(getFs(), getV8CacheDirectory())
     const proxyCache = new Map<any, any>()
     const reverseInfraFiles = Object.fromEntries(Object.entries(infraFiles).map(x => x.reverse())) as Record<string, string>
@@ -111,13 +144,14 @@ export function createrLoader(
         sources: { name: string, source: string }[],
         getSource: (fileName: string, id: string, virtualLocation: string) => string,
         solvePerms: (target: any, globals?: Record<string, any>, args?: any[], thisArg?: any) => any,
+        sourceMapping: Record<string, { module: string }>
     ) {
-        const capturedSymbolData = new Map<any, Context>()
-        const onExitScope = options.exportSymbolData
-            ? (context: Context, val: any) => { capturedSymbolData.set(val, context) }
-            : undefined
+        const runtimeToSourceFile = new Map(sources.map(s => [s.name, s.source]))
+        const sourceToRuntimeFile = new Map(sources.map(s => [s.source, s.name]))
 
-        const context = createContextStorage({ onExitScope }, workingDirectory)
+        const context = createContextStorage(workingDirectory, runtimeToSourceFile, moduleResolver, sourceMapping)
+
+        const wrappedProc = wrapProcess(process)
 
         function createTerraformState(): terraform.State {
             return {
@@ -132,64 +166,23 @@ export function createrLoader(
             }
         }
 
-        function createExportedSymbols(getSymbolId: (symbol: NonNullable<Scope['symbol']>) => number) {
-            function getExecutionScopeId(scopes: Scope[]) {
-                const symbols = scopes.slice(0, -1)
-                    .map(x => x.symbol)
-                    .filter(isNonNullable)
-
-                return symbols.map(getSymbolId).join(':')
+        function getScopedId(type: string, kind: terraform.TerraformElement['kind'], suffix?: string, peek?: boolean) {
+            if (peek) {
+                return context.peekName(type, kind, suffix)
             }
 
-            const files: Record<string, { [executionScopeId: string]: { symbols: { [symbolId: number]: any }, context: Context } }> = {}
-            for (const [k, v] of capturedSymbolData.entries()) {
-                const scopes = v.scope2
-                const assignmentSymbol = scopes[scopes.length - 1]?.assignmentSymbol
-                if (!assignmentSymbol) continue
-
-                const id = getSymbolId(assignmentSymbol)
-                const executionScope = getExecutionScopeId(scopes)
-
-                const exports = files[assignmentSymbol.fileName] ??= {}
-                const values = exports[executionScope] ??= { symbols: {}, context: v }
-                if (id in values.symbols) {
-                    // throw new Error(`Found non-empty slot when assigning value to an execution scope`)
-                    getLogger().log(`Found non-empty slot when assigning value to an execution scope: ${assignmentSymbol.name}`)
-                    continue
-                }
-
-                values.symbols[id] = k
-            }
-
-            const Export = getExportClass()
-    
-            for (const [fileName, scopes] of Object.entries(files)) {
-                for (const [k, v] of Object.entries(scopes)) {
-                    function createExport() {
-                        new Export({ symbols: v.symbols }, {
-                            id: `__exported-symbol-data`,
-                            source: fileName,
-                            executionScope: k,
-                        } as any)
-                    }
-
-                    context.restore(v.context, createExport)
-                }
-            }
+            return context.generateName(type, kind, suffix)
         }
 
         const terraformState = createTerraformState()
         const tfGlobals =[
             () => terraformState,
-            (peek?: boolean) => peek ? context.getId(-1) : context.getId(),
+            getScopedId,
             () => context.getModuleId(),
             () => context.getNamedContexts(),
             () => context.getScopes(),
-            options.exportSymbolData ? createExportedSymbols : undefined,
+            unwrapProxy,
         ] as const
-
-        const runtimeToSourceFile = new Map(sources.map(s => [s.name, s.source]))
-        const sourceToRuntimeFile = new Map(sources.map(s => [s.source, s.name]))
 
         const cache: Record<string, any> = {}
         const ctx = createVmContext()
@@ -270,14 +263,19 @@ export function createrLoader(
                 // if (hint === 'cjs') {
     
                 // }
-                const mod = new vm.SyntheticModule(Object.keys(symbols), () => {}, { context: opt?.context?.vm ?? ctx.vm, identifier: m.name })
+                const mod = new vm.SyntheticModule(
+                    Object.keys(symbols), 
+                    () => {}, 
+                    { context: opt?.context?.vm ?? ctx.vm, identifier: m.name }
+                )
+
                 await mod.link((() => {}) as any)
                 const proxy = wrapNamespace(m.id, mod.namespace)
                 const req = createRequire2(m.id, false)
                 for (const [k, v] of Object.entries(symbols)) {
                     defineProperty(proxy, k, {
                         enumerable: true,
-                        configurable: false,
+                        configurable: true,
                         get: () => req(v.moduleSpecifier)[v.symbolName]
                     })
                 }
@@ -314,12 +312,13 @@ export function createrLoader(
                 if (moduleName) {
                     const evaluate = module.evaluate.bind(module)
                     module.evaluate = (opt) => {
-                        return context.run({ moduleId: moduleName }, () => evaluate(opt))
-                            .then(() => {
-                                if (options.generateExports && !!deployables[location]) {
-                                    createExportResource(location, moduleName, module.namespace, 'esm')
-                                }
-                            })
+                        return context.run({ moduleId: moduleName }, async () => {
+                            await evaluate(opt)
+
+                            if (options.generateExports && !!deployables[location]) {
+                                createExportResource(location, moduleName, module.namespace, 'esm')
+                            }
+                        })
                     }
                 }
 
@@ -331,8 +330,7 @@ export function createrLoader(
 
         const hostPermissions: any[] = []
         function solveHostPerms(target: any, args?: any[], thisArg?: any) {
-            const s = solvePerms(target, undefined, args, thisArg)
-            hostPermissions.push(...s)
+            solvePerms(target, undefined, args, thisArg)
         }
 
         function getHostPerms() {
@@ -514,6 +512,7 @@ export function createrLoader(
                 RegExp: _globalThis.RegExp,
                 global: _globalThis,
                 globalThis: _globalThis, // Probably shouldn't do this
+                performance: _globalThis.performance,
                 get __getCredentials() {
                     return getCredentialsFn()
                 },
@@ -522,6 +521,7 @@ export function createrLoader(
                 __getBuildDirectory: () => outDir,
                 __symEval: symEval,
                 __createUnknown: createUnknown,
+                __isUnknown: isUnknown,
                 __getLogger: getLogger,
                 __getArtifactFs: () => artifactFs,
                 __defer: (fn: () => void) => {
@@ -534,7 +534,7 @@ export function createrLoader(
                 get __runCommand() {
                     return getCommandRunner()
                 },
-                __getCurrentId: () => context.getScope(),
+                __getCurrentId: context.getScope,
                 __getPointer: getPointer,
                 __getCallerModuleId: context.getModuleId,
                 __requireSecret: (envVar: string, type: string) => constructsModule.registerSecret(envVar, type),
@@ -550,6 +550,14 @@ export function createrLoader(
             return {
                 globals: _globalThis,
                 vm: ctx,
+            }
+        }
+
+        function registerLazyProvidersCjs() {
+            const providerTarget = targets['synapse:srl']['Provider']
+            for (const [k, v] of Object.entries(providerTarget)) {
+                if (k === deployTarget) continue
+                context.providerContext.registerLazyProvider(k, () => defaultRequire(v.moduleSpecifier)[v.symbolName])
             }
         }
 
@@ -612,47 +620,46 @@ export function createrLoader(
                     getLogger().log(`Loaded symbol bindings for: ${physicalLocation} [${location}]`, Object.keys(replacementsData))
                 }
 
+                function createStubProps() {
+                    if (!replacementsData) {
+                        return
+                    }
+    
+                    const targets = getReplacementsForTarget(replacementsData, deployTarget!)
+
+                    return Object.fromEntries(Object.entries(targets).map(([k, v]) => {
+                        function getVal(this: any) {
+                            const val = require2(v.moduleSpecifier)[v.symbolName]
+                            Object.defineProperty(this, k, { value: val, enumerable: true, configurable: true })
+
+                            return val
+                        }
+
+                        return [k, { get: getVal, enumerable: true, configurable: true }] as const
+                    }))
+                }
+
+                const stubProps = createStubProps()
+
                 function createModuleStub(val: any) {
-                    if (!replacementsData || !deployTarget) {
+                    if (!stubProps) {
                         return val
                     }
     
-                    const targets = getReplacementsForTarget(replacementsData, deployTarget)
-                    const desc = {
-                        ...Object.getOwnPropertyDescriptors(val),
-                        ...Object.fromEntries(
-                            Object.entries(targets).map(([k, v]) => {
-                                function getVal() {
-                                    const val = require2(v.moduleSpecifier)[v.symbolName]
-                                    if (terraform.isProviderClass(val)) {
-                                        context.providerContext.registerProvider(val)
-                                    }
-
-                                    Object.defineProperty(stub, k, { value: val, enumerable: true, configurable: true })
-
-                                    return val
-                                }
-
-                                return [k, { get: getVal, enumerable: true, configurable: true }] as const
-                            })
-                        )
-                    }
-
-                    const stub = Object.create(null, desc)
-
-                    return stub
+                    return Object.defineProperties(val, stubProps)
                 }
 
                 const require2 = createRequire2(location)
                 let wrapped = addSymbol(createModuleStub({}), location, isInfraSource)
                 const module_ = {
-                        get exports() {
-                            return wrapped
-                        },
-                        set exports(newVal) {
-                            wrapped = addSymbol(createModuleStub(newVal), location, isInfraSource)
-                        }
+                    __virtualId: location,
+                    get exports() {
+                        return wrapped
+                    },
+                    set exports(newVal) {
+                        wrapped = addSymbol(createModuleStub(newVal), location, isInfraSource)
                     }
+                }
 
                 cache[location] = module_
 
@@ -674,7 +681,7 @@ export function createrLoader(
         function runText(
             text: string, 
             location: string, 
-            module: { exports: {} }, 
+            module: { __virtualId: string; exports: {} }, 
             require2 = createRequire2(location),
             cacheKey?: string
         ) {
@@ -685,7 +692,19 @@ export function createrLoader(
             }
 
             try {
-                const cjs = createScriptModule(ctx.vm, text, source ?? location, require2, codeCache, cacheKey, sourcemapParser, process, undefined, undefined, module)
+                const cjs = createScriptModule(
+                    ctx.vm, 
+                    text, 
+                    source ?? location, 
+                    require2,
+                    codeCache, 
+                    cacheKey, 
+                    sourcemapParser, 
+                    wrappedProc.process, 
+                    undefined, 
+                    undefined, 
+                    module,
+                )
 
                 runTask(
                     'require', 
@@ -693,6 +712,8 @@ export function createrLoader(
                     () => {
                         if (moduleName) {
                             return context.run({ moduleId: moduleName }, cjs.evaluate)
+                        } else if (sourceMapping[location]) {
+                            return context.run({ virtualId: module.__virtualId }, cjs.evaluate)
                         }
 
                         return cjs.evaluate()
@@ -725,7 +746,7 @@ export function createrLoader(
                 ? { __esModule: true, ...exports }
                 : exports
 
-            context.run({ moduleId: moduleName }, () => new Export(exportObj, opt))
+            return context.run({ moduleId: moduleName }, () => new Export(exportObj, opt))
         }
 
         function getCore() {
@@ -738,7 +759,6 @@ export function createrLoader(
 
         return { 
             createRequire2, 
-            runText, 
             executeDeferred, 
             constructsModule, 
             getHostPerms, 
@@ -747,6 +767,9 @@ export function createrLoader(
             getContext: () => context, 
             createLinker, 
             globals: ctx.globals,
+            getCapturedEnvVars: wrappedProc.getCapturedEnvVars,
+            tfModule,
+            registerLazyProvidersCjs,
         }
     }
 
@@ -815,9 +838,10 @@ export function createrLoader(
         runtime: ReturnType<typeof createRuntime>
     ) {
         runtime.getContext().providerContext.enter()
+        runtime.registerLazyProvidersCjs()
 
         const coreProvider = new (runtime.getCore()).Provider(providerParams as any)
-        const targetProvider = new (runtime.getSrl()).Provider('#default')
+        const targetProvider = new (runtime.getSrl()).Provider()
         const req = runtime.createRequire2(bootstrapPath)
 
         runTask('run', 'bootstrap', () => {
@@ -833,7 +857,11 @@ export function createrLoader(
         try {
             const terraform = runTask('emit', 'synth', () => runtime.constructsModule.emitTerraformJson(), 1)
 
-            return { terraform, permissions: runtime.getHostPerms() }
+            return { 
+                terraform, 
+                permissions: runtime.getHostPerms(),
+                envVars: runtime.getCapturedEnvVars(),
+            }
         } catch (e) {
             handleError(e)
         }
@@ -847,7 +875,7 @@ export function createrLoader(
         runtime.getContext().providerContext.enter()
 
         const coreProvider = new (runtime.getCore()).Provider(providerParams as any)
-        const targetProvider = new (runtime.getSrl()).Provider('#default')
+        const targetProvider = new (runtime.getSrl()).Provider()
         const linker = runtime.createLinker()
 
         await runTask('run', 'bootstrap', async () => {
@@ -864,7 +892,11 @@ export function createrLoader(
         try {
             const terraform = runTask('emit', 'synth', () => runtime.constructsModule.emitTerraformJson(), 50)
 
-            return { terraform, permissions: runtime.getHostPerms() }
+            return { 
+                terraform, 
+                permissions: runtime.getHostPerms(),
+                envVars: runtime.getCapturedEnvVars(),
+            }
         } catch (e) {
             handleError(e)
         }
@@ -973,19 +1005,24 @@ function isObjectOrNullPrototype(proto: any) {
     return proto === Object.prototype || proto === null || proto.constructor?.name === 'Object'
 }
 
-function shouldTrap(value: any): boolean {
+function shouldProxy(value: any): boolean {
     if (typeof value === 'function') {
         // PERF: this hurts perf by ~10%
         // But it's needed to make sure resources aren't instantiated outside of their context
-        if (moveable in value) { 
+        if (Object.hasOwn(value, moveable)) { 
             return false
         }
 
         return true
     }
-    if (Reflect.getOwnPropertyDescriptor(value, moveable2)) {
+
+    // TODO: doing this check first and removing the recursion in `unwrapProxy` is a bit
+    // faster for `--target aws` in many cases. But we break capturing `react` without it
+    // because `react` assigns directly to `module.exports` for CJS modules.
+    if (proxies.has(value)) {
         return false
     }
+
     // value instanceof stream.Readable
     if (value instanceof Buffer || value.constructor === Uint8Array || value.constructor === ArrayBuffer) {
         return false
@@ -1002,7 +1039,7 @@ function shouldTrap(value: any): boolean {
 
     const descriptors = Object.getOwnPropertyDescriptors(value)
     for (const desc of Object.values(descriptors)) {
-        if (desc.get || desc.set || _shouldTrap(desc.value)) {
+        if (desc.get || desc.set || _shouldProxy(desc.value)) {
             return true
         }
     }
@@ -1119,15 +1156,23 @@ function createGlobalProxy(value: any) {
 }
 
 export function isProxy(o: any, checkPrototype = false) {
+    if (proxies.has(o)) {
+        return true
+    }
+
+    if (!checkPrototype) {
+        return false
+    }
+
     // TODO: see how much this `try/catch` block hurts perf
     // Simple tests don't show a noticeable change
     // 
-    // We only need it because some modules bind JS builtins which we end up trapping.
+    // We only need it because some modules bind JS builtins which we end up proxying.
     // Many of those builtin functions accept primitives as receivers.
     // Not a fan of this "intrinsic" pattern. It only makes things more confusing...
 
     try {
-        return !!o && ((checkPrototype && unproxy in o) || !!Reflect.getOwnPropertyDescriptor(o, moveable2))
+        return o && unproxy in o
     } catch(e) {
         if (typeof o !== 'object' && typeof o !== 'function') {
             return false
@@ -1146,17 +1191,16 @@ export function unwrapProxy(o: any, checkPrototype = false): any {
 }
 
 const c = new WeakMap<any, boolean>()
-function _shouldTrap(target: any) {
+function _shouldProxy(target: any) {
     if (target === null || (typeof target !== 'function' && typeof target !== 'object')) {
         return false
     }
 
-    const f = c.get(target)
-    if (f !== undefined) {
-        return f
+    if (c.has(target)) {
+        return c.get(target)
     }
 
-    const v = shouldTrap(target)
+    const v = shouldProxy(target)
     c.set(target, v)
 
     return v
@@ -1169,6 +1213,7 @@ const moveable2 = Symbol.for('__moveable__2')
 const unproxyParent = Symbol.for('unproxyParent')
 const boundContext = Symbol.for('synapse.boundContext')
 const reflectionType = Symbol.for('reflectionType')
+const moduleIdOverride = Symbol.for('moduleIdOverride')
 
 // This is an issue with React when capturing JSX elements:
 // TypeError: 'ownKeys' on proxy: trap returned extra keys but proxy target is non-extensible
@@ -1188,6 +1233,8 @@ function defineProperty(proxy: any, key: PropertyKey, descriptor: PropertyDescri
     return true
 }
 
+// FIXME: this is an obvious memory leak
+const proxies = new Map<any, any>()
 function createSerializationProxy(
     value: any, 
     operations: any[],
@@ -1268,7 +1315,7 @@ function createSerializationProxy(
 
     function getMoveableDescFn() {
         // This is currently used for the generated Terraform classes
-        const moduleOverride = parent?.[Symbol.for('moduleIdOverride')] ?? value?.[Symbol.for('moduleIdOverride')]
+        const moduleOverride = parent?.[moduleIdOverride] ?? value?.[moduleIdOverride]
         // TODO: is this still needed (yes it is)
         // Runtime failures happen without it, e.g. `throw __scope__("Error", () => new Error("No target set!"));` 
         if (isInfra && !moduleOverride) {
@@ -1284,11 +1331,6 @@ function createSerializationProxy(
         return fn
     }
 
-    const moveableDesc = { 
-        configurable: true, 
-        get: getMoveableDescFn,
-    }
-
     const p: any = new Proxy(value, {
         ...extraHandlers,
         get: (target, prop, recv) => {
@@ -1301,7 +1343,7 @@ function createSerializationProxy(
             } else if (prop === unproxyParent) {
                 return parent
             } else if (prop === reflectionType) {
-                const moduleOverride = parent?.[Symbol.for('moduleIdOverride')] ?? value?.[Symbol.for('moduleIdOverride')]
+                const moduleOverride = parent?.[moduleIdOverride] ?? value?.[moduleIdOverride]
                 if (isInfra && !moduleOverride) {
                     cache.set(moveable2, expand)
                     cache.set(reflectionType, undefined)
@@ -1318,7 +1360,7 @@ function createSerializationProxy(
             } else if (descriptors?.has(prop)) {
                 const desc = descriptors.get(prop)!
                 const result = desc.get ? desc.get() : desc.value
-                if (!_shouldTrap(result)) {
+                if (!_shouldProxy(result)) {
                     return result
                 }
 
@@ -1358,7 +1400,8 @@ function createSerializationProxy(
 
             // Checking the descriptor is needed otherwise an error is thrown on non-proxyable descriptors
             const desc = Reflect.getOwnPropertyDescriptor(target, prop)
-            if (typeof prop === 'symbol' || (desc?.configurable === false && desc.writable === false) || !_shouldTrap(result)) {
+            if (typeof prop === 'symbol' || (desc?.configurable === false && desc.writable === false) || !_shouldProxy(result)) {
+                cache.set(prop, result)
                 return result
             }
 
@@ -1381,7 +1424,7 @@ function createSerializationProxy(
         },
         apply: (target, thisArg, args) => {
             const result = Reflect.apply(target, unwrapProxy(thisArg, true), args)
-            if (!_shouldTrap(result)) {
+            if (!_shouldProxy(result)) {
                 return result
             }
 
@@ -1419,10 +1462,6 @@ function createSerializationProxy(
                 }
             }
 
-            // if (!shouldTrap(result)) {
-            //     return result
-            // }
-
             return createSerializationProxy(
                 result,
                 [...operations, {
@@ -1449,19 +1488,14 @@ function createSerializationProxy(
 
             return Reflect.set(target, prop, newValue, recv)
         },
-        getOwnPropertyDescriptor: (target, prop) => {
-            if (prop === moveable2) {
-                return moveableDesc
-            }
-
-            return Reflect.getOwnPropertyDescriptor(target, prop)
-        },
-        // TODO: deleteProperty
+        // TODO: deleteProperty, defineProperty
     })
 
     if (descriptors) {
         allDescriptors.set(p, descriptors)
     }
+
+    proxies.set(p, value)
 
     return p
 }
@@ -1576,11 +1610,14 @@ function patchBind(FunctionCtor: typeof Function, ObjectCtor: typeof Object) {
 }
 
 interface Context {
-    readonly moduleId?: string
-    readonly scope: string[]
-    readonly symbols: terraform.Symbol[]
-    readonly scope2: Scope[]
     readonly namedContexts: Record<string, any[]>
+    readonly scopes?: Scope[]
+    readonly moduleId?: string
+    readonly virtualId?: string
+    readonly declarationScope?: terraform.Symbol[] // Used for singletons
+    
+    // Inline cache
+    cachedScopes?: terraform.ExecutionScope[]
 }
 
 const contextSym = Symbol.for('synapse.context')
@@ -1591,25 +1628,34 @@ function getContextType(o: any, visited = new Set<any>()): string | undefined {
         return
     }
 
-    // FIXME
-    if (visited.size > 10) {
-        return
-    }
-
     const unproxied = unwrapProxy(o)
     visited.add(unproxied)
 
-    return o[contextTypeSym] ?? getContextType(unproxied.constructor, visited)
+    return unproxied[contextTypeSym] ?? getContextType(unproxied.constructor, visited)
 }
 
-interface ContextHooks {
-    onExitScope?: (context: Context, result: any) => void
-}
+// For singletons we want to key the resource using the package identifier + 
+// module id of the callsite. This only becomes problematic when multiple 
+// versions of a package exist in a module graph _and_ the instantiations 
+// are incompatible. But that's a problem for another day.
+//
+// We can include the package version in the key after having a robust 
+// solution for automatically migrating resources, particularly for resource 
+// instantiations within packages.
+//
+// All resource instantiations in the top-level scope of a module are effectively
+// singletons because module evaluation is cached and invariant to the caller.
+//
+// For modules in the "root" package, we handle this case by using `moduleId`.
+// But we still need to handle modules loaded in all other packages.
+
 
 type ContextStorage = ReturnType<typeof createContextStorage>
 function createContextStorage(
-    hooks: ContextHooks = {},
-    workingDir: string
+    workingDir: string,
+    runtimeToSourceFile: Map<string, string>,
+    resolver: ModuleResolver, // Needed for mapping absolute file paths to relative specifiers
+    sourceMapping: Record<string, { module: string }>
 ) {
     const storage = new AsyncLocalStorage<Context>()
     const providerContext = createProviderContextStorage()
@@ -1653,36 +1699,44 @@ function createContextStorage(
         return namedContexts
     }
 
-    function run<T extends any[], U>(scope: Scope, fn: (...args: T) => U, ...args: T): U {
-        const oldStore = storage.getStore()
-
-        const namedContexts = getNewNamedContexts(scope, oldStore?.namedContexts ?? {})
-
-        const symbols = oldStore?.symbols ?? []
-        const scope2 = [...(oldStore?.scope2 ?? []), scope]
-        const context: Context = {
-            scope2,
-            namedContexts,
-            moduleId: scope.moduleId ?? oldStore?.moduleId,
-            symbols: scope.symbol ? [...symbols, scope.symbol] : symbols,
-            scope: [...(oldStore?.scope ?? []), scope.name ?? ''],
+    function getNewScopes(scope: Scope & { virtualId?: string }, oldScopes?: Scope[]) {
+        if (!scope.symbol) {
+            return oldScopes
         }
 
-        const result = storage.run(context, fn, ...args)
-
-        if (hooks.onExitScope) {
-            const handler = hooks.onExitScope
-            if (util.types.isPromise(result)) {
-                result.then(v => handler(context, v))
-            } else {
-                handler(context, result)
-            }
-        }
-
-        return result
+        return oldScopes ? [...oldScopes, scope] : [scope]
     }
 
-    function getScope() {
+    function run<T extends any[], U>(scope: Scope & { virtualId?: string }, fn: (...args: T) => U, ...args: T): U {
+        const oldStore = storage.getStore()
+        const namedContexts = getNewNamedContexts(scope, oldStore?.namedContexts ?? {})
+
+        // Reset execution scopes when evaluating a module
+        if (scope.virtualId || scope.moduleId) {
+            const context: Context = {
+                namedContexts,
+                moduleId: scope.moduleId,
+                virtualId: scope.virtualId,
+            }
+    
+            return storage.run(context, fn, ...args)
+        }
+
+        const scopes = getNewScopes(scope, oldStore?.scopes)
+
+        const context: Context = {
+            scopes,
+            namedContexts,
+            moduleId: scope.moduleId ?? oldStore?.moduleId,
+            virtualId: scope.virtualId ?? oldStore?.virtualId,
+            declarationScope: scope.declarationScope ?? oldStore?.declarationScope,
+            cachedScopes: scopes === oldStore?.scopes ? oldStore?.cachedScopes : undefined,
+        }
+
+        return storage.run(context, fn, ...args)
+    }
+
+    function getScope(): string {
         const id = getId()
         if (!id) {
             throw new Error('Not within a scope')
@@ -1691,17 +1745,68 @@ function createContextStorage(
         return id
     }
 
+    function getKeyFromScopes(scopes: Scope[]) {
+        if (scopes.length === 0) {
+            throw new Error('No scopes provided')
+        }
+    
+        const parts: string[] = []
+        for (let i = 0; i < scopes.length; i++) {
+            const s = scopes[i]
+
+            if (s.assignmentSymbol) {
+                parts.push(s.assignmentSymbol.name)
+            }
+
+            if (s.namespace) {
+                for (let j = 0; j < s.namespace.length; j++) {
+                    parts.push(s.namespace[j].name)
+                }
+            }
+
+            parts.push(s.symbol!.name)
+        }
+    
+        return parts.join('--')
+    }
+
+    // `pos` is assumed to be a negative number
     function getId(pos?: number) {
-        const scope = storage.getStore()?.scope.filter(x => !!x)
-        const sliced = pos && scope ? scope.slice(0, pos) : scope
-        if (!sliced || sliced.length === 0) {
-            return ''
+        const store = storage.getStore()
+
+        if (store?.declarationScope && store.scopes) {
+            const index = store.scopes.findIndex(x => x.declarationScope === store.declarationScope)
+            const sliced = store.scopes.slice(index + 1, pos ?? store.scopes.length)
+            if (!sliced.length) {
+                return getSingletonId(store.scopes[index])
+            }
+            
+            return getSingletonId(store.scopes[index], getKeyFromScopes(sliced))
+        }
+    
+        const moduleId = getModuleId2()
+        const scopes = store?.scopes
+        const sliced = pos && scopes ? scopes.slice(0, pos) : scopes
+        if (!sliced?.length) {
+            return moduleId
         }
 
-        const id = sliced.join('--')
-        const moduleId = getModuleId()
+        const id = getKeyFromScopes(sliced)
 
-        return moduleId ? `${moduleId.replace(/\//g, '--').replace(/\.(.*)$/, '')}_${id}` : id
+        return `${moduleId ? `${moduleId}_` : ''}${id}`
+    }
+
+    function getSingletonId(scope: Scope, suffix?: string) {
+        if (!scope.symbol || !scope.declarationScope) {
+            return
+        }
+
+        const mapped = mapSymbol(scope.symbol)
+        const declPart = scope.declarationScope!.map(s => s.name)
+        const firstPart = mapped.packageRef ?? mapped.specifier
+        const lastPart = `${mapped.fileName}_${(suffix ? [...declPart, suffix] : declPart).join('--')}`
+
+        return `${firstPart ? `${firstPart}#` : ''}${lastPart}`
     }
 
     // TODO: this should ideally be apart of `scope`
@@ -1709,25 +1814,199 @@ function createContextStorage(
         return storage.getStore()?.moduleId
     }
 
-    function mapSymbol(sym: NonNullable<Scope['symbol']>): NonNullable<Scope['symbol']> {
-        return {
+    function getModuleId2() {
+        const store = storage.getStore()
+        if (!store?.virtualId) {
+            return store?.moduleId
+        }
+
+        const reversed = resolver.reverseLookup(store.virtualId)
+        if (!reversed?.fileName) {
+            return reversed?.specifier ?? store?.moduleId
+        }
+
+        const info = reversed.source
+        const packageRef = info?.type === 'package' && info.data.type !== 'file'
+            ? `${info.data.type}:${info.data.name}` 
+            : undefined
+
+        let fileName = reversed.fileName
+        if (reversed.location) {
+            fileName = sourceMapping[path.resolve(reversed.location, reversed.fileName)]?.module ?? fileName
+        }
+
+        if (process.platform === 'win32') {
+            fileName = fileName.replaceAll('\\', '/')
+        }
+
+        return `${packageRef ?? reversed.specifier}#${fileName}`
+    }
+
+    const symbolCache = new Map<string, NonNullable<terraform.Symbol>>()
+    function mapSymbol(sym: NonNullable<terraform.Symbol>): NonNullable<terraform.Symbol> {
+        const key = `${sym.fileName}:${sym.line}:${sym.column}`
+        if (symbolCache.has(key)) {
+            return symbolCache.get(key)!
+        }
+
+        const reversed = resolver.reverseLookup(sym.fileName)
+        if (!reversed?.fileName && !reversed?.source) {
+            const resolved = runtimeToSourceFile.get(sym.fileName) ?? sym.fileName
+            const mapped = {
+                ...sym,
+                fileName: path.relative(workingDir, resolved),
+            }
+            symbolCache.set(key, mapped)
+
+            if (process.platform === 'win32') {
+                mapped.fileName = mapped.fileName.replaceAll('\\', '/')
+            }
+    
+            return mapped
+        }
+
+        const info = reversed.source
+        const packageRef = info?.type === 'package' && info.data.type !== 'file'
+            // ? `${info.data.type}:${info.data.name}@${info.data.version || '0.0.0'}` 
+            ? `${info.data.type}:${info.data.name}` 
+            : undefined
+
+        if (reversed.fileName && reversed.location) {
+            const fileName = sourceMapping[path.resolve(reversed.location, reversed.fileName)]?.module ?? reversed.fileName
+            const mapped = {
+                ...sym,
+                fileName,
+                specifier: reversed?.specifier,
+                packageRef,
+            }
+
+            if (process.platform === 'win32') {
+                mapped.fileName = mapped.fileName.replaceAll('\\', '/')
+            }
+    
+            symbolCache.set(key, mapped)
+    
+            return mapped
+        }
+
+        const mapped = {
             ...sym,
-            fileName: path.relative(workingDir, sym.fileName),
+            fileName: !reversed?.fileName ? path.relative(workingDir, sym.fileName) : reversed.fileName,
+            specifier: reversed?.specifier,
+            packageRef,
+        }
+
+        symbolCache.set(key, mapped)
+
+        if (process.platform === 'win32') {
+            mapped.fileName = mapped.fileName.replaceAll('\\', '/')
+        }
+
+        return mapped
+    }
+
+    function mapScope(s: Scope) {
+        return {
+            isNewExpression: s.isNewExpression,
+            callSite: mapSymbol(s.symbol!),
+            assignment: s.assignmentSymbol ? mapSymbol(s.assignmentSymbol) : undefined,
+            namespace: s.namespace?.map(mapSymbol),
         }
     }
 
-    function getScopes() {
-        const scopes = storage.getStore()?.scope2
+    function getScopes(): terraform.ExecutionScope[] {
+        const store = storage.getStore()
+        const scopes = store?.scopes
         if (!scopes) {
             return []
         }
 
-        return scopes.map(s => ({ 
-            isNewExpression: s.isNewExpression,
-            callSite: s.symbol ? mapSymbol(s.symbol) : undefined, 
-            assignment: s.assignmentSymbol ? mapSymbol(s.assignmentSymbol) : undefined,
-            namespace: s.namespace?.map(mapSymbol),
-        }))
+        if (store.cachedScopes) {
+            return store.cachedScopes
+        }
+
+        if (store.declarationScope) {
+            const index = store.scopes.findIndex(x => x.declarationScope === store.declarationScope)
+            const startIndex = index + 1
+
+            return store.cachedScopes = [
+                {
+                    ...mapScope(store.scopes[index]),
+                    declaration: store.declarationScope.map(mapSymbol),
+                },
+                ...store.scopes.slice(startIndex).map(mapScope)
+            ]
+        }
+
+        return store.cachedScopes = scopes.map(mapScope)
+    }
+
+    function getDeclScopeKey() {
+        const lastScope = storage.getStore()?.scopes?.at(-1)
+        if (!lastScope?.declarationScope) {
+            return
+        }
+
+        return getSingletonId(lastScope)
+    }
+
+    const names = new Map<string, number>()
+    function addName(name: string) {
+        if (!names.has(name)) {
+            names.set(name, 1)
+        } else {
+            names.set(name, names.get(name)! + 1)
+        }
+    }
+
+    function getUniqueName(type: string, kind: terraform.TerraformElement['kind'], prefix?: string, suffix?: string, shouldAdd = false) {
+        const resolvedPrefix = prefix ?? `${kind === 'provider' ? '' : `${kind}-`}${type}`
+        const base = `${resolvedPrefix || 'default'}${suffix ? `--${suffix}` : ''}`
+        const key = `${kind}.${type}.${base}`
+        if (!names.has(key)) {
+            if (shouldAdd) {
+                addName(key)
+            }    
+
+            return base
+        }
+
+        const result = `${base}-${names.get(key)!}`
+        if (shouldAdd) {
+            addName(key)
+        }
+
+        return result 
+    }
+
+    function nameWithPrefix(name: string, kind: terraform.TerraformElement['kind']) {
+        const hashed = getHash(name)
+
+        switch (kind) {
+            case 'provider':
+                return `p_${hashed}`
+            case 'resource':
+                return `r_${hashed}`
+            case 'data-source':
+                return `d_${hashed}`
+            case 'local':
+                return hashed
+        }
+    }
+
+    function peekName(type: string, kind: terraform.TerraformElement['kind'], suffix?: string) {
+        const name = getUniqueName(type, kind, getId(-1), suffix)
+
+        return nameWithPrefix(name, kind)
+    }
+
+    function generateName(type: string, kind: terraform.TerraformElement['kind'], suffix?: string) {
+        const name = getUniqueName(type, kind, getId(), suffix, true)
+        if (kind === 'provider' && (name === 'default' || name === type)) {
+            return name
+        }
+    
+        return nameWithPrefix(name, kind)
     }
 
     function get(type: keyof Context['namedContexts']) {
@@ -1747,17 +2026,37 @@ function createContextStorage(
         return storage.run(ctx, fn)
     }
 
+    function bind<T extends any[], U>(fn: (...args: T) => U): (...args: T) => U {
+        const ctx = storage.getStore()
+
+        return (...args) => {
+            if (!ctx) {
+                return storage.run(storage.getStore() ?? { namedContexts: {} }, fn, ...args)
+            }
+
+            // XXX: merge named contexts in order to get providers
+            const current = storage.getStore()
+            const namedContexts = getNewNamedContexts(ctx.namedContexts, current?.namedContexts ?? {})
+
+            return storage.run({ ...ctx, namedContexts }, fn, ...args)
+        }
+    }
+
     return {
         save,
         restore,
-
+        bind,
         run,
         get,
         getId,
         getScope,
         getScopes,
+        getDeclScopeKey,
         getModuleId,
         getNamedContexts,
+
+        peekName,
+        generateName,
 
         providerContext,
     }
@@ -1794,7 +2093,13 @@ function isSubclass(a: new (...args: any[]) => any, b: new (...args: any[]) => a
 
 interface ProviderContext {
     defaultProviders: Map<string, any | undefined>
-    registeredProviders: Map<string, new () => any>
+    registeredProviders: Map<string, {
+        mode: 'eager'
+        ctor: new () => any
+    } | { 
+        mode: 'lazy'
+        fn: () => new () => any 
+    }>
     didCopy?: boolean
 }
 
@@ -1811,31 +2116,35 @@ function createProviderContextStorage() {
         ctx.didCopy = true
     }
 
-    function registerProvider(cls: new () => any) {
+    function registerProvider(ctor: new () => any) {
         const ctx = storage.getStore()
         if (!ctx) {
             return false
         }
 
-        const type = getContextType(cls)
+        const type = getContextType(ctor)
         if (!type) {
-            throw new Error(`Failed to register provider "${cls.name}": missing context type`)
+            throw new Error(`Failed to register provider "${ctor.name}": missing context type`)
         }
-        
-        // TODO: think more about this 
-        // if (ctx.registeredProviders.has(type)) {
-        //     const existingClass = ctx.registeredProviders.get(type)!
-        //     if (cls === existingClass) {
-        //         return true
-        //     }
 
-        //     if (!isSubclass(cls, existingClass)) {
-        //         throw new Error(`Failed to register provider "${cls.name}": a provider for type "${type}" already exists: ${existingClass.name}`)
-        //     }
-        // }
+        if (ctx.registeredProviders.has(type)) {
+            return false
+        }
 
         doCopy(ctx)
-        ctx.registeredProviders.set(type, cls)
+        ctx.registeredProviders.set(type, { mode: 'eager', ctor })
+
+        return true
+    }
+
+    function registerLazyProvider(type: string, fn: () => new () => any) {
+        const ctx = storage.getStore()
+        if (!ctx) {
+            return false
+        }
+
+        doCopy(ctx)
+        ctx.registeredProviders.set(type, { mode: 'lazy', fn })
 
         return true
     }
@@ -1852,13 +2161,20 @@ function createProviderContextStorage() {
 
         doCopy(ctx)
 
-        const c = ctx.registeredProviders.get(type)
-        if (!c) {
+        const provider = ctx.registeredProviders.get(type)
+        if (!provider) {
             ctx.defaultProviders.set(type, undefined)
             return
         }
 
-        const inst = new c()
+        if (provider.mode === 'lazy') {
+            const inst = new (provider.fn())()
+            ctx.defaultProviders.set(type, inst)
+    
+            return inst
+        }
+
+        const inst = new provider.ctor()
         ctx.defaultProviders.set(type, inst)
 
         return inst
@@ -1876,6 +2192,8 @@ function createProviderContextStorage() {
     return {
         enter,
         registerProvider,
+        registerLazyProvider,
         getDefaultProvider,
     }
 }
+

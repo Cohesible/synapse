@@ -320,9 +320,11 @@ export function createManifestRepo(client = createNpmRegistryClient(), manifestC
     }
 
     async function close() {
+        getPackageManifest.clear()
         cancelManifestRequests()
-        const tags = await getEtags()
-        await manifestCache.set(etagsKey, tags)
+        if (getEtags.cached) {
+            await manifestCache.set(etagsKey, await getEtags())
+        }
     }
 
     async function _getPackageManifest(name: string) {

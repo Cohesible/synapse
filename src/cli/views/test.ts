@@ -1,12 +1,12 @@
-import { getLogger } from '../../logging'
-import { DeployLogEvent, FailedTestEvent, TestEvent, TestLogEvent } from '../../logging'
-import { colorize, format, printLine } from '../ui'
 import * as nodeUtil from 'node:util'
+import { getLogger } from '../../logging'
+import { FailedTestEvent, TestEvent, TestLogEvent } from '../../logging'
+import { colorize, format, printLine } from '../ui'
 
 // We should output the filename for each suite/test
 export function createTestView() {
-    const startTimes = new Map<number, Date>()
-    function getDuration(id: number, endTime: Date) {
+    const startTimes = new Map<string, Date>()
+    function getDuration(id: string, endTime: Date) {
         const startTime = startTimes.get(id)
         if (!startTime) {
             return
@@ -17,9 +17,9 @@ export function createTestView() {
         return dur < 5 ? 0 : dur
     }
 
-    const cachedTests = new Map<number, number[]>()
+    const cachedTests = new Map<string, string[]>()
 
-    const indentLevel = new Map<number, number>()
+    const indentLevel = new Map<string, number>()
     function getIndent(ev: TestEvent) {
         if (ev.parentId === undefined) {
             indentLevel.set(ev.id, 0)
@@ -36,7 +36,7 @@ export function createTestView() {
 
     const l = getLogger().onTest(ev => {
         if (ev.status === 'cached') {
-            const parentId = ev.parentId ?? -1
+            const parentId = ev.parentId ?? 'root'
             const arr = cachedTests.get(parentId) ?? []
             arr.push(ev.id)
             cachedTests.set(parentId, arr)

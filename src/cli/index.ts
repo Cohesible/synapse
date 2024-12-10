@@ -3,8 +3,8 @@
 import * as synapse from '..'
 import * as path from 'node:path'
 import * as inspector from 'node:inspector'
-import { getLogger } from '../logging'
-import { LogLevel, logToFile, logToStderr, purgeOldLogs, validateLogLevel } from './logger'
+import { getLogger, LogLevel } from '../logging'
+import { logToFile, logToStderr, purgeOldLogs, validateLogLevel } from './logger'
 import { CancelError, dispose, getCurrentVersion, runWithContext, setContext, setCurrentVersion } from '../execution'
 import { RenderableError, colorize, getDisplay, printLine } from './ui'
 import { showUsage, executeCommand, runWithAnalytics, removeInternalCommands } from './commands'
@@ -19,10 +19,11 @@ async function _main(argv: string[]) {
     }
 
     const [cmd, ...params] = argv
+    synapse.pushPlatformDisposables()
 
     await runWithAnalytics(cmd, async () => {
         await executeCommand(cmd, params)
-    }).finally(() => synapse.shutdown())
+    })
 }
 
 function isProbablyRelativePath(arg: string) {
@@ -65,7 +66,7 @@ function isMaybeCodeFile(arg: string) {
 function getLogLevel(): LogLevel | 'off' | undefined {
     const envVar = process.env['SYNAPSE_LOG']
     if (!envVar) {
-        return
+        return isProdBuild ? 'off' : undefined
     }
 
     if (envVar === 'off') {
@@ -210,7 +211,8 @@ export function main(...args: string[]) {
         })
 
         await new Promise<void>((resolve, reject) => {
-            session.post('Profiler.setSamplingInterval', { interval: 100 }, err => err ? reject(err) : resolve())
+            const interval = Number(process.env.CPU_PROF_INTERVAL || 100)
+            session.post('Profiler.setSamplingInterval', { interval }, err => err ? reject(err) : resolve())
         })
 
         await new Promise<void>((resolve, reject) => {
@@ -242,10 +244,13 @@ export function main(...args: string[]) {
     }
 
     async function runWithLogger() {
-        purgeOldLogs().catch(e => console.error('Failed to purge logs', e))
-
         const isCi = !!getCiType()
         const logLevel = getLogLevel()
+
+        if (logLevel !== 'off') {
+            purgeOldLogs().catch(e => console.error('Failed to purge logs', e))
+        }
+
         const disposable = logLevel !== 'off' 
             ? isCi ? logToStderr(getLogger(), logLevel) : logToFile(getLogger(), logLevel) 
             : undefined
@@ -342,25 +347,9 @@ export function main(...args: string[]) {
     })
 }
 
-function seaMain() {
-    const v8 = require('node:v8') as typeof import('node:v8')
-    if (!v8.startupSnapshot.isBuildingSnapshot()) {
-        throw new Error(`BUILDING_SEA was set but we're not building a snapshot`)
-    }
-
-    v8.startupSnapshot.setDeserializeMainFunction(() => {
-        const args = process.argv.slice(2)
-
-        return main(...args)
-    })
-}
-
 if (isSea) {
     if (isProdBuild) {
         removeInternalCommands()
-    }
-    if (!process.env.SKIP_SEA_MAIN) {
-        seaMain()
     }
 } else {
     main(...process.argv.slice(2))

@@ -22,7 +22,7 @@ interface Postject {
 function loadFromRelPath() {
     const selfPath = getSelfPath()
     if (!selfPath) {
-        return
+        throw new Error('Missing self path')
     }
 
     return createRequire(selfPath)('./postject')
@@ -54,7 +54,7 @@ async function injectSeaBlob(executable: string, blob: Buffer) {
     })
 }
 
-async function removeSeaBlob(executable: string) {
+async function removeSeaBlob(executable: string, targetPlatform?: string) {
     const postject = getPostject()
     if (!postject.remove) {
         getLogger().log('Missing `remove` method from `postject`')
@@ -62,7 +62,7 @@ async function removeSeaBlob(executable: string) {
     }
 
     const didRemove = await postject.remove(executable, 'NODE_SEA_BLOB', {
-        machoSegmentName: 'NODE_SEA', // Darwin only
+        machoSegmentName: 'NODE_SEA',
         sentinelFuse: sentinelFuseParts.join('_'),
     })
 
@@ -71,8 +71,14 @@ async function removeSeaBlob(executable: string) {
         return
     }
 
-    if (process.platform === 'darwin') {
-        await runCommand('codesign', ['--sign', '-', executable])
+    if (targetPlatform === 'darwin') {
+        // Removing the payload removes the signature. We're going to execute the binary
+        // to generate the payload so we need to re-sign it.
+        await runCommand('codesign', ['--sign', '-', executable]).catch(e => {
+            if (!(e as any).stderr.includes('is already signed')) {
+                throw e
+            }
+        })
     }
 }
 
@@ -107,28 +113,45 @@ export async function resolveAssets(assets?: Record<string, string>): Promise<Re
     return resolved
 }
 
-export async function makeSea(main: string, nodePath: string, dest: string, assets?: Record<string, string>, sign = true) {
+interface SeaOptions {
+    assets?: Record<string, string>
+    sign?: boolean
+    hostPath?: string
+    targetPlatform?: string
+}
+
+export async function makeSea(main: string, nodePath: string, dest: string, opt?: SeaOptions) {
     const output = path.resolve(path.dirname(dest), 'sea-prep.blob')
     const config: SeaConfig = {
         main,
         output,
-        assets: await resolveAssets(assets),
+        assets: await resolveAssets(opt?.assets),
         useSnapshot: true,
         disableExperimentalSEAWarning: true,
     }
+
+    const sign = opt?.sign ?? true
+    const targetPlatform = opt?.targetPlatform ?? process.platform
 
     getLogger().log(`SEA assets`, config.assets)
 
     const configPath = path.resolve(path.dirname(dest), 'sea-config.json')
     await getFs().writeFile(configPath, JSON.stringify(config))
+    const tmpHost = opt?.hostPath ? path.resolve(path.dirname(dest), 'tmp') : undefined
 
     try {
         await getFs().writeFile(dest, await getFs().readFile(nodePath))
         await makeExecutable(dest)
-        await removeSeaBlob(dest)
+        await removeSeaBlob(dest, targetPlatform)
+
+        if (opt?.hostPath) {
+            await getFs().writeFile(tmpHost!, await getFs().readFile(opt.hostPath))
+            await makeExecutable(tmpHost!)
+            await removeSeaBlob(tmpHost!, process.platform)
+        }
 
         getLogger().log('Creating SEA blob using executable', nodePath)
-        await runCommand(dest, ['--experimental-sea-config', configPath], { 
+        await runCommand(tmpHost ?? dest, ['--experimental-sea-config', configPath], { 
             cwd: path.dirname(main),
             env: { ...process.env, BUILDING_SEA: '1' },
             shell: false,
@@ -138,13 +161,14 @@ export async function makeSea(main: string, nodePath: string, dest: string, asse
         getLogger().log('Injecting SEA blob')
         const blob = await getFs().readFile(output)
         await injectSeaBlob(dest, Buffer.from(blob))
-        if (process.platform === 'darwin' && sign) {
+        if (targetPlatform === 'darwin' && sign) {
             await runCommand('codesign', ['--sign', '-', dest])
         }
     } finally {
         await Promise.all([
             getFs().deleteFile(configPath).catch(throwIfNotFileNotFoundError), 
-            getFs().deleteFile(output).catch(throwIfNotFileNotFoundError)
+            getFs().deleteFile(output).catch(throwIfNotFileNotFoundError),
+            tmpHost ? getFs().deleteFile(tmpHost!).catch(throwIfNotFileNotFoundError) : undefined,
         ])
     }
 }
