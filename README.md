@@ -13,8 +13,8 @@ Synapse is a toolchain for building and deploying TypeScript applications, from 
 Features:
 * Multi-stage programming - run code at build time to create exactly what you need
 * Cloud agnostic libraries - write once, deploy anywhere, including locally
-* Automatic permissions solver - least privilege permissions via symbol execution
-* [Native modules](docs/native-modules.md) - write modules using Zig with automatic TypeScript bindings (experimental)
+* Automatic permissions solver - least privilege permissions via symbolic execution
+* [Native modules](docs/native-modules.md) - write modules using Zig (experimental)
 * Everything you need, built-in
     * TypeScript compiler and bundler
     * Incremental builds (distributed caching coming soon)

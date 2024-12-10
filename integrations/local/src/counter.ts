@@ -1,5 +1,7 @@
 import * as core from 'synapse:core'
 import * as storage from 'synapse:srl/storage'
+import * as compute from 'synapse:srl/compute'
+import { randomUUID } from 'node:crypto'
 
 export class Counter implements storage.Counter {
     private readonly bucket = new storage.Bucket()
@@ -30,5 +32,55 @@ export class Counter implements storage.Counter {
     }
 }
 
-
 core.addTarget(storage.Counter, Counter, 'local')
+
+export class SimpleLock {
+    private readonly bucket = new storage.Bucket()
+
+    async lock(id: string, timeout?: number) {
+        let sleepTime = 1
+
+        while (true) {
+            const l = await this.tryLock(id)
+            if (l) {
+                return l
+            }
+
+            await new Promise<void>(r => setTimeout(r, sleepTime))
+
+            if (sleepTime < 100) {
+                sleepTime = Math.round((1 + Math.random()) * sleepTime)
+            }
+        }
+    }
+
+    async tryLock(id: string) {
+        const currentState = await this.bucket.get(id, 'utf-8')
+        if (currentState && currentState !== '0') {
+            return
+        }
+
+        const lockId = randomUUID()
+        await this.bucket.put(id, lockId)
+        const c = await this.bucket.get(id, 'utf-8')
+
+        if (c === lockId) {
+            return {
+                id,
+                [Symbol.asyncDispose]: () => this.unlock(id),
+            }
+        }
+    }
+
+    async unlock(id: string) {
+        await this.bucket.put(id, '0')
+    }
+
+    async clear() {
+        for (const k of await this.bucket.list()) {
+            await this.bucket.delete(k)
+        }
+    }
+}
+
+core.addTarget(compute.SimpleLock, SimpleLock, 'local')

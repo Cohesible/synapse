@@ -1,15 +1,7 @@
 import * as compute from 'synapse:srl/compute'
 import { Bucket } from 'synapse:srl/storage'
 import { describe, it, test, expect, expectEqual } from 'synapse:test'
-
-// AWS Lambda will report "done" if the event loop is empty and the microtask queue isn't being emptied
-const shouldUnref = process.env.SYNAPSE_TARGET === 'local'
-function sleep(ms: number, unref = shouldUnref) {
-    return new Promise<void>(r => {
-        const timer = setTimeout(r, ms)
-        unref && timer.unref()
-    })
-}
+import { sleep, waitUntil } from './util'
 
 describe('Function', () => {
     describe('arguments', () => {
@@ -85,19 +77,13 @@ describe('Function', () => {
     
             const actual = await b.get(key, 'utf-8')
             expectEqual(actual, undefined)
-    
-            const start = Date.now()
-            while (Date.now() - start < timeout) {
-                const actual = await b.get(key, 'utf-8')
-                if (actual !== undefined) {
-                    expectEqual(actual, timestamp)
-                    return
-                }
-    
-                await sleep(250)
+
+            const final = await waitUntil(250, timeout, () => b.get(key, 'utf-8'))
+            if (final === undefined) {
+                throw new Error(`Timed-out waiting for key "${key}" in bucket`)
             }
-    
-            throw new Error(`Timed-out waiting for key "${key}" in bucket`)
+
+            expectEqual(final, timestamp)    
         })    
     })
 

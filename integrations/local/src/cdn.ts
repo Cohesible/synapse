@@ -14,7 +14,7 @@ export class CDN implements storage.CDN {
                 props.bucket.stat(key)
             ])
 
-            const contentType = metadata.contentType ?? 'application/octet-stream'
+            const contentType = metadata?.contentType ?? 'application/octet-stream'
 
             return new Response(data, {
                 headers: {

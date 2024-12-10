@@ -440,7 +440,8 @@ function sendResponse(response: http.ServerResponse, data?: any, headers?: Heade
         return new Promise<void>((resolve, reject) => {
             response.on('error', reject)
             response.on('end', resolve)
-            response.writeHead(status, { 
+            response.writeHead(status, {
+                'content-type': 'application/octet-stream',
                 ...Object.fromEntries(headers?.entries() ?? []),
             })
 

@@ -8,11 +8,20 @@ import { describe, it, expect, expectEqual } from 'synapse:test'
 describe('HttpService', () => {
     const service = new compute.HttpService()
     const helloRoute = service.route('GET', '/hello/{name}', req => {
-        return `Hello, ${req.pathParameters.name}!`
+        const params = new URL(req.url).searchParams
+        const exclaim = Number(params.get('exclaim'))
+        const exclaimAmount = isNaN(exclaim) || exclaim <= 0 ? 1 : exclaim
+
+        return `Hello, ${req.pathParameters.name}${'!'.repeat(exclaimAmount)}`
     })
 
     it('uses path parameters', async () => {
         expectEqual(await http.fetch(helloRoute, 'world'), 'Hello, world!')
+    })
+
+    it('uses query parameters', async () => {
+        const url = new URL('hello/world?exclaim=3', service.invokeUrl)
+        expectEqual(await http.fetch(url.toString()), 'Hello, world!!!')
     })
 
     const someData = Buffer.from('foo')

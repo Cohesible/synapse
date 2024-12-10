@@ -45,6 +45,7 @@ export class LocalKVStore extends core.defineResource({
 
     async get(key: string): Promise<Blob | undefined>
     async get(key: string, encoding: storage.Encoding): Promise<string | undefined>
+    async get(key: string, encoding?: storage.Encoding): Promise<string | Blob | undefined>
     async get(key: string, encoding?: storage.Encoding): Promise<string | Blob | undefined> {        
         const data = await fs.readFile(path.resolve(getStoreFilePath(this.id), key), encoding).catch(e => {
             throwIfNotFileNotFoundError(e)
@@ -52,7 +53,7 @@ export class LocalKVStore extends core.defineResource({
         })
 
         if (encoding) {
-            return data
+            return data as string | undefined
         }
 
         return data !== undefined ? new Blob([data]) : undefined
