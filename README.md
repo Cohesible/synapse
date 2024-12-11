@@ -39,6 +39,11 @@ export async function main() {
 }
 ```
 
+```shell
+synapse deploy
+synapse run
+```
+
 ## How it works
 
 One way to think about Synapse is to imagine a "metaprogram" that controls _what_ code is executed and _where_ it is executed. Synapse enables you to write code describing this metaprogram within traditional code. 
