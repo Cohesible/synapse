@@ -86,6 +86,8 @@ export function isSelfSea() {
     return storage.getStore()?.selfBuildType === 'sea'
 }
 
+// Need a better name for this because it doesn't always 
+// point to a "real" file; it's the entrypoint JS file
 export function getSelfPath() {
     if (defaultContext?.selfPath) {
         return defaultContext?.selfPath

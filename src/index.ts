@@ -62,6 +62,7 @@ import { getTypesFile } from './compiler/resourceGraph'
 import { formatEvents, getLogService } from './services/logs'
 import { getNeededDependencies } from './pm/autoInstall'
 import { maybeLoadEnvironmentVariables } from './runtime/env'
+import { pointerPrefix } from './build-fs/pointers'
 
 // TODO: https://github.com/pulumi/pulumi/issues/3388
 
@@ -399,7 +400,7 @@ export async function deploy(targets: string[], opt: DeployOpt2 = {}) {
         targetResources.push(...gatherTargets(template, opt.symbols))
     }
 
-    if (maybeMoved) {
+    if (maybeMoved && targetResources.length > 0) {
         for (const m of maybeMoved) {
             targetResources.push(m.from)
             targetResources.push(m.to)
@@ -1029,7 +1030,7 @@ export async function plan(targets: string[], opt: PlanOptions = {}) {
         targetResources.push(...gatherTargets(template, opt.symbols))
     }
 
-    if (maybeMoved) {
+    if (maybeMoved && targetResources.length > 0) {
         for (const m of maybeMoved) {
             targetResources.push(m.from)
             targetResources.push(m.to)
@@ -1196,8 +1197,18 @@ export async function show(targets: string[], opt?: DeployOptions & { 'names-onl
     }
 
     if (opt?.['names-only']) {
-        for (const k of state.resources.map(r => `${r.type}.${r.name}`)) {
-            printLine(k)
+        const template = await maybeRestoreTemplate()
+        if (!template) {
+            throw new Error(`No deployment template found`)
+        }
+    
+        const graph = createSymbolGraphFromTemplate(template)
+
+        const keys = state.resources.map(r => `${r.type}.${r.name}`)
+        for (const k of keys) {
+            const sym = graph.hasResource(k) ? getSymbolNodeFromRef(graph, k) : undefined
+            const rendered = sym ? ` [${renderSymbol(sym, true, true)}]` : ''
+            printLine(`${k}${rendered}`)
         }
         return
     }
@@ -1350,8 +1361,9 @@ function getSymbolNodeFromRef(graph: SymbolGraph, ref: string) {
         }
     }
 
-    const { name, fileName, index } = parseSymbolRef(ref)
-    const matched = graph.matchSymbolNodes(name, fileName)
+    // XXX: ugh what have I done...
+    const { name, fileName, index, attribute } = parseSymbolRef(ref)
+    const matched = graph.matchSymbolNodes(name, fileName, attribute)
     if (matched.length === 0) {
         throw new Error(`No resources found matching name "${name}"${fileName ? ` in file "${fileName}"` : ''}`)
     }
@@ -2184,6 +2196,10 @@ export async function emitBlocks(dest: string) {
 export async function showRemoteArtifact(target: string, opt?: { captured?: boolean; deployed?: boolean; infra?: boolean }) {
     const repo = getDataRepository()
 
+    if (target.startsWith(pointerPrefix)) {
+        target = target.slice(pointerPrefix.length)
+    }
+
     if (target.includes(':')) {
         const m = await getMetadata(repo, target)
         printJson(m)
@@ -2651,22 +2667,65 @@ async function initFromRepo(name: string, dest: string) {
         throw new Error(`No example found named "${name}"`)
     }
 
-    await Promise.all(files.map(async f => getFs().writeFile(
-        path.resolve(dest, f.name.slice(prefix.length)),
-        await f.read()
+    try {
+        return await checkFilesAndInit(dest, Object.fromEntries(files.map(f => [f.name.slice(prefix.length), f.read()])))
+    } finally {
+        await repo.dispose()
+    }
+}
+
+// `null` means "this is written somewhere else"
+async function checkFilesAndInit(dir: string, files: Record<string, string | Uint8Array | Promise<Uint8Array> | null>) {
+    const toRootDir = (f: string): string => [f, '.'].includes(path.dirname(f)) ? f : toRootDir(path.dirname(f))
+
+    // Only check top-level directories. Why? Because adding files to existing directories can be very confusing.
+    // TODO: log which source file(s) conflict ?
+    // Also, checking that the contents don't match would be better. But that's for another day.
+    const roots = [...new Set(Object.keys(files).map(toRootDir))]
+    const conflicts = (await Promise.all(
+        roots.map(async f => await getFs().fileExists(f) ? f : undefined)
+    )).filter(isNonNullable)
+
+    if (conflicts.length > 0) {
+        const dirName = dir === process.cwd() ? 'The current directory' : path.relative(process.cwd(), dir)
+        throw new Error(`${dirName} contains conflicting files:\n${conflicts.map(x => `  ${x}\n`).join('')}`)
+    }
+
+    const filtered = Object.entries(files).filter(([_, v]) => v !== null) as [string, string | Uint8Array | Promise<Uint8Array>][]
+    await Promise.all(filtered.map(async ([k, v]) => getFs().writeFile(
+        path.resolve(dir, k),
+        await v
     )))
 
-    await repo.dispose()
-
-    return files.map(f => f.name.slice(prefix.length))
+    return Object.keys(files)
 }
 
 export async function init(opt?: { template?: string }) {
-    const fs = getFs()
     const dir = process.cwd()
-    const dirFiles = (await fs.readDirectory(dir)).filter(f => f.name !== '.git')
-    if (dirFiles.length !== 0) {
-        throw new Error(`${dir} is not empty! Move to an empty directory and try again.`)
+
+    async function compilePrograms(files: string[]) {
+        const programDirs = new Set<string>()
+        for (const f of files.map(x => path.resolve(dir, x))) {
+            if (path.basename(f) === 'package.json' || path.basename(f) === 'tsconfig.json') {
+                programDirs.add(path.dirname(f))
+            }
+        }
+
+        const programs = [...programDirs]
+        if (programs.length === 1 && programs[0] === process.cwd()) {
+            return compile([], { skipSynth: true })
+        }
+
+        if (programs.length === 0) {
+            // This is unexpected and likely an error somewhere
+            throw new Error('No programs found')
+        }
+
+        // Building a project with multiple programs/packages requires more sophisticated logic
+        // that I have not yet implemented. We need to construct a package-level dependency
+        // graph and compile/publish the nodes. Of course, publishing a package without deployment 
+        // leaves the package as a stub which may or may not play nicely with dependent packages.
+        getLogger().log('Skipping compile due to multiple programs', programs)
     }
 
     async function showInstructions(filesCreated: string[]) {
@@ -2687,19 +2746,24 @@ export async function init(opt?: { template?: string }) {
         for (const f of filesCreated) {
             printLine(colorize('green', `  ${f}`))
         }
-        if (await getFs().fileExists(path.resolve(dir, 'node_modules'))) {
-            printLine(colorize('gray', '"node_modules" was created for better editor support'))
-        }
+
+        await compilePrograms(filesCreated)
+
         printLine()
 
-        if (filesCreated.find(f => f === 'README.md')) {
+        const readmeFile = filesCreated.find(f => f.toLowerCase().endsWith('readme.md'))
+        if (readmeFile) {
+            const relPath = path.relative(process.cwd(), path.resolve(dir, readmeFile))
+            const relPathWithDir = path.dirname(relPath) === '.' ? `./${relPath}` : relPath // Little enhancement for `vscode`
+            printLine(`Open ${relPathWithDir} to get started`)
+
             return
         }
     
         const deployCmd = renderCmdSuggestion('deploy')
         const targetOption = colorize('gray', '--target aws')
     
-        printLine(`You can now use ${deployCmd} to compile & deploy your code!`)
+        printLine(`You can now use ${deployCmd} to deploy your code!`)
         printLine()
         printLine(`By default, your code is built for and deployed to a "local" target.`)
     
@@ -2734,8 +2798,8 @@ export async function main(...args: string[]) {
 }
 `.trimStart()
 
-    await fs.writeFile(path.resolve(dir, 'hello.ts'), text, { flag: 'wx' })
-    await showInstructions(['hello.ts'])
+    const created = await checkFilesAndInit(dir, { 'hello.ts': text, 'tsconfig.json': JSON.stringify({}) })
+    await showInstructions(created)
 }
 
 export async function clearCache(targetKey?: string, opt?: CombinedOptions) {

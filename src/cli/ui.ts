@@ -144,7 +144,7 @@ function getGraphemeWidth(str: string) {
     return 1
 }
 
-function getDisplayWidth(str: string) {
+export function getDisplayWidth(str: string) {
     let w = 0
     let j = 0
     let isEscaped = false

@@ -178,10 +178,11 @@ export function createCompileView(inputOptions?: CompilerOptions & { hideLogs?: 
         if (isFirstSynthLog) {
             isFirstSynthLog = false
             view.writeLine()
-            view.writeLine(`Synthesis logs:`)
+            view.writeLine('Compile Logs:')
         }
 
-        const formatted = `${dim(`[${levelToString(ev.level)}]`)} ${nodeUtil.format(...ev.args)}` // TODO: show source file + line # + col #
+        // TODO: show source file + line # + col #
+        const formatted = `${dim(`[${levelToString(ev.level)}]`)} ${nodeUtil.format(...ev.args)}`
         const lines = formatted.split('\n')
         for (const l of lines) {
             view.writeLine(`  ${l}`)

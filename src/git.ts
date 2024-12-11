@@ -157,15 +157,19 @@ export function getCurrentBranchSync(dir = process.cwd()) {
 }
 
 export async function openRemote(remote: string) {
-    const dest = path.resolve(getGitDirectory(), 'remotes', remote)
+    const url = new URL(remote)
+    const dest = path.resolve(getGitDirectory(), 'remotes', url.hostname + url.pathname)
 
     if (!(await getFs().fileExists(dest))) {
         await mkdir(dest, { recursive: true })
 
         const cloneResult = await runCommand(
             'git',
-            ['clone', '--depth', '1', '--no-checkout', '--no-tags',  '--filter=blob:none', remote, dest]
-        )
+            ['clone', '--depth', '1', '--no-checkout', '--no-tags',  '--filter=blob:none', remote, dest],
+        ).catch(async e => {
+            await getFs().deleteFile(dest)
+            throw e
+        })
     } else {
         await runCommand(
             'git',

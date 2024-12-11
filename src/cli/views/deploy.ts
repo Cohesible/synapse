@@ -1,9 +1,9 @@
 import * as path from 'node:path'
-import { getLogger } from '../../logging'
+import { DeployLogEvent, getLogger } from '../../logging'
 import { ParsedPlan, getChangeType, mapResource } from '../../deploy/deployment'
 import { DeployEvent, DeploySummaryEvent, FailedDeployEvent } from '../../logging'
 import { SymbolNode, SymbolGraph, renderSymbol, MergedGraph, renderSymbolLocation } from '../../refactoring'
-import { Color, colorize, format, getDisplay, getSpinnerFrame, printLine, Spinner, spinners, stripAnsi, print, ControlKey } from '../ui'
+import { Color, colorize, format, getDisplay, getSpinnerFrame, printLine, Spinner, spinners, stripAnsi, print, ControlKey, getDisplayWidth } from '../ui'
 import { keyedMemoize, sortRecord } from '../../utils'
 import { getWorkingDir } from '../../workspaces'
 import { resourceIdSymbol } from '../../deploy/server'
@@ -66,7 +66,7 @@ function isOnlyUpdatingDefs(state: SymbolState) {
     return true
 }
 
-export function printSymbolTable(symbols: Iterable<[sym: SymbolNode, state: SymbolState]>, showLocation = true, maxWidth = 80) {
+export function printSymbolTable(symbols: Iterable<[sym: SymbolNode, state: SymbolState]>) {
     const texts = new Map<SymbolNode, string>()
     for (const [k, v] of symbols) {
         if (isOnlyUpdatingDefs(v)) continue
@@ -79,7 +79,6 @@ export function printSymbolTable(symbols: Iterable<[sym: SymbolNode, state: Symb
         return
     }
 
-    // const headerSize = Math.min(process.stdout.columns, maxWidth)
     const largestWidth = [...texts.values()].map(stripAnsi).sort((a, b) => b.length - a.length)[0]
     const minGap = 2
     const padding = largestWidth.length + minGap
@@ -139,7 +138,6 @@ function renderSymbolWithState(
 ) {
     const actionColor = getColor(state.action)
     const icon = getIcon(state.action)
-   // const status = state.status !== 'pending' ? ` (${state.status})` : ''
     const duration = state.startTime ? Date.now() - state.startTime.getTime() : undefined
     const seconds = duration ? Math.floor(duration / 1000) : 0
     const durationText = !seconds ? '' : ` (${seconds}s)`
@@ -158,10 +156,6 @@ function renderSymbolWithState(
     const symWithIcon = colorize(actionColor, `${icon} ${parts.name}`)
 
     return `${status} ${symWithIcon}${details}`
-}
-
-interface DeploySummary {
-        
 }
 
 export async function createDeployView(graph: MergedGraph, mode: 'deploy' | 'destroy' | 'import' = 'deploy') {
@@ -354,10 +348,9 @@ export async function createDeployView(graph: MergedGraph, mode: 'deploy' | 'des
         })
     })
 
-    const resourceLogs: Record<string, string[]> = {}
+    const resourceLogs: DeployLogEvent[] = []
     getLogger().onDeployLog(ev => {
-        const arr = resourceLogs[ev.resource] ??= []
-        arr.push(require('node:util').format(...ev.args))
+        resourceLogs.push(ev)
     })
 
     function dispose(headerText?: string) {
@@ -369,16 +362,22 @@ export async function createDeployView(graph: MergedGraph, mode: 'deploy' | 'des
             clearInterval(v)
         }
 
+        function getDisplayName(resourceKey: string) {
+            const sym = graph.hasSymbol(resourceKey) ? graph.getSymbol(resourceKey) : undefined
+            
+            return sym ? renderSym(sym.value, true, true) : resourceKey
+        }
+
         if (errors.length > 0) {
             view.writeLine()
             view.writeLine('Errors:')
 
-            // TODO: convert resource names to symbols
             for (const [r, e] of errors) {
+                const name = getDisplayName(r)
                 if (typeof e === 'string') {
-                    view.writeLine(`[${r}]: ${e}`)
+                    view.writeLine(`[${name}]: ${e}`)
                 } else {
-                    printLine(`[${r}]: ${format(e)}`)
+                    printLine(`[${name}]: ${format(e)}`)
                 }
             }
         }
@@ -387,15 +386,32 @@ export async function createDeployView(graph: MergedGraph, mode: 'deploy' | 'des
             getLogger().log(`Skipped:`, skipped)
         }
 
-        const l = Object.entries(resourceLogs)
-        if (l.length > 0) {
+        // FIXME: we should organize into 3 columns (<name> <type> <location>) and pad between each
+        // Padding exclusively on the left works but it's not great. The output will look terrible
+        // with a large variety of filenames and/or resource types.
+        if (resourceLogs.length > 0) {
             view.writeLine()
             view.writeLine('Resource logs:')
-            // TODO: convert resource names to symbols
-            for (const [k, v] of l) {
-                for (const z of v) {
-                    view.writeLine(`[${k}]: ${z}`)
-                }
+
+            // Ensures finding the padding width is fast
+            const resourceDisplayNames = new Map<string, { text: string; width: number }>()
+            for (const ev of resourceLogs) {
+                if (resourceDisplayNames.has(ev.resource)) continue
+
+                const text = getDisplayName(ev.resource)
+                resourceDisplayNames.set(ev.resource, { text, width: getDisplayWidth(text) })
+            }
+
+            let paddingWidth = 0
+            for (const v of resourceDisplayNames.values()) {
+                paddingWidth = Math.max(v.width, paddingWidth)
+            }
+
+            for (const ev of resourceLogs) {
+                const name = resourceDisplayNames.get(ev.resource)!
+                const padding = paddingWidth - resourceDisplayNames.get(ev.resource)!.width
+                const paddedName = ' '.repeat(padding) + name.text
+                view.writeLine(`[ ${paddedName} ]: ${format(...ev.args)}`)
             }
         }
     }

@@ -34,19 +34,28 @@ interface ParsedConfig {
 function getDefaultTsConfig(targetFiles: string[]) {
     return {
         include: targetFiles,
-        compilerOptions: {
-          target: 'ES2022',
-          module: 'NodeNext',
-          moduleResolution: 'NodeNext',
-          resolveJsonModule: true,
-          sourceMap: true,
-          esModuleInterop: true,
-          strict: true,
-          skipLibCheck: true,
-          alwaysStrict: true,
-          forceConsistentCasingInFileNames: true,
-        },
+        compilerOptions: {},
     }
+}
+
+function applyDefaults(opt: ts.CompilerOptions) {
+    // FIXME: move to esm (high priority)
+    // Also a lot of these should be defaults
+    opt.target ??= ts.ScriptTarget.ES2022 // `esnext` I think fails w/ `_` as an ident?
+    opt.module ??= ts.ModuleKind.NodeNext
+    opt.moduleResolution ??= ts.ModuleResolutionKind.NodeNext
+    opt.resolveJsonModule ??= true
+    opt.sourceMap ??= true
+    opt.esModuleInterop ??= true
+    opt.strict ??= true
+    opt.skipLibCheck ??= true
+    opt.alwaysStrict ??= true
+    opt.composite ??= true
+
+    // This is probably the most "breaking" default. 
+    // But honestly, `tsc` should either be case-insensitive always _or_ this should be the default
+    // There's absolutely ZERO reason to be writing source files with different casing.
+    opt.forceConsistentCasingInFileNames ??= true
 }
 
 function checkTsDiags(diags: ts.Diagnostic[]) {
@@ -118,11 +127,7 @@ async function getTsConfig(
         const config = getTsConfigFromText(text, fileName, targetFiles)
         const cmd = ts.parseJsonConfigFileContent(config, sys, workingDirectory, undefined, fileName)
         checkTsDiags(cmd.errors)
-    
-        cmd.options.composite ??= true
-        cmd.options.alwaysStrict ??= true
-        cmd.options.sourceMap ??= true
-        cmd.options.skipLibCheck ??= true
+        applyDefaults(cmd.options)
     
         if (cmd.options.composite === false) {
             throw new Error('Programs cannot be compiled with `composite` set to `false`')

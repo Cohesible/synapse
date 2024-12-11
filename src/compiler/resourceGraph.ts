@@ -545,7 +545,7 @@ export function createResourceGraph(
                     visitExpression(m.initializer)
                 }
 
-                if (ts.isConstructorDeclaration(m)) {
+                if (ts.isConstructorDeclaration(m) || ts.isMethodDeclaration(m)) {
                     visitFunctionLikeDeclaration(m)
                 }
 

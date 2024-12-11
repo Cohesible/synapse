@@ -746,10 +746,18 @@ export function createSymbolGraph(sourceMap: TerraformSourceMap, resources: Reco
         return resourceToNode.has(key)
     }
 
-    function shallowMatchSymbolNodes(name: string, fileName?: string) {
+    function shallowMatchSymbolNodes(name: string, fileName?: string, attribute?: string) {
         const nodes: SymbolNode[] = []
+
+        // FIXME: there's zero reason to be iterating over a symbol map? just do the nodes?
         for (const [k, v] of symbolMap) {
-            if (k.name === name && (!fileName || k.fileName === fileName)) {
+            if ((fileName && k.fileName !== fileName)) continue
+
+            if (attribute) {
+                if (v.value.name === `${name}.${attribute}`) {
+                    nodes.push(v)
+                }
+            } else if (k.name === name) {
                 nodes.push(v)
             }
         }
@@ -757,9 +765,9 @@ export function createSymbolGraph(sourceMap: TerraformSourceMap, resources: Reco
         return nodes
     }
 
-    function matchSymbolNodes(name: string, fileName?: string) {
+    function matchSymbolNodes(name: string, fileName?: string, attribute?: string) {
         const segments = name.split('/')
-        const root = shallowMatchSymbolNodes(segments[0], fileName)
+        const root = shallowMatchSymbolNodes(segments[0], fileName, attribute)
         if (segments.length === 1 || root.length !== 1) {
             return root
         }        
@@ -952,29 +960,6 @@ function printNode(node: SymbolGraphNode) {
             return ''
     }
 }
-
-function printNodeRecursive(node: SymbolGraphNode, showResources = false, depth = 0, stack: SymbolGraphNode[] = []): string[] {
-    const lines: string[] = []
-    lines.push(`${'  '.repeat(depth)}${printNode(node)}`)
-    stack.push(node)
-
-    for (const c of node.children) {
-        if (stack.includes(c as SymbolGraphNode)) {
-            throw new Error(`Cycle detected: ${[...stack, c as SymbolGraphNode].map(n => printNode(n)).join(' --> ')}`)
-        }
-        if (!showResources && c.type === 'resource') continue
-        lines.push(...printNodeRecursive(c as SymbolGraphNode, showResources, depth + 1, stack))
-    }
-
-    stack.pop()!
-
-    return lines
-}
-
-// function printTree(g: ReturnType<typeof createSymbolGraph>) {
-//     getLogger().raw(printNodeRecursive(g.root).join('\n'))
-// }
-
 
 function isSameType(r1: Resource, r2: Resource) {
     return r1.type === r2.type && r1.subtype === r2.subtype

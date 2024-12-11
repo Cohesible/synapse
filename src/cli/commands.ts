@@ -111,6 +111,13 @@ const passthroughSwitch: PassthroughSwitch = {
     passthrough: true,
 }
 
+// TODO: allows for <cmd>-<arg> e.g. `run-main.ts`
+const dynamicArg: SwitchArgument = {
+    name: 'dynamicArg',
+    type: 'string',
+    hidden: true,
+}
+
 export interface RegisteredCommand<T extends any[] = any[]> {
     readonly name: string
     readonly fn: (...args: T) => Promise<void> | void
@@ -598,7 +605,8 @@ registerTypedCommand(
             { name: 'rollback-if-failed', type: 'boolean', hidden: true },
             { name: 'filter', type: 'string', hidden: true },
             { name: 'no-cache', type: 'boolean', description: 'Runs tests without caching results or using cached results' },
-            { name: 'show-logs', type: 'boolean', description: 'Shows all test logs regardless of the outcome' },
+            // TODO: need all flags to also have a `no` variant, right now this option does nothing. At all.
+            { name: 'show-logs', type: 'boolean', description: 'Shows all test logs regardless of the outcome', defaultValue: true },
         ],
         requirements: { program: true, process: true },
         inferBuildTarget: true,
@@ -771,7 +779,13 @@ registerTypedCommand(
     {
         isImportantCommand: true,
         args: [{ name: 'target', type: createUnionType(typescriptFileType, 'string'), optional: true }],
-        options: [passthroughSwitch, { name: 'skipValidation', type: 'boolean', hidden: true }, { name: 'skipCompile', type: 'boolean', hidden: true }, ...buildTargetOptions],
+        options: [
+            // dynamicArg,
+            passthroughSwitch, 
+            { name: 'skipValidation', type: 'boolean', hidden: true }, 
+            { name: 'skipCompile', type: 'boolean', hidden: true }, 
+            ...buildTargetOptions
+        ],
         inferBuildTarget: true,
         description: 'Executes a target file/script. Uses an executable in the current application by default.',
     },
@@ -1264,8 +1278,6 @@ registerTypedCommand(
     (opt) => handleCompletion(opt.targetArgs ?? [], getAllCommands()),
 )
 
-registerCommand('test-find-local', () => synapse.findLocalResources([]), { internal: true })
-
 registerTypedCommand(
     'deploy-modules',
     {
@@ -1307,12 +1319,16 @@ registerTypedCommand(
     async (opt) => await synapse.listCommitsCmd('', opt),
 )
 
+// TODO: if we want to be fancy (and a bit risky), we can make this command _very_ prominent if the user
+// is obviously not in a program/project. For example, it should show first in any commands lists
+// and it should be the only recommended command to use. And we would reject commands like `deploy`
+// if there's obviously nothing there. But anyway, more logic = more ways to break. This improvement 
+// would be great for adoption but should be thrown out soon after.
 registerTypedCommand(
     'init',  
     {
-        // Only important for new users
-        // isImportantCommand: true,
-        description: 'Creates a new package in the current directory',
+        isImportantCommand: true,
+        description: 'Creates a new program in the current directory',
         options: [
             { name: 'template', type: 'string' }
         ]
@@ -1650,7 +1666,6 @@ function getCommand(cmd: string) {
     
     return registeredCommands.get(name)
 }
-
 
 export async function executeCommand(cmd: string, params: string[]) {
     const command = getCommand(cmd)

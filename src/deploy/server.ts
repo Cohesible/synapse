@@ -153,7 +153,7 @@ function createProviderRoutes(ctx: DeploymentContext) {
         context['afs'].push(afs)
 
         context['resource'] ??= []
-        context['resource'].push(resourceName)
+        context['resource'].push(`synapse_resource.${resourceName}`)
 
         return {
             plan,
