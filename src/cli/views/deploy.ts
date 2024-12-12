@@ -615,24 +615,30 @@ export function renderSummary(ev: DeploySummaryEvent) {
     return lines.join('\n')
 }
 
-export async function promptDestroyConfirmation(reason: string, state: TfState) {
+export async function promptForInput(prompt: string) {
     const display = getDisplay()
     const tty = display.writer.tty
     if (!tty) {
         throw new Error('Cannot prompt for confirmation without a tty')
     }
 
-    const warning = `${reason} Are you sure you want to destroy this deployment?`
-    printLine(colorize('brightYellow', warning))
-    print(`(y/N): `)
-    // TODO: show what will be deleted
+    print(prompt)
 
     await new Promise<void>(r => setTimeout(r, 100))
     await display.writer.flush()
 
+    // Used for internal test fixtures
+    const inputFromTests = process.env['__SYNAPSE_TEST_INPUT']
+    if (inputFromTests !== undefined) {
+        printLine(inputFromTests)
+        await display.getOverlayedView().resetScreenTop()
+
+        return inputFromTests
+    }
+
     display.writer.showCursor()
 
-    const resp = await new Promise<string>((resolve, reject) => {
+    return new Promise<string>((resolve, reject) => {
         let buf = ''
         const l = tty.onKeyPress(ev => {
             switch (ev.key) {
@@ -666,12 +672,18 @@ export async function promptDestroyConfirmation(reason: string, state: TfState) 
                     break
             }
         })
-    })
+    }).finally(() => display.getOverlayedView().resetScreenTop())
+}
+
+export async function promptDestroyConfirmation(reason: string, state: TfState) {
+    const warning = `${reason} Are you sure you want to destroy this deployment?`
+    printLine(colorize('brightYellow', warning))
+
+    const resp = await promptForInput(`(y/N): `)
+    // TODO: show what will be deleted
 
     const trimmed = resp.trim().toLowerCase()
     if (!trimmed || trimmed.startsWith('n') || (trimmed !== 'y' && trimmed !== 'yes')) {
         throw new CancelError('Cancelled destroy')
     }
-
-    await display.getOverlayedView().clearScreen()
 }

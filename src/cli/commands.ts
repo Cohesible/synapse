@@ -2,7 +2,7 @@ import * as synapse from '..'
 import * as path from 'node:path'
 import { getObjectByPrefix } from '../build-fs/utils'
 import { eagerlyStartDaemon, emitCommandEvent } from '../services/analytics'
-import { getCiType, levenshteinDistance, memoize, toSnakeCase } from '../utils'
+import { getCiType, levenshteinDistance, memoize, Mutable, toSnakeCase } from '../utils'
 import { getWorkingDir, resolveProgramBuildTarget } from '../workspaces'
 import { readKey, setKey } from './config'
 import { RenderableError, colorize, printJson, printLine, stripAnsi } from './ui'
@@ -118,6 +118,12 @@ const dynamicArg: SwitchArgument = {
     hidden: true,
 }
 
+const helpFlag: SwitchArgument = {
+    name: 'help',
+    type: 'boolean',
+    hidden: true,
+}
+
 export interface RegisteredCommand<T extends any[] = any[]> {
     readonly name: string
     readonly fn: (...args: T) => Promise<void> | void
@@ -193,6 +199,10 @@ export function registerCommand(name: string, fn: (...args: any[]) => Promise<vo
             aliasedCommands.set(n, name)
         }
     }
+
+    // Inject common options
+    const options = (descriptor as Mutable<typeof descriptor>).options ??= []
+    options.push(helpFlag)
 
     validateDescriptor(descriptor)
     registeredCommands.set(name, { name, fn, descriptor })
@@ -395,7 +405,7 @@ const compileOptions = [
     ...buildTargetOptions,
     deployTargetOption,
     { name: 'no-incremental', type: 'boolean', description: 'Disables incremental compilation' },
-    { name: 'no-synth', type: 'boolean', description: 'Synthesis inputs are emitted instead of executed', hidden: true }, // TODO: better description
+    { name: 'no-synth', type: 'boolean', description: 'Synthesis inputs are emitted instead of executed', hidden: true },
     { name: 'no-infra', type: 'boolean', description: 'Disables generation of synthesis inputs', hidden: true },
     { name: 'skip-install', type: 'boolean' },
     { name: 'host-target', type: hostTargetType, hidden: true },
@@ -640,7 +650,7 @@ registerTypedCommand(
 registerTypedCommand(
     'show-object', 
     {
-        internal: true,
+        hidden: true,
         args: [objectHashArg],
         options: [
             { name: 'captured', type: 'boolean' },
@@ -682,7 +692,7 @@ registerTypedCommand(
 registerTypedCommand(
     'gc',  
     {
-        internal: true,
+        hidden: true,
         options: [
             { name: 'dry-run', type: 'boolean' }
         ],
@@ -715,7 +725,7 @@ registerTypedCommand(
 registerTypedCommand(
     'show',  
     {
-        internal: true, // Temporary
+        hidden: true,
         args: [{ name: 'symbols', type: 'string', allowMultiple: true }],
         options: [
             ...buildTargetOptions,
@@ -784,13 +794,14 @@ registerTypedCommand(
             passthroughSwitch, 
             { name: 'skipValidation', type: 'boolean', hidden: true }, 
             { name: 'skipCompile', type: 'boolean', hidden: true }, 
+            { name: 'no-deploy', type: 'boolean', description: 'Skips any prompts to deploy the program' },
             ...buildTargetOptions
         ],
         inferBuildTarget: true,
         description: 'Executes a target file/script. Uses an executable in the current application by default.',
     },
     async (target, opt) => {
-        await synapse.run(target, opt.targetArgs ?? [], opt)
+        await synapse.run(target, opt.targetArgs ?? [], { ...opt, noDeploy: opt['no-deploy'] })
     }
 )
 
@@ -850,7 +861,7 @@ registerTypedCommand(
 registerTypedCommand(
     'remove',  
     {
-        internal: true,
+        hidden: true,
         args: [{ name: 'packages', type: 'string', allowMultiple: true, min: 1 }],
         options: []
     },
@@ -876,7 +887,7 @@ registerTypedCommand(
 registerTypedCommand(
     'dump-fs',  
     {
-        internal: true,
+        hidden: true,
         args: [{ name: 'fs', optional: true, type: createUnionType(createEnumType('program', 'deployment', 'package', 'test'), objectHashType) }],
         options: [...buildTargetOptions, { name: 'block', type: 'boolean', hidden: true }, { name: 'debug', type: 'boolean', hidden: true, defaultValue: true }]
     },
@@ -1078,7 +1089,7 @@ registerTypedCommand(
 registerTypedCommand(
     'load-block',  
     {
-        internal: true,
+        hidden: true,
         args: [{ name: 'path', type: 'string' }, { name: 'destination', type: 'string', optional: true }],
         options: buildTargetOptions,
     },
@@ -1090,7 +1101,7 @@ registerTypedCommand(
 registerTypedCommand(
     'dump-state',  
     {
-        internal: true,
+        hidden: true,
         args: [{ name: 'path', type: 'string', optional: true }],
         options: buildTargetOptions,
     },
@@ -1102,7 +1113,7 @@ registerTypedCommand(
 registerTypedCommand(
     'load-state',  
     {
-        internal: true,
+        hidden: true,
         args: [{ name: 'path', type: 'string' }],
         options: buildTargetOptions,
     },
@@ -1192,8 +1203,11 @@ registerTypedCommand(
 
 registerTypedCommand(
     'list-deployments', 
-    { internal: true },
-    (...args) => synapse.listDeployments(),
+    { 
+        hidden: true,
+        options: [{ name: 'all', type: 'boolean' }],
+    },
+    (opt) => synapse.listDeployments(undefined, opt),
 )
 
 registerTypedCommand(
@@ -1214,10 +1228,11 @@ registerTypedCommand(
 registerTypedCommand(
     'fs-stats',  
     {
-        internal: true,
+        hidden: true,
         args: [],
+        options: [{ name: 'all', type: 'boolean' }]
     },
-    () => synapse.printFsStats()
+    (opt) => synapse.printFsStats(opt)
 )
 
 registerTypedCommand(
@@ -1293,7 +1308,7 @@ registerTypedCommand(
 registerTypedCommand(
     'taint', 
     {
-        internal: true,
+        hidden: true,
         args: [{ name: 'resourceId', type: 'string' }],
     }, 
     (a, opt) => synapse.taint(a, opt)
@@ -1302,7 +1317,7 @@ registerTypedCommand(
 registerTypedCommand(
     'delete-resource', 
     {
-        internal: true,
+        hidden: true,
         args: [{ name: 'resourceId', type: 'string' }],
         options: [{ name: 'force', type: 'boolean' }, ...buildTargetOptions]
     }, 
@@ -1312,11 +1327,11 @@ registerTypedCommand(
 registerTypedCommand(
     'list-commits',  
     {
-        internal: true,
+        hidden: true,
         requirements: { process: true },
-        options: [{ name: 'useProgram', type: 'boolean' }]
+        options: [{ name: 'program', type: 'boolean' }]
     },
-    async (opt) => await synapse.listCommitsCmd('', opt),
+    async (opt) => await synapse.listCommitsCmd('', { useProgram: opt['program'] }),
 )
 
 // TODO: if we want to be fancy (and a bit risky), we can make this command _very_ prominent if the user
@@ -1464,8 +1479,55 @@ async function parseArg(val: string, type: ArgType) {
     return val
 }
 
-function showHelp(desc: CommandDescriptor) {
-    // If command has passthrough switch we need to treat it differently
+function showHelp(name: string, desc: CommandDescriptor) {
+    function renderArg(arg: PositionalArgument) {
+        let res = `<${arg.name}>`
+        if (arg.optional) {
+            res = `${res}?`
+        }
+        if (arg.allowMultiple) {
+            res = `${res}...`
+        }
+        return res
+    }
+
+    function renderType(t: any): string {
+        switch (t) {
+            case 'boolean': return ''
+            case 'number': return '<number>'
+            case 'string': return '<string>'
+        }
+
+        if (isEnumType(t)) {
+            return `(${[...t[enumTypeSym]].join('|')})`
+        }
+
+        if (isUnionType(t)) {
+            const types = [...t[unionTypeSym]]
+
+            return `(${types.map(renderType).join('|')})`
+        }
+
+        if (isFileType(t)) {
+            const extnames = [...t[fileTypeSym]]
+
+            return `<${extnames.join(',')} file>`
+        }
+
+        return '<any>'
+    }
+
+    function renderOption(opt: SwitchArgument) {
+        const type = renderType(opt.type)
+        const parts: string[] = []
+        if (opt.shortName) {
+            parts.push(`-${opt.shortName}${type ? ` ${type}` : ''}`)
+        }
+
+        return parts.join(' | ')
+    }
+
+    printLine('WIP')
 }
 
 function validateDescriptor(desc: CommandDescriptor) {
@@ -1673,11 +1735,19 @@ export async function executeCommand(cmd: string, params: string[]) {
         throw new RenderableError(`Invalid command: ${cmd}`, () => didYouMean(cmd))
     }
 
-    if (command.descriptor.requirements?.program === false) {
+    async function parseAndRun(command: RegisteredCommand) {
         const parsed = await runTask('parse', cmd, () => parseArgs(params, command.descriptor), 1)
+        if (parsed.options.help) {
+            return showHelp(command.name, command.descriptor)
+        }
+
         const args = [...parsed.args, parsed.options]
 
         return runTask('run', cmd, () => command.fn(...args), 1)
+    }
+
+    if (command.descriptor.requirements?.program === false) {
+        return parseAndRun(command)
     }
 
     const buildTarget = await getBuildTarget(command.descriptor, params)
@@ -1692,11 +1762,7 @@ export async function executeCommand(cmd: string, params: string[]) {
         getLogger().debug(`Using resolved build target`, buildTarget)
     }
 
-    await runWithContext({ buildTarget }, async () => {
-        const parsed = await runTask('parse', cmd, () => parseArgs(params, command.descriptor), 1)
-        const args = [...parsed.args, parsed.options]
-        await runTask('run', cmd, () => command.fn(...args), 1)
-    })
+    await runWithContext({ buildTarget }, () => parseAndRun(command))
 }
 
 function _inferCmdName() {

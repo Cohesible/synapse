@@ -196,6 +196,10 @@ Prints a motivational quote fetched from a public Synapse application.
 ## Other Commands
 These commands expose lower-level functionality that you might find useful.
 
+### `status`
+
+Shows the build state for the current program, including any files that need to be re-compiled or re-deployed.
+
 ### `clean`
 
 Deletes all cached data for the current application.

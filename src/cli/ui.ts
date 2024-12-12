@@ -1043,7 +1043,21 @@ export function createDisplay() {
             await writer.flush()
         }
 
-        return { 
+        async function resetScreenTop() {
+            await writer.flush()
+
+            while (screenTop < height && spans.length > 0) {
+                spans.shift()
+                screenTop += 1
+            }
+
+            writer.write('\n'.repeat(spans.length + 1))
+            spans.length = 0
+            await writer.flush()
+        }
+
+        return {
+            resetScreenTop,
             write: (text: string) => write(text, true), 
             writeLine, 
             createRow, 
@@ -1252,6 +1266,7 @@ export function createDisplay() {
             createRow: (text) => createDisplayRow(text),
             dispose: async () => {},
             clearScreen: async () => {},
+            resetScreenTop: async () => {},
             get disposed() {
                 return false
             },

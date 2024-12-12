@@ -42,6 +42,9 @@ export async function getArtifactByPrefix(repo: DataRepository, prefix: string) 
 
 
 export function getObjectByPrefix(prefix: string, repo = getDataRepository()) {
+    if (prefix.startsWith('pointer:')) {
+        prefix = prefix.slice('pointer:'.length)
+    }
     return getArtifactByPrefix(repo, prefix.replace(/\//g, ''))
 }
 

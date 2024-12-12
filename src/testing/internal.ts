@@ -14,6 +14,7 @@ const expectFailCommand = '@expectFail'
 const skipCleanCommand = '@skipClean'
 const renameCommand = '@rename'
 const expectEqualCommand = '@expectEqual'
+const inputCommand = '@input'
 
 function parseCommands(text: string) {
     const lines = text.split('\n')
@@ -101,6 +102,15 @@ function renderCommands(fileName: string, commands: string[], synapseCmd = proce
         // Skip all `@` commands for forwards compat
         if (c.startsWith('@')) {
             continue
+        }
+
+        const inputIndex = c.indexOf(inputCommand)
+        if (inputIndex !== -1) {
+            const command = `export __SYNAPSE_TEST_INPUT="${c.slice(inputIndex + inputCommand.length + 1)}"`
+            inner.push(command)
+            inner.push(c.slice(0, inputIndex))
+            inner.push('unset __SYNAPSE_TEST_INPUT')
+            continue // TODO: make this work w/ `expectFail`
         }
 
         const index = c.indexOf(expectFailCommand)

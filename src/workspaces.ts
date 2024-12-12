@@ -1330,3 +1330,15 @@ export async function getOrCreateRemotePackage(useDefaultBranch?: boolean) {
 
     return pkg.id
 }
+
+export async function deleteProgram(projectId: string, id: string) {
+    const state = await getProjectState(projectId)
+    if (!state) {
+        return false
+    }
+    
+    const r = delete state.programs[id]
+    await setProjectState(state)
+
+    return r
+}

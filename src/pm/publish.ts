@@ -3,20 +3,21 @@ import { StdioOptions } from 'node:child_process'
 import { mergeBuilds, pruneBuild, getInstallation, writeSnapshotFile, getProgramFs, getDataRepository, getModuleMappings, loadSnapshot, dumpData, getProgramFsIndex, getDeploymentFsIndex, toFsFromIndex, copyFs, createSnapshot, getOverlayedFs, Snapshot, ReadonlyBuildFs, getSnapshotPath } from '../artifacts'
 import {  NpmPackageInfo, getDefaultPackageInstaller, installFromSnapshot, testResolveDeps } from './packages'
 import { getBinDirectory, getSynapseDir, getLinkedPackagesDirectory, getToolsDirectory, getUserEnvFileName, getWorkingDir, listPackages, resolveProgramBuildTarget, SynapseConfiguration, getUserSynapseDirectory, setPackage, BuildTarget, findDeployment, getOrCreateRemotePackage } from '../workspaces'
-import { gunzip, gzip, isNonNullable, keyedMemoize, linkBin, makeExecutable, memoize, throwIfNotFileNotFoundError, tryReadJson } from '../utils'
+import { gunzip, gzip, isNonNullable, keyedMemoize, linkBin, makeExecutable, memoize, replaceWithTilde, throwIfNotFileNotFoundError, tryReadJson } from '../utils'
 import { Fs, ensureDir, readFileWithStats } from '../system'
 import { glob } from '../utils/glob'
 import { getLogger, runTask } from '../logging'
 import { homedir } from 'node:os'
 import { getBuildTargetOrThrow, getFs, getSelfPathOrThrow, isSelfSea } from '../execution'
 import { ImportMap, expandImportMap, hoistImportMap } from '../runtime/importMaps'
-import { createCommandRunner, patchPath, runCommand } from '../utils/process'
+import { createCommandRunner, patchPath, runCommand, which } from '../utils/process'
 import { PackageJson, ResolvedPackage, getCompiledPkgJson, getCurrentPkg, getImmediatePackageJsonOrThrow, getPackageJson } from './packageJson'
 import { readPathMapKey, setPathKey } from '../cli/config'
 import { getEntrypointsFile } from '../compiler/programBuilder'
 import { createPackageForRelease } from '../cli/buildInternal'
 import * as registry from '@cohesible/resources/registry'
 import { createTarball, extractTarball } from '../utils/tar'
+import { colorize } from '../cli/ui'
 
 const getDependentsFilePath = () => path.resolve(getUserSynapseDirectory(), 'packageDependents.json')
 
@@ -860,9 +861,11 @@ async function installToProfile(synapseDir: string, profileFile: string, fs = ge
     const text = await fs.readFile(profileFile, 'utf-8').catch(throwIfNotFileNotFoundError)
 
     const getInstallationLines = () => createInstallCommands(synapseDir, true)
+    const maybePrompt = () => maybePromptToSourceOrReload(synapseDir, profileFile)
 
     if (!text) {
         await fs.writeFile(profileFile, getInstallationLines().join('\n'))
+        await maybePrompt()
 
         return true
     }
@@ -871,11 +874,6 @@ async function installToProfile(synapseDir: string, profileFile: string, fs = ge
         const isLastLineEmpty = !lines.at(-1)?.trim()
         const isSecondLastLineEmpty = !lines.at(-2)?.trim()
         const installLines = getInstallationLines()
-        // if (exportedPathLocation === -1) {
-        //     lines.push(...installLines)
-        // } else {
-        //     lines.splice(exportedPathLocation, 1, '', ...installLines)
-        // }
 
         if (isLastLineEmpty && isSecondLastLineEmpty) {
             lines.pop()
@@ -886,6 +884,7 @@ async function installToProfile(synapseDir: string, profileFile: string, fs = ge
         lines.push(...installLines, '')
     
         await fs.writeFile(profileFile, lines.join('\n'))
+        await maybePrompt()
     }
 
     const lines = text.split('\n')
@@ -895,13 +894,6 @@ async function installToProfile(synapseDir: string, profileFile: string, fs = ge
         if (lines.findIndex(x => !x.startsWith('#') && x.includes(`SYNAPSE_INSTALL=${desiredInstallLocation}`)) !== -1) {
             return true
         }
-        // const lastLine = lines.findIndex((x, i) => i > oldInstall && x.includes('$SYNAPSE_INSTALL')) 
-        // if (lastLine === -1) {
-        //     // Corrupted install?
-        // } else if (shouldOverride) {
-        //     lines.splice(oldInstall, (lastLine - oldInstall) + 1, ...getInstallationLines())
-        //     await fs.writeFile(profileFile, lines.join('\n'))
-        // }
         await appendInstall(uninstallFromProfile(lines))
         return true
     }
@@ -924,6 +916,20 @@ export async function installToUserPath(target: 'sh' | 'bash' | 'zsh' = 'zsh', s
         case 'zsh':
             return installToProfile(synapseDir, path.resolve(homedir(), '.zprofile'))
     }
+}
+
+async function maybePromptToSourceOrReload(synapseDir: string, profilePath: string) {
+    const absPath = await which('synapse').catch(e => {
+        // Swallowed
+    })
+
+    const destPath = path.resolve(synapseDir, 'bin', 'synapse')
+    if (destPath === absPath) {
+        return
+    }
+
+    console.log(colorize('blue', 'Restart your terminal or run the following to complete installation:\n'))
+    console.log(`    source "${replaceWithTilde(profilePath)}"`)
 }
 
 function findBinPathsSync(pkgDir: string, fs = getFs()) {

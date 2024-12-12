@@ -22,7 +22,7 @@ import { ResolvedProgramConfig, getResolvedTsConfig, resolveProgramConfig } from
 import { createProgramBuilder, getDeployables, getEntrypointsFile, getExecutables } from './compiler/programBuilder'
 import { loadCpuProfile } from './perf/profiles'
 import { colorize, createTreeView, printJson, printLine, print, getDisplay, bold, RenderableError, dim } from './cli/ui'
-import { createDeployView, extractSymbolInfoFromPlan, getPlannedChanges, groupSymbolInfoByPkg, printSymbolTable, promptDestroyConfirmation, renderMove, renderSummary, renderSym } from './cli/views/deploy'
+import { createDeployView, extractSymbolInfoFromPlan, getPlannedChanges, groupSymbolInfoByPkg, printSymbolTable, promptDestroyConfirmation, promptForInput, renderMove, renderSummary, renderSym } from './cli/views/deploy'
 import { TerraformSourceMap, TfJson } from './runtime/modules/terraform'
 import { glob } from './utils/glob'
 import { createMinimalLoader } from './runtime/rootLoader'
@@ -44,7 +44,7 @@ import { transformNodePrimordials } from './utils/convertNodePrimordials'
 import { createCompileView, getPreviousDeploymentData } from './cli/views/compile'
 import { createSessionContext, getModuleLoader, getSession, shutdownSessions } from './deploy/session'
 import { findArtifactByPrefix, getMetadata } from './build-fs/utils'
-import { collectStats, diffFileInLatestCommit, diffIndices, diffObjects, printStats, printTopNLargestObjects } from './build-fs/stats'
+import { collectAllStats, collectStats, diffFileInLatestCommit, diffIndices, diffObjects, mergeRepoStats, printStats, printTopNLargestObjects } from './build-fs/stats'
 import { renderCmdSuggestion } from './cli/commands'
 import * as ui from './cli/ui'
 import * as bfs from './artifacts'
@@ -1399,12 +1399,12 @@ export async function deleteResource(id: string, opt?: CombinedOptions & { dryRu
         await putState(state)
     }
 
-    if (id === 'ALL_CUSTOM') {
-        const state = await readState()
-        if (!state) {
-            return
-        }
+    const state = await readState()
+    if (!state) {
+        return
+    }
 
+    if (id === 'ALL_CUSTOM') {
         for (const r of state.resources) {
             if (r.type === 'synapse_resource' && (r.name.endsWith('--Example')) || r.name.endsWith('--Custom')) {
                 await _deleteResource(`${r.type}.${r.name}`)
@@ -1414,7 +1414,8 @@ export async function deleteResource(id: string, opt?: CombinedOptions & { dryRu
         return 
     }
 
-    if (opt?.force) {
+    const perfectMatch = !!state.resources.find(x => `${x.type}.${x.name}` === id)
+    if (opt?.force || perfectMatch) {
         getLogger().log(`Treating target as an absolute reference`)
         await _deleteResource(id)
 
@@ -2119,7 +2120,22 @@ export async function emitBfs(target?: string, opt?: CombinedOptions & { isEmit?
 
     // XXX: assumes it's a hash
     if (target && path.basename(target).length === 64) {
-        const data = await getFs().readFile(target)
+        const data = await getFs().readFile(target).catch(async e => {
+            throwIfNotFileNotFoundError(e)
+
+            const indexData = await getDataRepository().readData(path.basename(target))
+            const index = JSON.parse(Buffer.from(indexData).toString('utf-8'))
+
+            const dest = path.resolve('.vfs-dump')
+            for (const [k, v] of Object.entries(index.files)) {
+                await getFs().writeFile(path.resolve(dest, k), await getDataRepository().readData((v as any).hash))
+            }    
+        })
+
+        if (!data) {
+            return
+        }
+
         const block = openBlock(Buffer.from(data))
         const index = JSON.parse(block.readObject(path.basename(target)).toString('utf-8'))
 
@@ -2538,10 +2554,17 @@ async function loadMovedIntoTemplate(fileName: string, merge = true) {
             return false
         }
 
+        if (withoutDupes.length === 1 && withoutDupes[0].from === from) {
+            getLogger().log(`Overriding move: ${from} -> ${to} [previvously ${withoutDupes[0].to}]`)
+            checked.splice(checked.indexOf(withoutDupes[0]), 1, { from, to })
+            return true
+        }
+
         const overrides = withoutDupes.filter(x => x.to === to)
         if (overrides.length === 1) {
             getLogger().log(`Overriding move: ${from} [previvously ${overrides[0].from}] -> ${to}`)
             checked.splice(checked.indexOf(overrides[0]), 1, { from, to })
+            return true
         } else {
             getLogger().warn(`Found conflicting move: ${from} -> ${to}`, withoutDupes)
         }
@@ -2637,9 +2660,18 @@ export async function listDeployments(type?: string, opt?: CombinedOptions & { a
 
         if (!opt?.all && rel.startsWith('..')) continue
 
+        const stats = await getFs().stat(v.workingDirectory).catch(throwIfNotFileNotFoundError)
+        if (stats?.type !== 'directory') {
+            getLogger().log('Removing invalid program', v.workingDirectory)
+            // TODO: this orphans the app
+            await workspaces.deleteProgram(v.projectId, v.programId)
+            continue
+        }
+
         const s = await readState(getDeploymentFs(k, v.programId, v.projectId))
         const isRunning = s && s.resources.length > 0
-        const info = `(${rel || '.'}) [${isRunning ? 'RUNNING' : 'STOPPED'}]${v.environment ? ` [env: ${v.environment}]` : ''}`
+        const status = colorize(isRunning ? 'green' : 'gray', isRunning ? 'RUNNING' : 'STOPPED')
+        const info = `(${rel || '.'}) [${status}]${v.environment ? ` [env: ${v.environment}]` : ''}`
         printLine(`${k} ${info}`)
     }
 }
@@ -2821,7 +2853,7 @@ export async function listCommitsCmd(mod: string, opt?: CombinedOptions & { useP
     }
 
     if (!opt?.useProgram) {
-        printLine(`${'Timestamp'.padEnd(timestampWidth, ' ')} ${'Process'.padEnd(hashWidth, ' ')} ${'Program'.padEnd(hashWidth, ' ')} ${'IsTest?'}`)
+        printLine(`${'Timestamp'.padEnd(timestampWidth, ' ')} ${'Deployment'.padEnd(hashWidth, ' ')} ${'Program'.padEnd(hashWidth, ' ')} ${'IsTest?'}`)
         for (const c of commits) {
             printLine(c.timestamp, c.storeHash.slice(0, hashWidth), c.programHash?.slice(0, hashWidth), !!c.isTest)
         }
@@ -2978,7 +3010,8 @@ async function compileIfNeeded(target?: string, skipSynth = true) {
 }
 
 async function getDeploymentStatus(target: string, deployables: Record<string, string>) {
-    const incr = createIncrementalHost({})
+    const opt = await getResolvedTsConfig()
+    const incr = createIncrementalHost(opt?.options ?? {})
 
     const [deps, info, sources] = await Promise.all([
         incr.getCachedDependencies(path.resolve(getWorkingDir(), target)),
@@ -3014,6 +3047,7 @@ async function getDeploymentStatus(target: string, deployables: Record<string, s
     }
 
     return {
+        info,
         isTargetDeployable,
         needsDeploy,
         staleDeploys,
@@ -3021,46 +3055,92 @@ async function getDeploymentStatus(target: string, deployables: Record<string, s
     }
 }
 
-async function validateTargetsForExecution(targets: string, deployables: Record<string, string>) {
+async function validateTargetsForExecution(targets: string, deployables: Record<string, string>, canPrompt = process.stdin.isTTY) {
     const status = await getDeploymentStatus(targets, deployables)
+    const resourcesNeedDeployMessage = colorize('brightRed', 'Resources in the target file need to be deployed')
 
-    if (status.needsDeploy.length > 0) {
-        // TODO: automatically deploy for "local" (or if the user opts-in for other targets)
-        throw new RenderableError(`Program not deployed`, () => {
-            function printSuggestion() {
-                printLine()
+    function printNotDeployedError() {
+        function printSuggestion() {
+            printLine()
 
-                const deployCmd = renderCmdSuggestion('deploy', status.needsDeploy)
-                printLine(`Run ${deployCmd} first and try again.`)
-                printLine()
-            }
+            const deployCmd = renderCmdSuggestion('deploy', status.needsDeploy)
+            printLine(`Run ${deployCmd} first and try again.`)
+            printLine()
+        }
 
-            if (status.needsDeploy.length === 1 && status.needsDeploy[0] === targets) {
-                printLine(colorize('brightRed', 'Resources in the target file need to be deployed'))
+        if (status.needsDeploy.length === 1 && status.needsDeploy[0] === targets) {
+            printLine(resourcesNeedDeployMessage)
+            printSuggestion()
+            return
+        }
+
+        // Implies length >= 2
+        if (status.needsDeploy.includes(targets)) {
+            printLine(colorize('brightRed', 'The target file and its dependencies have not been deployed'))
+        } else {
+            if (status.needsDeploy.length === 1) {
+                printLine(colorize('brightRed', 'Dependency has not been deployed'))
                 printSuggestion()
                 return
             }
 
-            // Implies length >= 2
-            if (status.needsDeploy.includes(targets)) {
-                printLine(colorize('brightRed', 'The target file and its dependencies have not been deployed'))
-            } else {
-                if (status.needsDeploy.length === 1) {
-                    printLine(colorize('brightRed', 'Dependency has not been deployed'))
-                    printSuggestion()
-                    return
-                }
+            printLine(colorize('brightRed', 'Dependencies have not been deployed'))
+        }
 
-                printLine(colorize('brightRed', 'Dependencies have not been deployed'))
+        printLine('Needs deployment:')
+        for (const f of status.needsDeploy) {
+            printLine(`    ${f}`)
+        }
+
+        printSuggestion()
+    }
+
+    async function promptForDeploy(message: string) {
+        printLine(message)
+        print(colorize('blue', 'Deploy now?'))
+
+        const bt = getBuildTargetOrThrow()
+        const canDefaultYes = !bt.environmentName || bt.environmentName === 'local'
+
+        const resp = await promptForInput(canDefaultYes ? ' (Y/n): ' : ' (y/N): ')
+
+        function canDeploy() {
+            const trimmed = resp.trim().toLowerCase()
+            if (!trimmed) {
+                return canDefaultYes
             }
 
-            printLine('Needs deployment:')
-            for (const f of status.needsDeploy) {
-                printLine(`    ${f}`)
+            switch (trimmed) {
+                case 'n':
+                case 'no':
+                    return false
+
+                case 'y':
+                case 'yes':
+                    return true
             }
 
-            printSuggestion()
-        })
+            return false
+        }
+    
+        if (!canDeploy()) {
+            return false
+        }
+    
+        await deploy([targets])
+        return true
+    }
+
+    if (status.needsDeploy.length > 0) {
+        if (!canPrompt) {
+            throw new RenderableError('Program not deployed', printNotDeployedError)
+        }
+
+        if (!(await promptForDeploy(resourcesNeedDeployMessage))) {
+            throw new CancelError('Cancelled deploy')
+        }
+
+        return status
     }
 
     // If the target file isn't a deployable AND its deps are stale, we will fail
@@ -3072,13 +3152,21 @@ async function validateTargetsForExecution(targets: string, deployables: Record<
                 printLine(colorize('brightRed', 'The target\'s dependencies have not been deployed'))
             })
         }
-        printLine(colorize('brightYellow', 'Deployment has not been updated with the latest changes'))
+
+        const needsUpdateMessage = colorize('brightYellow', 'Deployment has not been updated with the latest changes')
+        if (!canPrompt) {
+            printLine(needsUpdateMessage)
+        } else {
+            await promptForDeploy(needsUpdateMessage)
+        }
     }
 
     return status
 }
 
-export async function run(name: string | undefined, args: string[], opt?: CombinedOptions & { skipValidation?: boolean; skipCompile?: boolean }) {
+type RunOptions = CombinedOptions & { skipValidation?: boolean; skipCompile?: boolean; noDeploy?: boolean }
+
+export async function run(name: string | undefined, args: string[], opt?: RunOptions) {
     const maybeCmd = name ? await maybeGetPkgScript(name) : undefined
     if (maybeCmd) {
         getLogger().log(`Running package script: ${name}`)
@@ -3105,6 +3193,11 @@ export async function run(name: string | undefined, args: string[], opt?: Combin
         throw new Error(`No executables found`)
     }
 
+    // Normalize name relative to cwd
+    if (name) {
+        name = makeRelative(getBuildTargetOrThrow().workingDirectory, name)
+    }
+
     const deployables = files.deployables ?? {}
     const entries = Object.entries(executables)
     const match = !name ? entries[0] : entries.find(([k, v]) => k === name)
@@ -3115,7 +3208,7 @@ export async function run(name: string | undefined, args: string[], opt?: Combin
     const [source, output] = match
 
     if (!opt?.skipValidation) {
-        const status = await validateTargetsForExecution(source, deployables)
+        const status = await validateTargetsForExecution(source, deployables, !opt?.noDeploy)
 
         const resolved = status.isTargetDeployable
             ? await resolveReplTarget(source)
@@ -3450,7 +3543,15 @@ export async function inspectBlock(target: string, opt?: any) {
     printLine(colorize('green', 'No issues found'))
 }
 
-export async function printFsStats() {
+export async function printFsStats(opt?: { all?: boolean }) {
+    if (opt?.all) {
+        const repoStats = await collectAllStats(getDataRepository())
+        const stats = { ...mergeRepoStats(repoStats), type: 'unknown' as const }
+        await printStats('ALL', stats)
+        await printTopNLargestObjects(stats)
+        return
+    }
+
     const head = workspaces.toProgramRef(getBuildTargetOrThrow())
     const stats = await collectStats(getDataRepository(), head)
     await printStats(head, stats)

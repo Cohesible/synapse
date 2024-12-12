@@ -1873,7 +1873,12 @@ export function renderSymbolLocation(sym: Pick<Symbol, 'line' | 'column' | 'file
     const pos = `:${sym.line + 1}:${sym.column + 1}`
     const ref = sym.packageRef ?? sym.specifier
 
-    return `${sym.fileName}${includePosition ? pos : ''}${ref ? ` (${ref})` : ''}`
+    // TODO: it'd be useful to link directly to the source file when it's in the current project
+    if (ref) {
+        return `[${ref}]`
+    }
+
+    return `${sym.fileName}${includePosition ? pos : ''}`
 }
 
 export function renderSymbol(sym: Symbol, includeFileName = true, includePosition = false) {

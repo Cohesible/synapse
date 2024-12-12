@@ -31,13 +31,6 @@ interface ParsedConfig {
 // "verbatimModuleSyntax": true,
 // "noEmit": true,
 
-function getDefaultTsConfig(targetFiles: string[]) {
-    return {
-        include: targetFiles,
-        compilerOptions: {},
-    }
-}
-
 function applyDefaults(opt: ts.CompilerOptions) {
     // FIXME: move to esm (high priority)
     // Also a lot of these should be defaults
@@ -76,11 +69,40 @@ function checkTsDiags(diags: ts.Diagnostic[]) {
     throw new Error(`Failed to parse "tsconfig.json":\n\t${formatted}`)
 }
 
+async function gatherNestedDirs(baseDir: string) {
+    const dirs: string[] = []
+
+    async function scan(dir: string, checkForPackage = true) {
+        if (checkForPackage) {
+            const filesToCheck = ['package.json', 'tsconfig.json']
+            for (const f of filesToCheck) {
+                if (await getFs().fileExists(path.resolve(dir, f))) {
+                    dirs.push(dir)
+                    return
+                }
+            }  
+        }
+
+        const promises: Promise<void>[] = []
+        for (const f of await getFs().readDirectory(dir)) {
+            if (f.type !== 'directory') continue
+    
+            promises.push(scan(path.resolve(dir, f.name)))
+        }
+        
+        await Promise.all(promises)
+    }
+
+    await scan(baseDir, false)
+
+    return dirs
+}
+
 function getTsConfigFromText(configText: string | void, fileName: string, targetFiles?: string[]) {
     if (!configText) {
         getLogger().debug(`No tsconfig.json, using default`)
 
-        return getDefaultTsConfig(targetFiles ?? ['*'])
+        return {}
     }
 
     const parseResult = ts.parseConfigFileTextToJson(fileName, configText)
@@ -188,8 +210,14 @@ async function getTsConfig(
 }
 
 async function globTsFiles(fs: Fs, workingDir: string, cmd: ParsedConfig['cmd']) {
-    const exclude = cmd.raw?.exclude ?? ['node_modules']
-    const include = cmd.raw?.include ?? ['*']
+    const exclude = cmd.raw?.exclude ?? [
+        'node_modules', 
+        ...(await gatherNestedDirs(workingDir)).map(p => makeRelative(workingDir, p))
+    ]
+
+    getLogger().log(exclude)
+
+    const include = cmd.raw?.include ?? ['*', '**/*']
     const files = await glob(fs, workingDir, include, exclude)
     const filtered = files.filter(f => !!f.match(/\.tsx?$/))
 
