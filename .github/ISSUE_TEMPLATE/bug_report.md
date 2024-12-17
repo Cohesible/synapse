@@ -7,17 +7,39 @@ assignees: ''
 
 ---
 
+<!-- Tip: run `synapse report-bug` for easier bug reporting -->
+
 ### Problem
 <!--
-A clear and concise description of what the problem is. 
-Add screenshots and/or code if it helps illustrate the problem.
+A clear and concise description of the problem. 
+Screenshots (without sensitive info!) are optional but greatly appreciated when the problem relates to UI. 
+
+Be ready to answer clarifying questions from maintainers.
+
+Ex. `run ./main.ts` doesn't work, it fails with YYY
 -->
 
 ### System Info
 <!-- Run `synapse print-info` and paste the output here -->
 
-<!-- ### Reproduction Steps -->
-<!-- Optional. But greatly appreciated. -->
+<!-- 
+### Reproduction Steps 
+-->
+<!-- 
+If you're able to semi-reliably reproduce this issue, include the steps (CLI commands, file edits, etc.) taken to hit the bug. Incomplete steps or rough guidance are OK!
 
-<!-- ### Additional context -->
-<!-- Optional. Include anything you feel might be relevant such as specifics to your setup. -->
+Ex.
+1. `synapse init`
+2. `synapse deploy`
+3. `synapse run ./main.ts` 
+
+Ex.
+It sometimes happens after I change the code and run `deploy`.
+-->
+
+<!--
+### Related Issues
+-->
+<!--
+If you’re aware of similar issues, feel free to link them here. If you didn't search, don't worry about it, maintainers will handle reconciling duplicates.
+-->

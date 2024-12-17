@@ -9,10 +9,10 @@ export async function main(...args: string[]) {
 }
 
 // !commands
-// synapse deploy main.ts
 // synapse deploy ./main.ts
+// synapse deploy main.ts
 // @expectEqual "$(synapse run ./main.ts)" "{ message: 'hello, world!' }"
 //
-// synapse deploy folder/hello.ts
 // synapse deploy ./folder/hello.ts
+// synapse deploy folder/hello.ts
 // @expectEqual "$(synapse run ./folder/hello.ts)" "{ message: 'hello, world?' }"

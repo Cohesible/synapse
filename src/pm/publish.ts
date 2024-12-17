@@ -928,8 +928,12 @@ async function maybePromptToSourceOrReload(synapseDir: string, profilePath: stri
         return
     }
 
-    console.log(colorize('blue', 'Restart your terminal or run the following to complete installation:\n'))
-    console.log(`    source "${replaceWithTilde(profilePath)}"`)
+    // Not robust
+    const maybeQuote = (s: string) => s.includes(' ') ? `"${profilePath}"` : s
+
+    console.log(colorize('green', 'Restart your terminal or run the following to complete installation:'))
+    console.log(`    source ${maybeQuote(replaceWithTilde(profilePath))}`)
+    console.log('')
 }
 
 function findBinPathsSync(pkgDir: string, fs = getFs()) {

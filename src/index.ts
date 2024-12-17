@@ -377,6 +377,9 @@ async function checkCompileForDeploy(targets: string[], opt?: DeployOpt2) {
 }
 
 export async function deploy(targets: string[], opt: DeployOpt2 = {}) {
+    const workingDir = getBuildTargetOrThrow().workingDirectory
+    targets = targets.map(x => makeRelative(workingDir, resolveRelative(workingDir, x)))
+
     await validateTargets(targets)
 
     const programFsHash = opt?.sessionCtx?.buildTarget.programHash
@@ -1020,6 +1023,9 @@ export async function showLogs(patterns: string, opt?: DeployOptions) {
 type PlanOptions = DeployOptions & { symbols?: string[]; forceRefresh?: boolean; planDepth?: number; debug?: boolean; expectNoChanges?: boolean }
 
 export async function plan(targets: string[], opt: PlanOptions = {}) {
+    const workingDir = getBuildTargetOrThrow().workingDirectory
+    targets = targets.map(x => makeRelative(workingDir, resolveRelative(workingDir, x)))
+
     const maybeMoved = await checkCompileForDeploy(targets, opt)
 
     const session = await getSession(getTargetDeploymentIdOrThrow(), undefined, { ...opt, noSave: true })
