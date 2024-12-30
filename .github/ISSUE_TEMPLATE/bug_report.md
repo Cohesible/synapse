@@ -17,15 +17,7 @@ Screenshots (without sensitive info!) are optional but greatly appreciated when 
 Be ready to answer clarifying questions from maintainers.
 
 Ex. `run ./main.ts` doesn't work, it fails with YYY
--->
 
-### System Info
-<!-- Run `synapse print-info` and paste the output here -->
-
-<!-- 
-### Reproduction Steps 
--->
-<!-- 
 If you're able to semi-reliably reproduce this issue, include the steps (CLI commands, file edits, etc.) taken to hit the bug. Incomplete steps or rough guidance are OK!
 
 Ex.
@@ -36,6 +28,9 @@ Ex.
 Ex.
 It sometimes happens after I change the code and run `deploy`.
 -->
+
+### System Info
+<!-- Run `synapse print-info` and paste the output here -->
 
 <!--
 ### Related Issues
