@@ -2293,7 +2293,7 @@ export async function writeToNodeModules(
                     }
 
                     // Copy `package.json` to help TypeScript
-                    const patterns = typesOnly ? ['**/*.d.ts', 'package.json'] : ['**']
+                    const patterns = typesOnly ? ['**/*.d.ts', 'package.json'] : ['**/*']
                     // A decent chunk of a time is just spent globbing
                     // We also aren't streaming the discovered files
                     const files = await glob(fs, pkgLocation, patterns) 

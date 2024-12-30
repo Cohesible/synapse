@@ -160,7 +160,15 @@ export function createTemplateService(
         const programFs = programFsHash ? await getFsFromHash(programFsHash) : getProgramFs()
         const template = await getBinaryTemplate(programFs)
         if (!template) {
-            throw new Error(`No template found`)
+            // Support deployments before we moved to the binary format
+            const oldTemplate = await utils.tryReadJson<TfJson>(programFs, 'template.json')
+            if (!oldTemplate) {
+                throw new Error('Nothing to deploy')
+            }
+
+            await getFs().writeFile(oldPath, JSON.stringify(oldTemplate))
+            _template = oldTemplate
+            return oldPath
         }
 
         _rawTemplate = template as Buffer

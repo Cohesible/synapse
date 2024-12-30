@@ -136,7 +136,7 @@ export async function getSortedLogs() {
 
     const stats = await Promise.all(promises)
 
-    return stats.filter(isNonNullable).sort((a, b) => b.ctimeMs - a.ctimeMs)
+    return stats.filter(isNonNullable).sort((a, b) => b.mtimeMs - a.mtimeMs)
 }
 
 const maxLogs = 10

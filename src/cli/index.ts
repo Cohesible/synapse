@@ -202,7 +202,7 @@ export function main(...args: string[]) {
         loop()
     }
 
-    async function createProfiler(): Promise<AsyncDisposable> {
+    async function createProfiler() {
         const session = new inspector.Session()
         session.connect()
 
@@ -232,7 +232,7 @@ export function main(...args: string[]) {
             })
         }
 
-        return { [Symbol.asyncDispose]: dispose }
+        return { dispose }
     }
 
     function getProfiler() {
@@ -242,6 +242,9 @@ export function main(...args: string[]) {
 
         return createProfiler()
     }
+
+    // Don't show the same errors during disposal
+    let handledError: any
 
     async function runWithLogger() {
         const isCi = !!getCiType()
@@ -271,10 +274,13 @@ export function main(...args: string[]) {
             }
         }
 
+        const profiler = await getProfiler()
+
         try {
-            await using profiler = await getProfiler()
             await _main(args)
         } catch (e) {
+            handledError = e
+
             if (e instanceof CancelError) {
                 didThrow = true
                 return
@@ -295,6 +301,8 @@ export function main(...args: string[]) {
         } finally {
             await dispose()
             await disposable?.dispose() // No more log events will be emitted
+
+            await profiler?.dispose()
 
             setTimeout(() => {
                 process.stderr.write(`Forcibly shutting down\n`)
@@ -342,7 +350,10 @@ export function main(...args: string[]) {
     }
 
     return runWithContext({ abortSignal: ac.signal, selfPath, selfBuildType }, runWithLogger).catch(e => {
-        process.stderr.write((e as any).message + '\n')
+        // We only get here if disposal fails as well
+        if (handledError !== e) {
+            process.stderr.write((e as any).message + '\n')
+        }
         process.exit(100)
     })
 }

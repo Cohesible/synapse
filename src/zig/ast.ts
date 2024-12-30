@@ -231,6 +231,10 @@ function fieldDeclToProperty(node: zig.FieldDecl) {
         ty2 = createSyntheticUnion(ty2.child_type)
     }
 
+    if (node.initializer) {
+        isOptional = true
+    }
+
     return ts.factory.createPropertySignature(
         undefined,
         node.name,
@@ -565,6 +569,13 @@ export async function getImportedModulesFromFile(target: string) {
     return { ast, deps }
 }
 
+const pointerSizes = {
+    'One': '*',
+    'Many': '[*]',
+    'Slice': '[]',
+    'C': '[c*]'
+}
+
 export function renderNode(node: zig.Node): string {
     const n = createSyntheticUnion(node)
     switch (n.$type) {
@@ -574,10 +585,13 @@ export function renderNode(node: zig.Node): string {
             return `${renderNode(n.exp)}(${n.args.map(renderNode).join(', ')})`
         case 'field_access':
             return `${renderNode(n.exp)}.${n.member}`
-        case 'ptr_type':
-            return `${n.is_const ? `const ` : ''}*${renderNode(n.child_type)}`
+        case 'ptr_type': {
+            return `${pointerSizes[n.size as keyof typeof pointerSizes]}${n.is_const ? `const ` : ''}${renderNode(n.child_type)}`
+        }
         case 'error_union':
             return `${n.lhs ? renderNode(n.lhs) : ''}!${renderNode(n.rhs)}`
+        case 'optional_type':
+            return `?${renderNode(n.child_type)}`
     }
 
     throw new Error(`Unhandled type: ${n.$type}`)

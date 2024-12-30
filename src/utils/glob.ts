@@ -168,7 +168,7 @@ function matchSet(char: string, s: CharacterSet, caseInsensitive = false) {
     return false
 }
 
-function matchComponent(segment: string, pattern: Exclude<GlobComponent, Separator>[], matchHidden = false, caseInsensitive = false): boolean {
+function matchSegment(segment: string, pattern: Exclude<GlobComponent, Separator>[], matchHidden = false, caseInsensitive = false): boolean {
     if (segment[0] === '.' && !matchHidden && pattern[0].type === 'wildcard') {
         return false
     }
@@ -260,7 +260,7 @@ async function multiGlob(fs: GlobHost, dir: string, patterns: Exclude<GlobCompon
         const opt = options.get(index)
         const matchHidden = opt?.matchHidden ?? !!opt?.exclude
 
-        return matchComponent(name, pattern, matchHidden, opt?.caseInsensitive)
+        return matchSegment(name, pattern, matchHidden, opt?.caseInsensitive)
     }
 
     const literalSegments: [index: number, group: Literal[]][] = []
@@ -473,6 +473,10 @@ async function multiGlob(fs: GlobHost, dir: string, patterns: Exclude<GlobCompon
     return res
 }
 
+// This implementation was/is intended to match `tsc`, resulting in some quirks:
+// - `*` only matches files
+// - `exclude` implicitly globstars directories
+// - `**` by itself does nothing
 export function glob(fs: GlobHost, dir: string, include: string[], exclude: string[] = []) {
     const patterns = include.map(parseGlobPattern).map(splitComponents)
     const options = new Map<number, PatternOptions>()

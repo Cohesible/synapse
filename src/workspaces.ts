@@ -127,6 +127,12 @@ export function getGlobalZigBuildDir() {
     return path.resolve(getBuildTargetOrThrow().buildDir, 'zig')
 }
 
+export function getWatcherStateFilePath() {
+    const bt = getBuildTargetOrThrow()
+
+    return path.resolve(getGlobalCacheDirectory(), 'watcher-indices', getHash(toProgramRef(bt)))
+}
+
 export interface Project {
     readonly id: string
     readonly name: string

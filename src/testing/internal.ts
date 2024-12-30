@@ -15,6 +15,7 @@ const skipCleanCommand = '@skipClean'
 const renameCommand = '@rename'
 const expectEqualCommand = '@expectEqual'
 const inputCommand = '@input'
+const commentCommand = '@toggleComment'
 
 function parseCommands(text: string) {
     const lines = text.split('\n')
@@ -27,9 +28,11 @@ function parseCommands(text: string) {
     for (let i = directive + 1; i < lines.length; i++) {
         const line = lines[i]
         if (!line.startsWith('//')) break
+        if (line.startsWith('#')) continue
         
-        const [command, ...rest] = line.slice(2).split('#')
-        const comment = rest.join('#')
+        // We require a space after `#` for comments appended to commands
+        const [command, ...rest] = line.slice(2).split('# ')
+        const comment = rest.join('# ')
 
         const trimmed = command.trim()
         if (trimmed) {
@@ -99,6 +102,28 @@ function renderCommands(fileName: string, commands: string[], synapseCmd = proce
             continue
         }
 
+        if (c.startsWith(commentCommand)) {
+            const args = parseShell(c.slice(commentCommand.length + 1))
+            if (args.length === 0) {
+                throw new Error(`Expected one to two arguments`)
+            }
+
+            const subject = args.length === 1 ? fileName : args[0]
+            const lineNumber = Number(args[args.length-1])
+            if (Number.isNaN(lineNumber)) {
+                throw new Error(`Line is not a number: ${args[args.length-1]}`)
+            }
+
+            if (subject === fileName) {
+                hasRenames = true
+            }
+
+            inner.push(`__LINE=$(sed -n "${lineNumber}p" "${subject}")`)
+            inner.push(`if [[ "$__LINE" =~ "// " ]]; then __PATTERN='${lineNumber}s&^// &&'; else __PATTERN='${lineNumber}s&^&// &'; fi`)
+            inner.push(`sed -i '' -r "$__PATTERN" "${subject}"`)
+            continue
+        }
+
         // Skip all `@` commands for forwards compat
         if (c.startsWith('@')) {
             continue
@@ -115,7 +140,7 @@ function renderCommands(fileName: string, commands: string[], synapseCmd = proce
 
         const index = c.indexOf(expectFailCommand)
         if (index !== -1) {
-            const command = `${c.slice(0, index)}; if [[ $? -eq 0 ]]; then echo "Expected command ${i} to fail"; false; fi`
+            const command = `(${c.slice(0, index)}; if [[ $? -eq 0 ]]; then echo "Expected command ${i} to fail"; false; fi)`
             inner.push(command)
         } else {
             inner.push(c)
@@ -123,8 +148,8 @@ function renderCommands(fileName: string, commands: string[], synapseCmd = proce
     }
 
     if (statements.length > 0) {
-        statements.unshift('export _EXIT_CODE=$?')
-        statements.push('exit $_EXIT_CODE')
+        statements.unshift('export __EXIT_CODE=$?')
+        statements.push('exit $__EXIT_CODE')
     }
 
     const cmd = [

@@ -63,6 +63,7 @@ import { formatEvents, getLogService } from './services/logs'
 import { getNeededDependencies } from './pm/autoInstall'
 import { maybeLoadEnvironmentVariables } from './runtime/env'
 import { pointerPrefix } from './build-fs/pointers'
+import { initOrUpdateWatcherState, maybeDetectChanges } from './utils/stateless-watcher/binding'
 
 // TODO: https://github.com/pulumi/pulumi/issues/3388
 
@@ -324,10 +325,11 @@ async function checkCompileForDeploy(targets: string[], opt?: DeployOpt2) {
         return
     }
 
-    const doCompile = (forcedSynth?: boolean, targetFiles = targets) => compile(targetFiles, { 
+    const doCompile = (forcedSynth?: boolean, targetFiles = targets, skipWatcher = true) => compile(targetFiles, { 
         forcedSynth, 
         incremental: true, 
-        skipSummary: true, 
+        skipSummary: true,
+        skipWatcher,
         hideLogs: true, 
         deployTarget: opt?.deployTarget,
     })
@@ -347,9 +349,12 @@ async function checkCompileForDeploy(targets: string[], opt?: DeployOpt2) {
         // We never synthed, need a full compile
         if (!sources) {
             getLogger().log('No sources found, compiling all')
-            await doCompile(undefined, [])
+            await doCompile(undefined, [], false)
         } else if (sources.stale.size > 0) {
             getLogger().log('Found stale sources, recompiling')
+            await doCompile()
+        } else if (sources.removed.size > 0) {
+            getLogger().log('Found removed sources, recompiling', [...sources.removed])
             await doCompile()
         } else if (opt?.deployTarget) {
             const prev = await getPreviousPkg()
@@ -607,7 +612,7 @@ export async function destroy(targets: string[], opt?: CombinedOptions & { dryRu
 
         throwIfFailed(view, result.error)
 
-        // Only delete this on a "full" destroy
+        // Only delete this on a "full" destroy 
         if (result.state.resources.length === 0) {
             await session.templateService.cleanState()
         
@@ -878,19 +883,19 @@ export async function runTests(targets: string[], opt?: TestOptions) {
     const suites = await listTestSuites(session.templateService, filter)
     const tests = await listTests(session.templateService, filter)
 
-    const targetResources = [
+    const targetResources = new Set([
         ...Object.keys(suites),
         ...Object.keys(tests),
-    ]
+    ])
 
     const targetModules = new Set<string>()
 
     // FIXME: figure out a way to avoid doing this. Right now this is done to ensure 
     // that any resources that cause "side-effects" are also deployed
-    const suiteKeys = [
+    const suiteKeys = new Set([
         ...Object.values(suites).map(x => `${x.fileName}:${x.id}`),
         ...Object.values(tests).map(x => `${x.fileName}:${x.parentId}`),
-    ].filter(isNonNullable)
+    ].filter(isNonNullable))
 
     const resources = (await session.templateService.getTemplate()).resource
     for (const [k, v] of Object.entries(resources)) {
@@ -898,8 +903,8 @@ export async function runTests(targets: string[], opt?: TestOptions) {
             const parsed = parseModuleName((v2 as any).module_name)
             const key = `${k}.${k2}`
             const testKey = parsed.testSuiteId !== undefined ? `${parsed.fileName}:${parsed.testSuiteId}` : undefined
-            if (testKey!== undefined && suiteKeys.includes(testKey) && !targetResources.includes(key)) {
-                targetResources.push(key)
+            if (testKey!== undefined && suiteKeys.has(testKey) && !targetResources.has(key)) {
+                targetResources.add(key)
                 targetModules.add(parsed.fileName)
             }
         }
@@ -958,7 +963,7 @@ export async function runTests(targets: string[], opt?: TestOptions) {
                 ...opt, 
                 autoApprove: true, 
                 useTests: true,
-                targetResources: targetResources,
+                targetResources: [...targetResources],
             }).catch(err => {
                 // Rolling back is much more important than a clean destruction of test resources
                 if (!shouldRollback) {
@@ -986,7 +991,7 @@ export async function testGlob(patterns: string[], opt?: DeployOptions) {
 
     await runTask('glob', 'glob', async () => {
         const res = await glob(getFs(), getWorkingDir(), patterns, excluded ? [excluded] : undefined)
-        printJson(res)
+        printJson(res.map(x => path.relative(getWorkingDir(), x)))
     }, 25)
 }
 
@@ -1961,8 +1966,8 @@ export async function startWatch(targets?: string[], opt?: CompilerOptions & { a
     }
 }
 
-async function resolveConfigAndDeps(targets: string[], opt?: CombinedOptions & { skipInstall?: boolean }) {
-    const config = await resolveProgramConfig(opt, targets.length > 0 ? targets : undefined)
+async function resolveConfigAndDeps(opt?: CombinedOptions & { skipInstall?: boolean }) {
+    const config = await resolveProgramConfig(opt)
     const incrementalHost = createIncrementalHost(config.tsc.cmd.options)
 
     const deps = await runTask('parse', 'deps', async () => {
@@ -2016,6 +2021,7 @@ type CompileOptions = CombinedOptions & {
     skipSynth?: boolean
     skipInstall?: boolean
     skipSummary?: boolean
+    skipWatcher?: boolean
     hideLogs?: boolean
     logSymEval?: boolean
     forcedInfra?: string[]
@@ -2037,7 +2043,13 @@ async function getNeedsSynth() {
 export async function compile(targets: string[], opt?: CompileOptions) {
     const view = createCompileView(opt)
 
-    const { config, incrementalHost } = await resolveConfigAndDeps(targets, opt)
+    const { config, incrementalHost } = await resolveConfigAndDeps(opt)
+
+    const shouldRunWatcher = !opt?.skipWatcher && opt?.incremental !== false
+    const watcherPromise = shouldRunWatcher
+        ? runTask('compile', 'init watcher state', () => initOrUpdateWatcherState(), 1)
+        : undefined
+
     const builder = createProgramBuilder(config, incrementalHost)
     const { entrypointsFile } = await runTask('compile', 'all', () => builder.emit(), 100)
 
@@ -2052,6 +2064,7 @@ export async function compile(targets: string[], opt?: CompileOptions) {
         await Promise.all([
             writeTemplate(template.binary),
             opt?.forcedSynth ? setNeedsSynth(false) : undefined,
+            watcherPromise,
         ])
 
         await commitProgram()
@@ -2063,6 +2076,7 @@ export async function compile(targets: string[], opt?: CompileOptions) {
             view.done()
         }
     } else {
+        await watcherPromise
         if (needsSynth && opt?.skipSynth) {
             await setNeedsSynth(true)
         }
@@ -2974,14 +2988,12 @@ async function compileIfNeeded(target?: string, skipSynth = true) {
 
     // TODO: we can skip synth if the stale files aren't apart of the synthesis dependency graph
     // TODO: if `run` automatically compiles anything, it should _always_ use the last-used settings
-    const { stale, sources } = await getStaleSources() ?? {}
-    if (!sources || (stale && stale.size > 0) || (target && !sources[target])) {
+    const { stale, removed, sources } = await getStaleSources() ?? {}
+    const compileOpt = { incremental: true, skipSummary: true, skipSynth: !!stale && skipSynth, skipWatcher: !!sources }
+    if (!sources || (stale && stale.size > 0) || (!skipSynth && removed && removed.size > 0)) {
         // We don't need to generate a template, we just want updated program analyses
         // TODO: mark the current compilation as "needs synth"
-        return compile(
-            target ? [target] : [],
-            { incremental: true, skipSummary: true, skipSynth: !!stale && skipSynth },
-        )
+        return compile(target ? [target] : [], compileOpt)
     }
 
     const workingDir = getWorkingDir()
@@ -2994,10 +3006,7 @@ async function compileIfNeeded(target?: string, skipSynth = true) {
     )
 
     if (zigGraph && zigGraph.changed.size > 0) {
-        return compile(
-            target ? [target] : [],
-            { incremental: true, skipSummary: true, skipSynth: !!stale && skipSynth },
-        )
+        return compile(target ? [target] : [], compileOpt)
     }
 
     if (skipSynth) {
@@ -3008,10 +3017,7 @@ async function compileIfNeeded(target?: string, skipSynth = true) {
     if (diff) {
         getLogger().log(`Synthesis environment variables changed: ${diff}`)
 
-        return compile(
-            target ? [target] : [],
-            { incremental: true, skipSummary: true },
-        )
+        return compile(target ? [target] : [], { ...compileOpt, skipSynth: false })
     }
 }
 
@@ -3292,20 +3298,53 @@ async function getPreviousDeployInfo() {
     return { state, hash, deploySources }
 }
 
-// TODO: we need to check if any new files were added to included dirs and
-// treat those additional files as stale
 async function getStaleSources(include?: Set<string>) {
-    const sources = await bfs.readSources()
-    const hasher = getFileHasher()
+    const [sources, changes] = await Promise.all([
+        bfs.readSources(),
+        maybeDetectChanges()
+    ])
+
     if (!sources) {
         return
     }
 
     // Check hashes
-    const stale = new Set<string>()
+    const hasher = getFileHasher()
     const workingDir = getWorkingDir()
+    const stale = new Set<string>()
+    const removed = new Set<string>()
+    const shouldSkip = new Set<string>()
+
+    if (changes) {
+        for (const k of Object.keys(sources)) {
+            shouldSkip.add(k)
+        }
+
+        for (const c of changes) {
+            if (c.is_added) {
+                getLogger().log('Found new source file', c.subpath)
+                stale.add(resolveRelative(workingDir, c.subpath))
+            } else if (c.is_removed) {
+                if (delete sources![c.subpath]) {
+                    getLogger().log('Found removed source file', c.subpath)
+                    removed.add(c.subpath)
+                    shouldSkip.delete(c.subpath)
+                } else {
+                    getLogger().log('Found extraneous removed file', c.subpath)
+                }
+            } else {
+                getLogger().log('Found changed source file', c.subpath)
+                shouldSkip.delete(c.subpath)
+
+                // Needed to handle re-checking potentially "deployable" files
+                include?.add(resolveRelative(workingDir, c.subpath))
+            }
+        }
+    }
 
     async function checkSource(k: string, v: { hash: string }) {
+        if (shouldSkip.has(k)) return
+
         const source = resolveRelative(workingDir, k)
         if (include && !include.has(source)) return
 
@@ -3319,14 +3358,14 @@ async function getStaleSources(include?: Set<string>) {
 
     await Promise.all(Object.entries(sources).map(([k, v]) => checkSource(k, v)))
 
-    return { stale, sources }
+    return { stale, sources, removed }
 }
 
 // This is used to see if we need to re-synth
 async function getStaleDeployableSources(targets?: string[]) {
     const deployables = await getDeployables()
     if (!deployables) {
-        return
+        return getStaleSources()
     }
 
     const resolvedOptions = await getResolvedTsConfig()
@@ -3334,8 +3373,15 @@ async function getStaleDeployableSources(targets?: string[]) {
     const incr = createIncrementalHost(resolvedOptions?.options ?? {})
     const deps = await incr.getCachedDependencies(...(deployableSet))
     const allDeps = getAllDependencies(deps, targets?.map(x => resolveRelative(getWorkingDir(), x)) ?? [...deployableSet])
-    
-    return getStaleSources(allDeps.deps)
+    const result = await getStaleSources(allDeps.deps)
+    if (!result) {
+        return
+    }
+
+    // Small optimization: we don't need to resynth if the removed files aren't deployable
+    const removed = new Set([...result.removed].map(k => resolveRelative(getWorkingDir(), k)).filter(k => deployableSet.has(k)))
+
+    return { ...result, removed }
 }
 
 export async function showStatus(opt?: { verbose?: boolean }) {
@@ -3508,7 +3554,8 @@ export async function clean(opt?: { packages?: boolean; tests?: boolean; deploym
 
     await Promise.all([
         bt.deploymentId ? clearCachedTestResults() : undefined,
-        getDataRepository().deleteHead(workspaces.toProgramRef(bt))
+        getDataRepository().deleteHead(workspaces.toProgramRef(bt)),
+        getFs().deleteFile(workspaces.getWatcherStateFilePath()).catch(throwIfNotFileNotFoundError),
     ])
 }
 

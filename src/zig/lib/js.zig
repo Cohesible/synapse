@@ -65,6 +65,21 @@ pub const Object = opaque {
         return obj;
     }
 
+    pub fn wrapWithRef(ptr: *anyopaque) !struct { obj: *Object, ref: *Ref } {
+        const env = currentEnv;
+        const obj = try Object.init(env);
+
+        const f = struct {
+            pub fn f(_: *Env, _: ?*anyopaque, _: ?*anyopaque) callconv(.C) void {}
+        }.f;
+
+        var ref: *Ref = undefined;
+        try checkStatus(napi_wrap(env, @ptrCast(obj), ptr, &f, null, &ref));
+        try ref.ref(env);
+
+        return .{ .obj = obj, .ref = ref };
+    }
+
     pub fn unwrap(this: *Object) !*anyopaque {
         const env = currentEnv;
         var result: *anyopaque = undefined;
@@ -121,7 +136,7 @@ pub const Object = opaque {
                     var converter = w.initConverter();
                     defer converter.deinit();
 
-                    x.* = converter.fromJs(field.type, z[0][0]) catch return null;
+                    x.* = converter.fromValue(field.type, z[0][0]) catch return null;
 
                     return null;
                 }
@@ -144,13 +159,28 @@ pub const Object = opaque {
 
     pub fn toStruct(comptime T: type, converter: *ValueConverter, obj: *Object) !T {
         const s = getStruct(T) orelse return error.NotAStruct;
-
         var val: T = undefined;
 
         inline for (s.fields) |field| {
-            const v = try obj.getNamedProperty(converter.env, field.name);
             const r = &@field(val, field.name);
-            r.* = try converter.fromJs(field.type, v);
+            const v = try obj.getNamedProperty(converter.env, field.name);
+
+            // We don't strictly check if the property exists or not
+            // Test case:
+            // zig: pub fn f(s: struct { y: u32 = 1 }) u32 { return s.y; }
+            // js: console.log(f({}) // 1
+
+            // TODO: check if `field.type` is optional here (optimization)
+
+            if (comptime field.default_value != null) {
+                if (try converter.env.typeof(v) == .undefined) {
+                    r.* = @as(*const field.type, @alignCast(@ptrCast(field.default_value orelse unreachable))).*;
+                } else {
+                    r.* = try converter.fromValue(field.type, v);
+                }
+            } else {
+                r.* = try converter.fromValue(field.type, v);
+            }
         }
 
         return val;
@@ -265,8 +295,52 @@ const Class = opaque {
     }
 };
 
+
+fn getReferenceType(comptime T: type) ?type {
+    return switch (@typeInfo(T)) {
+        .Struct => |s| blk: {
+            if (!@hasField(T, "_T") or !@hasField(T, "ref")) break :blk null;
+
+            break :blk switch (@typeInfo(s.fields[2].type)) {
+                .Pointer => |a| a.child,
+                else => null,
+            };
+        },
+        else => null,
+    };
+}
+
+// Call `deinit` to allow the referenced value to be GC'd
+fn Reference(comptime T: type) type {
+    // TODO: validate type
+
+    return struct {
+        ref: *Ref,
+        env: *Env,
+
+        _T: *T = undefined,
+
+        pub fn init(env: *Env, val: *T) !@This() {
+            return .{
+                .env = env,
+                .ref = try Ref.init(env, @ptrCast(val), 1),
+            };
+        }
+
+        pub fn deinit(this: @This()) !void {
+            // TODO: prevent use-after-free
+            return this.ref.deinit(this.env);
+        }
+
+        pub fn getValue(this: *const @This()) !*T {
+            return @ptrCast(try this.ref.getValue(this.env));
+        }
+    };
+}
+
 const Ref = opaque {
     extern fn napi_create_reference(env: *Env, value: *Value, initial_refcount: u32, result: **Ref) Status;
+    extern fn napi_delete_reference(env: *Env, ref: *Ref) Status;
 
     extern fn napi_add_finalizer(env: *Env, obj: *Object, data: ?*anyopaque, cb: *const FinalizeFn, hint: ?*anyopaque, result: **Ref) Status;
 
@@ -276,6 +350,10 @@ const Ref = opaque {
         try checkStatus(status);
 
         return result;
+    }
+
+    pub fn deinit(this: *@This(), env: *Env) !void {
+        try checkStatus(napi_delete_reference(env, this));
     }
 
     fn Finalizer(comptime T: type) FinalizeFn {
@@ -297,9 +375,44 @@ const Ref = opaque {
 
         return result;
     }
+
+    extern fn napi_reference_ref(env: *Env, ref: *Ref, result: ?*u32) Status;
+
+    pub fn ref(this: *@This(), env: *Env) !void {
+        try checkStatus(napi_reference_ref(env, this, null));
+    }
 };
 
-const String = opaque {
+// XXX
+pub const ReferencedBuffer = struct {
+    data: []const u8,
+    source: *Value,
+    ref: *Ref,
+
+    pub fn init(env: *Env, val: *Value) !@This() {
+        const ref = try Ref.init(env, @ptrCast(val), 1);
+        var data: []const u8 = undefined;
+        if (try ArrayBufferRaw.isArrayBuffer(env, val)) {
+            const p = @as(*ArrayBufferRaw, @ptrCast(val));
+            data = try p.getBuffer(env);
+        } else {
+            const p = @as(*TypedArray, @ptrCast(val));
+            data = try p.toSlice(env, u8);
+        }
+
+        return .{
+            .data = data,
+            .source = val,
+            .ref = ref,
+        };
+    }
+
+    pub fn deinit(this: @This(), env: *Env) !void {
+        try this.ref.deinit(env);
+    }
+};
+
+pub const String = opaque {
     extern fn napi_get_value_string_latin1(env: *Env, value: *String, buf: [*]u8, bufsize: usize, result: ?*usize) Status;
     extern fn napi_get_value_string_utf8(env: *Env, value: *String, buf: ?[*]u8, bufsize: usize, result: ?*usize) Status;
     extern fn napi_get_value_string_utf16(env: *Env, value: *String, buf: [*]u16, bufsize: usize, result: ?*usize) Status;
@@ -312,6 +425,14 @@ const String = opaque {
     pub fn fromUtf8(env: *Env, str: []const u8) !*String {
         var result: *String = undefined;
         const status = napi_create_string_utf8(env, str.ptr, str.len, &result);
+        try checkStatus(status);
+
+        return result;
+    }
+
+    pub fn fromUtf8Pub(str: []const u8) !*String {
+        var result: *String = undefined;
+        const status = napi_create_string_utf8(currentEnv, str.ptr, str.len, &result);
         try checkStatus(status);
 
         return result;
@@ -593,6 +714,16 @@ const ArrayPointer = opaque {
     extern fn napi_get_element(env: *Env, object: *ArrayPointer, index: u32, result: **Value) Status;
     extern fn napi_delete_element(env: *Env, object: *ArrayPointer, index: u32, result: *bool) Status;
     extern fn napi_get_array_length(env: *Env, object: *ArrayPointer, result: *u32) Status;
+    extern fn napi_create_array(env: *Env, result: **ArrayPointer) Status;
+    extern fn napi_create_array_with_length(env: *Env, length: usize, result: **ArrayPointer) Status;
+
+    pub fn initCapacity(env: *Env, num: usize) !*ArrayPointer {
+        var result: *ArrayPointer = undefined;
+        const status = napi_create_array_with_length(env, num, &result);
+        try checkStatus(status);
+
+        return result;
+    }
 
     const IterateResult = enum(u8) {
         _exception,
@@ -706,6 +837,7 @@ pub const ArrayBufferRaw = opaque {
     extern fn napi_create_external_arraybuffer(env: *Env, data: *anyopaque, len: usize, cb: *const anyopaque, hint: ?*anyopaque, result: **ArrayBufferRaw) Status;
     extern fn napi_create_external_arraybuffer2(env: *Env, data: *anyopaque, len: usize, cb: *const anyopaque, hint: ?*anyopaque, result: **ArrayBufferRaw) Status;
 
+    extern fn napi_get_arraybuffer_info(env: *Env, value: *@This(), data: **anyopaque, byte_length: *usize) Status;
 
     pub fn initJs(env: *Env, len: usize) !ArrayBuffer {
         var data: *anyopaque = undefined;
@@ -755,7 +887,51 @@ pub const ArrayBufferRaw = opaque {
 
         return value;
     }
+
+    pub fn getBuffer(this: *@This(), env: *Env) ![]u8 {
+        var len: usize = undefined;
+        var data: *anyopaque = undefined;
+        const status = napi_get_arraybuffer_info(env, this, &data, &len);
+        try checkStatus(status);
+
+        return @as([*]u8, @ptrCast(data))[0..len];
+    }
+
+    pub fn isArrayBuffer(env: *Env, value: *Value) !bool {
+        var result: bool = undefined;
+        try checkStatus(napi_is_arraybuffer(env, value, &result));
+
+        return result;
+    }
 };
+
+// Wraps the value and then embeds a reference to the handle into `api_handle`
+pub fn TypedWrap(comptime T: type) type {
+    return struct {
+        value: T,
+        marker: void = undefined,
+    };
+}
+
+// FIXME: we can't (easily) use the technique used with `Promise` because the
+// instantiated tuple types are treated as different for some reason
+fn getTypedWrapType(comptime T: type) ?type {
+    const info = @typeInfo(T);
+    const s = switch (info) {
+        .Struct => |s| s,
+        else => return null,
+    };
+
+    if (s.is_tuple or s.fields.len != 2) {
+        return null;
+    }
+
+    if (!@hasField(T, "value") or !@hasField(T, "marker")) {
+        return null;
+    }
+
+    return s.fields[0].type;
+}
 
 const TypedArray = opaque {
     const ArrayType = enum(u32) {
@@ -771,7 +947,7 @@ const TypedArray = opaque {
         biguint64,
     };
 
-    extern fn napi_get_typedarray_info(env: *Env, value: *TypedArray, ty: *ArrayType, length: *usize, data: **anyopaque, arraybuffer: **ArrayBufferRaw, byte_offset: *usize) Status;
+    extern fn napi_get_typedarray_info(env: *Env, value: *const TypedArray, ty: *ArrayType, length: *usize, data: **anyopaque, arraybuffer: **ArrayBufferRaw, byte_offset: *usize) Status;
 
     const Info = struct {
         ty: ArrayType,
@@ -781,7 +957,7 @@ const TypedArray = opaque {
         byte_offset: usize,
     };
 
-    pub fn get_info(self: *TypedArray, env: *Env) !Info {
+    pub fn get_info(self: *const TypedArray, env: *Env) !Info {
         var info: Info = .{
             .ty = undefined,
             .len = undefined,
@@ -794,6 +970,14 @@ const TypedArray = opaque {
         try checkStatus(status);
 
         return info;
+    }
+
+    pub fn toSlice(this: *const @This(), env: *Env, comptime T: type) ![]T {
+        const info = try this.get_info(env);
+        // TODO: validate type
+        const d: [*]T = @alignCast(@ptrCast(info.data));
+
+        return d[0..info.len];
     }
 };
 
@@ -932,14 +1116,15 @@ fn makeCtor(comptime t: Type.Fn, comptime v: anytype, comptime T: type) NativeFn
             const z = info.get_args(env, t.params.len) catch return null;
             var args: Args = undefined;
             inline for (z[0], 0..t.params.len) |x, i| {
-                args[i] = converter.fromJs(t.params[i].type orelse unreachable, x) catch return null;
+                args[i] = converter.fromValue(t.params[i].type orelse unreachable, x) catch return null;
             }
 
             const ptr = wrap.allocator.create(T) catch return null;
 
             if (FnErrorTypes) |_| {
                 const ret = @call(.always_inline, v, args) catch |e| {
-                    const err = toValue(anyerror, wrap, e) orelse return null;
+                    const captured = CapturedError(anyerror){ .val = e, .trace = @errorReturnTrace() };
+                    const err = toValue(CapturedError(anyerror), wrap, captured) orelse return null;
                     wrap.throw(err) catch @panic("Failed to throw error");
                     return null;
                 };
@@ -980,12 +1165,13 @@ fn makeMethod(comptime t: Type.Fn, comptime v: anytype) NativeFn {
 
             args[0] = @alignCast(@ptrCast(r));
             inline for (z[0][0 .. t.params.len - 1], 1..t.params.len) |x, i| {
-                args[i] = converter.fromJs(t.params[i].type orelse unreachable, x) catch return null;
+                args[i] = converter.fromValue(t.params[i].type orelse unreachable, x) catch return null;
             }
 
             if (FnErrorTypes) |types| {
                 const ret = @call(.always_inline, v, args) catch |e| {
-                    const err = toValue(anyerror, wrap, e) orelse return null;
+                    const captured = CapturedError(anyerror){ .val = e, .trace = @errorReturnTrace() };
+                    const err = toValue(CapturedError(anyerror), wrap, captured) orelse return null;
                     wrap.throw(err) catch @panic("Failed to throw error");
                     return null;
                 };
@@ -1025,14 +1211,15 @@ fn makeFn(comptime t: Type.Fn, comptime v: anytype) NativeFn {
             const z = info.get_args(env, t.params.len) catch return null;
             var args: Args = undefined;
             if (t.params.len > 0 and t.params[0].type == *Receiver) {
-                args[0] = converter.fromJs(t.params[0].type orelse unreachable, z[1]) catch return null;
+                args[0] = converter.fromValue(t.params[0].type orelse unreachable, z[1]) catch return null;
                 inline for (z[0][0 .. t.params.len - 1], 1..t.params.len) |x, i| {
-                    args[i] = converter.fromJs(t.params[i].type orelse unreachable, x) catch return null;
+                    args[i] = converter.fromValue(t.params[i].type orelse unreachable, x) catch return null;
                 }
             } else {
                 inline for (z[0], 0..t.params.len) |x, i| {
-                    args[i] = converter.fromJs(t.params[i].type orelse unreachable, x) catch |e| {
-                        const err = toValue(anyerror, wrap, e) orelse return null;
+                    args[i] = converter.fromValue(t.params[i].type orelse unreachable, x) catch |e| {
+                        const captured = CapturedError(anyerror){ .val = e, .trace = @errorReturnTrace() };
+                        const err = toValue(CapturedError(anyerror), wrap, captured) orelse return null;
                         wrap.throw(err) catch @panic("Failed to throw error");
                         return null;
                     };
@@ -1041,7 +1228,8 @@ fn makeFn(comptime t: Type.Fn, comptime v: anytype) NativeFn {
 
             if (FnErrorTypes) |types| {
                 const ret = @call(.always_inline, v, args) catch |e| {
-                    const err = toValue(anyerror, wrap, e) orelse return null;
+                    const captured = CapturedError(anyerror){ .val = e, .trace = @errorReturnTrace() };
+                    const err = toValue(CapturedError(anyerror), wrap, captured) orelse return null;
                     wrap.throw(err) catch @panic("Failed to throw error");
                     return null;
                 };
@@ -1261,7 +1449,7 @@ const AsyncTask = opaque {
         resource: ?*Value,
         name: ?*Value,
         exec: *const anyopaque, // Execute
-        complete: *const anyopaque, // Complete
+        complete: ?*const anyopaque, // Complete
         data: ?*anyopaque,
         result: **AsyncTask,
     ) Status;
@@ -1270,7 +1458,7 @@ const AsyncTask = opaque {
     extern fn napi_cancel_async_work(env: *Env, task: *AsyncTask) Status;
     extern fn napi_delete_async_work(env: *Env, task: *AsyncTask) Status;
 
-    extern fn napi_schedule_async_work(env: *Env, exec: *const anyopaque, complete: *const anyopaque, data: ?*anyopaque) Status;
+    extern fn napi_schedule_async_work(env: *Env, exec: *const anyopaque, complete: ?*const anyopaque, data: ?*anyopaque) Status;
 
     pub fn init(env: *Env, exec: Execute, complete: Complete, data: ?*anyopaque) !*AsyncTask {
         var result: *AsyncTask = undefined;
@@ -1308,13 +1496,80 @@ inline fn fatal(src: std.builtin.SourceLocation, msg: [:0]const u8) noreturn {
     napi_fatal_error(location.ptr, location.len, msg.ptr, msg.len);
 }
 
+inline fn getErrorMessage(maybe_trace: ?*std.builtin.StackTrace) ![:0]const u8 {
+    const trace = maybe_trace orelse return "Native error";
+
+    var buf = std.ArrayList(u8).init(gpa.allocator());
+
+    const writer = struct {
+        pub fn f(ctx: *std.ArrayList(u8), bytes: []const u8) !usize {
+            try ctx.appendSlice(bytes);
+
+            return bytes.len;
+        }
+    }.f;
+
+    const Stream = std.io.GenericWriter(*std.ArrayList(u8), anyerror, writer);
+    const s = Stream{ .context = &buf };
+
+    const debug_info = std.debug.getSelfDebugInfo() catch  {
+        // stderr.print("Unable to dump stack trace: Unable to open debug info: {s}\n", .{@errorName(err)}) catch return;
+        // return;
+        unreachable;
+    };
+
+    // XXX: no clue why the call graph analysis yields a depth of 0 here
+    if (trace.index == 0) {
+        for (trace.instruction_addresses) |addr| {
+            if (addr == 0) break;
+
+            trace.index += 1;
+        }
+    }
+
+    try std.debug.writeStackTrace(trace.*, s, gpa.allocator(), debug_info, .no_color);
+    try buf.append(0);
+
+    return buf.items[0..buf.items.len-1 :0];
+}
+
+fn CapturedError(comptime T: type) type {
+    return struct {
+        val: T,
+        trace: ?*std.builtin.StackTrace,
+    };
+}
+
+
 fn toValue(comptime T: type, envWrap: *EnvWrap, val: T) ?*Value {
+    if (getTypedWrapType(T)) |U| {
+        const Child = comptime switch (@typeInfo(U)) {
+            .Pointer => |x| x.child,
+            else => @compileError("Not a pointer"),
+        };
+
+        if (!comptime @hasField(Child, "api_handle")) {
+            @compileError("Missing field: 'api_handle'");
+        }
+
+        const wrapped = Object.wrapWithRef(val.value) catch fatal(@src(), "Failed to create wrapped object");
+        const ptr: *?*anyopaque = &@field(val.value, "api_handle");
+        ptr.* = wrapped.ref;
+
+        return @ptrCast(wrapped.obj);
+    }
+
     return switch (T) {
         void => null,
         bool => envWrap.getBool(val) catch fatal(@src(), "Failed to create bool"),
         anyerror => {
             const err = envWrap.env.createError(val, "Native error") catch fatal(@src(), "Failed to create error");
             return @ptrCast(err);
+        },
+        CapturedError(anyerror) => {
+            const msg = getErrorMessage(val.trace) catch fatal(@src(), "Failed to create error message");
+            const err = envWrap.env.createError(val.val, msg) catch fatal(@src(), "Failed to create error");
+            return @ptrCast(err);     
         },
         i32 => @ptrCast(Number.createI32(envWrap.env, val) catch fatal(@src(), "Failed to create number")),
         u32 => @ptrCast(Number.createU32(envWrap.env, val) catch fatal(@src(), "Failed to create number")),
@@ -1325,6 +1580,13 @@ fn toValue(comptime T: type, envWrap: *EnvWrap, val: T) ?*Value {
         ArrayBuffer => {
             var ab = val;
             return ArrayBuffer.toValue(&ab) catch fatal(@src(), "Failed to create buffer");
+        },
+        ReferencedBuffer => {
+            val.deinit(envWrap.env) catch |e| {
+                _ = e;
+            };
+
+            return val.source;
         },
         *ArrayBuffer => val.toValue() catch fatal(@src(), "Failed to create buffer"),
         *Value => val,
@@ -1350,8 +1612,40 @@ fn toValue(comptime T: type, envWrap: *EnvWrap, val: T) ?*Value {
                 .Struct => {
                     return @ptrCast(Object.fromStruct(val) catch fatal(@src(), "Failed to create object"));
                 },
-                .Pointer => {
+                .Pointer => |ty| {
+                    if (ty.is_const and ty.size == .One) {
+                        switch (@typeInfo(ty.child)) {
+                            .Array => |c| {
+                                // TODO: check sentinel too?
+                                if (c.child == u8) {
+                                    const v = String.fromUtf8(envWrap.env, val) catch fatal(@src(), "Failed to create string");
+                                    return @ptrCast(v);
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+
+                    if (ty.is_const and ty.size == .Slice) {
+                        if (ty.child == u8) {
+                            const v = String.fromUtf8(envWrap.env, val) catch fatal(@src(), "Failed to create string");
+                            return @ptrCast(v);    
+                        }
+                        const arr = ArrayPointer.initCapacity(envWrap.env, val.len) catch unreachable;
+                        var i: u32 = 0;
+                        while (i < val.len) : (i += 1) {
+                            arr.set(envWrap.env, i, toValue(ty.child, envWrap, val[i]) orelse unreachable) catch unreachable;
+                        }
+                        return @ptrCast(arr);
+                    }
+
                     return @ptrCast(Object.fromEmbeddedStruct(val) catch fatal(@src(), "Failed to create object"));
+                },
+                .Optional => |t| {
+                    if (val) |v| {
+                        return toValue(t.child, envWrap, v);
+                    }
+                    return envWrap.env.getUndefined() catch fatal(@src(), "Failed to create undefined");
                 },
                 else => fatal(@src(), "Invalid type"),
             },
@@ -1475,7 +1769,7 @@ fn AsyncFn(comptime func: anytype) type {
     const RetSlot = if (FnErrorTypes) |t| blk: {
         break :blk union(enum) {
             val: PromiseType,
-            err: t.error_set,
+            err: CapturedError(t.error_set),
         };
     } else PromiseType;
 
@@ -1492,7 +1786,7 @@ fn AsyncFn(comptime func: anytype) type {
             var args: Args = undefined;
             var converter = wrap.envWrap.initConverter();
             inline for (z[0], 0..funcType.params.len) |x, i| {
-                args[i] = try converter.fromJs(funcType.params[i].type orelse unreachable, x);
+                args[i] = try converter.fromValue(funcType.params[i].type orelse unreachable, x);
             }
 
             var this = try converter.arena.allocator().create(@This());
@@ -1508,7 +1802,7 @@ fn AsyncFn(comptime func: anytype) type {
             var this: *@This() = @alignCast(@ptrCast(data orelse unreachable));
             if (FnErrorTypes != null) {
                 const r = @call(.auto, func, this.args) catch |e| {
-                    this.ret = .{ .err = e };
+                    this.ret = .{ .err = .{ .val = e, .trace = @errorReturnTrace() } };
                     return;
                 };
                 this.ret = .{ .val = r[0] };
@@ -1531,7 +1825,7 @@ fn AsyncFn(comptime func: anytype) type {
             if (FnErrorTypes != null) {
                 switch (this.ret) {
                     .val => |r| this.wrap.resolve(toValue(PromiseType, this.wrap.envWrap, r)) catch {},
-                    .err => |e| this.wrap.reject(toValue(anyerror, this.wrap.envWrap, e)) catch {},
+                    .err => |e| this.wrap.reject(toValue(CapturedError(anyerror), this.wrap.envWrap, .{ .val = e.val, .trace = e.trace } )) catch {},
                 }
             } else {
                 this.wrap.resolve(toValue(PromiseType, this.wrap.envWrap, this.ret)) catch {};
@@ -1591,6 +1885,36 @@ const Env = opaque {
     pub fn throw(this: *Env, err: *Value) !void {
         const status = napi_throw(this, err);
         try checkStatus(status);
+    }
+
+    extern fn napi_is_promise(env: *Env, val: *Value, result: *bool) Status;
+
+    pub fn isPromise(this: *@This(), val: *Value) !bool {
+        var result: bool = undefined;
+        try checkStatus(napi_is_promise(this, val, &result));
+
+        return result;
+    }
+
+    const ValueType = enum(u32) {
+        undefined,
+        null,
+        boolean,
+        number,
+        string,
+        symbol,
+        object,
+        function,
+        external,
+        bigint,
+    };
+
+    extern fn napi_typeof(env: *Env, val: *Value, result: *ValueType) Status;
+
+    pub fn typeof(this: *@This(), val: *Value) !ValueType {
+        var result: ValueType = undefined;
+        try checkStatus(napi_typeof(this, val, &result));
+        return result;
     }
 };
 
@@ -1704,7 +2028,7 @@ const ValueConverter = struct {
         this.arena.deinit();
     }
 
-    pub fn fromJs(this: *ValueConverter, comptime T: type, val: *Value) !T {
+    pub fn fromValue(this: *ValueConverter, comptime T: type, val: *Value) !T {
         if (T == bool) {
             const b: *Boolean = @ptrCast(val);
             
@@ -1718,12 +2042,19 @@ const ValueConverter = struct {
             return UTF8String{ .data = data };
         }
 
+        if (getTypedWrapType(T)) |U| {
+            const o: *Object = @ptrCast(val);
+            const v: U = @alignCast(@ptrCast(try o.unwrap()));
+
+            return TypedWrap(U){ .value = v };
+        }
+
         if (getArrayElementType(T)) |U| {
             const arr: *ArrayPointer = @ptrCast(val);
             const tmp = try arr.copy(this.env, this.arena.allocator());
             var tmp2: []U = try this.arena.allocator().alloc(U, tmp.len);
             for (0..tmp.len) |i| {
-                tmp2[i] = try this.fromJs(U, tmp[i]);
+                tmp2[i] = try this.fromValue(U, tmp[i]);
             }
 
             return T{ .elements = tmp2 };
@@ -1748,6 +2079,14 @@ const ValueConverter = struct {
             };
         }
 
+        if (getReferenceType(T)) |U| {
+            return Reference(U).init(this.env, @ptrCast(val));
+        }
+
+        if (T == ReferencedBuffer) {
+            return ReferencedBuffer.init(this.env, val);
+        }
+
         if (T == FastU32Array) {
             const arr: *TypedArray = @ptrCast(val);
             const info = try arr.get_info(this.env);
@@ -1757,6 +2096,13 @@ const ValueConverter = struct {
                 .data = d,
                 .length = info.len,
             };
+        }
+
+        if (T == ArrayBuffer) {
+            const arr: *ArrayBufferRaw = @ptrCast(val);
+            const buf = try arr.getBuffer(this.env);
+
+            return .{ .buf = buf, .hasValue = true, .value = arr };
         }
 
         return switch (T) {
@@ -1783,6 +2129,30 @@ const ValueConverter = struct {
                     .Struct => |_| {
                         return Object.toStruct(T, this, @ptrCast(val)) catch fatal(@src(), "Failed to convert struct from JS value"); 
                     },
+                    .Optional => |o| {
+                        return switch (try this.env.typeof(val)) {
+                            .null, .undefined => null,
+                            else => @as(T, try this.fromValue(o.child, val)),
+                        };
+                    },
+                    .Pointer => |p| {
+                        // FIXME: check if the pointer references a string
+                        if (p.is_const and p.child == u8) {
+                            const s: *String = @ptrCast(val);
+                            const data: [:0]const u8 = try s.toUtf8(this.env, this.arena.allocator());
+
+                            return data;
+                        }
+
+                        const arr: *ArrayPointer = @ptrCast(val);
+                        const tmp = try arr.copy(this.env, this.arena.allocator());
+                        var tmp2: []p.child = try this.arena.allocator().alloc(p.child, tmp.len);
+                        for (0..tmp.len) |i| {
+                            tmp2[i] = try this.fromValue(p.child, tmp[i]);
+                        }
+
+                        return tmp2;
+                    },
                     else => {}
                 }
 
@@ -1805,6 +2175,10 @@ pub fn waitForPromise(value: *Value) !*Value {
 
 const Allocator = std.heap.GeneralPurposeAllocator(.{});
 var gpa = Allocator{};
+
+pub inline fn getAllocator() std.mem.Allocator {
+    return gpa.allocator();
+}
 
 const EnvWrap = struct {
     const Envs = std.AutoHashMap(*Env, EnvWrap);

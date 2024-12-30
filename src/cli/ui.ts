@@ -1023,8 +1023,8 @@ export function createDisplay() {
                 return
             }
 
-            clearTimeout(t)
             disposed = true
+            clearTimeout(t)
 
             return _dispose()
         }

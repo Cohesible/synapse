@@ -125,7 +125,8 @@ export declare class HttpService {
 /** @internal */
 export interface ContainerInstance {
     readonly name: string
-    readonly ip: string
+    readonly publicIp?: string // v4
+    readonly privateIp: string // v4
     readonly port: number // obviously this is 1:1 w/ a running app
 }
 
