@@ -21,6 +21,7 @@ Features:
     * Extremely fast package manager
     * Node.js compatible JavaScript runtime
     * [A testing framework](docs/testing.md)
+    * Deployment engine compatible with Terraform providers
 
 ```main.ts
 import { Bucket } from 'synapse:srl/storage'

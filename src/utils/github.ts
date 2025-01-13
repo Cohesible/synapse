@@ -67,9 +67,12 @@ export async function listArtifacts(owner: string, repo: string, name?: string) 
 }
 
 export async function downloadRepoFile(owner: string, repo: string, filePath: string, branch = 'main') {
-    const url = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${filePath}`
+    const pathSegment = `/${owner}/${repo}/${branch}/${filePath}`
+    const url = `https://raw.githubusercontent.com${pathSegment}`
 
-    return fetchData(url, 'application/vnd.github.v3.raw')
+    return fetchData(url, 'application/vnd.github.v3.raw').catch(e => {
+        throw new Error(`Download failed: ${pathSegment}`, { cause: e })
+    })
 }
 
 export interface Release {

@@ -71,22 +71,35 @@ function toPromise(proc: child_process.ChildProcess, encoding?: BufferEncoding) 
         return enc ? buf.toString(enc) : buf
     }
 
+    function makeLazyResult(enc?: BufferEncoding) {
+        let _stdout: string | Buffer
+        let _stderr: string | Buffer
+
+        return {
+            get stdout() {
+                return _stdout ??= getResult(stdout, enc)
+            },
+            get stderr() {
+                return _stderr ??= getResult(stderr, enc)
+            },
+        }
+    }
+
     const p = new Promise<{ stdout: string | Buffer; stderr: string | Buffer}>((resolve, reject) => {
         function onError(e: unknown) {
             reject(e)
             proc.kill()
         }
 
-        function close(code: number | null, signal: NodeJS.Signals | null) {
+        function onExit(code: number | null, signal: NodeJS.Signals | null) {
             if (code === 0) {
-                return resolve({ stdout: getResult(stdout), stderr: getResult(stderr) })
+                return resolve(makeLazyResult())
             }
 
             const message = `Non-zero exit code: ${code} [signal ${signal}]`
-            const err = Object.assign(
-                new Error(message), 
-                { code, stdout: getResult(stdout), stderr: getResult(stderr, 'utf-8') },
-            )
+            const err = Object.assign(new Error(message), { code })
+
+            Object.defineProperties(err, Object.getOwnPropertyDescriptors(makeLazyResult('utf-8')))
 
             Object.defineProperty(err, 'stack', {
                 get: memoize(() => message + '\n' + _err.stack?.split('\n').slice(1).join('\n'))
@@ -96,11 +109,7 @@ function toPromise(proc: child_process.ChildProcess, encoding?: BufferEncoding) 
         }
 
         proc.on('error', onError)
-        proc.on('close', close)
-
-        if (!proc.stdout && !proc.stderr) {
-            proc.on('exit', close)
-        }
+        proc.on('exit', onExit)
     })
 
     return p

@@ -7,6 +7,7 @@ import { getLogger } from '../logging'
 import { seaAssetPrefix } from '../bundler'
 import { isDataPointer } from '../build-fs/pointers'
 import { getDataRepository } from '../artifacts'
+import { getWorkingDir } from '../workspaces'
 
 interface PostjectOptions {
     readonly overwrite?: boolean
@@ -29,8 +30,9 @@ function loadFromRelPath() {
 }
 
 function getPostject(): Postject {
-      // This is so we can still load `postject` as an SEA
-    const loadFromCwd = () => createRequire(path.resolve(process.cwd(), 'package.json'))('postject')
+    // This is so we can still load `postject` as an SEA
+    const origin = path.resolve(getWorkingDir(), 'package.json')
+    const loadFromCwd = () => createRequire(origin)('postject')
 
     try {
         return loadFromRelPath()

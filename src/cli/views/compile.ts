@@ -1,3 +1,4 @@
+import * as path from 'node:path'
 import * as nodeUtil from 'node:util'
 import { bold, colorize, dim, getDisplay, renderDuration } from '../ui'
 import { CompilerOptions } from '../../compiler/host'
@@ -53,8 +54,9 @@ interface ConfigDelta<T = any> {
 
 // This is intentionally hand-written to include only the most relevant things
 interface ConfigDiff {
-    environmentName?: ConfigDelta<string>
+    workingDir?: ConfigDelta<string>
     deployTarget?: ConfigDelta<string>
+    environmentName?: ConfigDelta<string>
 }
 
 function getDelta<T>(input: T | undefined, resolved: T | undefined): ConfigDelta<T> | undefined {
@@ -75,10 +77,15 @@ function getDelta<T>(input: T | undefined, resolved: T | undefined): ConfigDelta
 // * When one implicit input overrides another (Synapse config vs. `tsconfig.json`)
 
 function diffConfig(
-    config: ResolvedProgramConfig,
+    config: Pick<ResolvedProgramConfig, 'csc'>,
     inputOptions: CompilerOptions = {}
 ): ConfigDiff {
     const diff: ConfigDiff = {}
+
+    if (config.csc.workingDirectory) {
+        diff.workingDir = getDelta('', path.relative(process.cwd(), config.csc.workingDirectory))
+    }
+
     diff.deployTarget = getDelta(inputOptions.deployTarget, config.csc.deployTarget)
     diff.environmentName = getDelta(inputOptions.environmentName, config.csc.environmentName)
 
@@ -93,6 +100,8 @@ function diffConfig(
 
 function mapOptionName(name: string) {
     switch (name) {
+        case 'workingDir':
+            return 'cwd'
         case 'deployTarget':
             return 'target'
         case 'environmentName':
@@ -102,9 +111,31 @@ function mapOptionName(name: string) {
     return name
 }
 
-interface CompileSummaryOpt {
-    showResourceSummary?: boolean
-    showSuggestions?: boolean
+interface RenderOptions {
+    readonly dim?: boolean
+}
+
+export function renderCompilerOptions(opt: CompilerOptions, renderOpt?: RenderOptions) {
+    const diff = diffConfig({ csc: opt })
+
+    return renderConfigDiff(diff, renderOpt)
+}
+
+function renderConfigDiff(diff: ConfigDiff, renderOpt?: RenderOptions) {
+    const entries = Object.entries(diff) as [string, ConfigDelta][]
+    if (entries.length === 0) {
+        return
+    }
+
+    const dimFn = renderOpt?.dim === false ? (s: string) => s : dim
+
+    function renderEntry(k: string, v: ConfigDelta) {
+        return dimFn(`${mapOptionName(k)}: ${bold(colorize(v.clobbered ? 'red' : 'blue', v.resolved ?? v.input))}`)
+    }
+
+    const resolved = entries.filter(([k, v]) => v.resolved !== undefined)
+    const rendered = resolved.map(([k, v]) => renderEntry(k, v)).join(dimFn(', '))
+    return `${dimFn('(')}${rendered}${dimFn(')')}`
 }
 
 // `inputOptions` is used for diffing the resolved config
@@ -138,19 +169,10 @@ export function createCompileView(inputOptions?: CompilerOptions & { hideLogs?: 
     // Anything that uses a particular key must use the resolved form
     getLogger().onResolveConfig(ev => {
         const diff = diffConfig(ev.config, inputOptions)
-        const entries = Object.entries(diff) as [string, ConfigDelta][]
-        if (entries.length === 0) {
-            return
+        const text = renderConfigDiff(diff)
+        if (text) {
+            setConfigText(text)
         }
-
-        function renderEntry(k: string, v: ConfigDelta) {
-            return dim(`${mapOptionName(k)}: ${bold(colorize(v.clobbered ? 'red' : 'blue', v.resolved ?? v.input))}`)
-        }
-
-        const resolved = entries.filter(([k, v]) => v.resolved !== undefined)
-        const rendered = resolved.map(([k, v]) => renderEntry(k, v)).join(dim(', '))
-        const text = `${dim('(')}${rendered}${dim(')')}`
-        setConfigText(text)
     })
 
     function done() {

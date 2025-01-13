@@ -213,7 +213,8 @@ export function createStaticSolver(
 
     function createSolver(
         state = new Map<string, any>(),
-        context?: SubstitutionFunction
+        context?: SubstitutionFunction,
+        isConditionalExecution?: boolean
     ): { solve: (node: ts.Node) => any, getState: () => Map<string, any>, printState: () => void } {
         function getExports() {
             const val = state.get('exports')
@@ -523,6 +524,18 @@ export function createStaticSolver(
                 })
             }
 
+            if (isUnion(thisArg)) {
+                return createCachedUnion(function* () {
+                    for (const t of thisArg) {
+                        if (isUnknown(t)) {
+                            yield t
+                        } else {
+                            yield callWithStack(source, fn, t, args)
+                        }
+                    }
+                }) 
+            }
+
             if (typeof fn !== 'function') {
                 // This is mostly to handle `.then` or `.catch`
                 // Whether or not a function truly returns a Promise is not always statically known
@@ -634,6 +647,22 @@ export function createStaticSolver(
                     const memberName = solveMemberName(left.name)
                     if (typeof memberName !== 'string') {
                         failOnNode(`Not a string: ${memberName}`, node)
+                    }
+
+                    if (isConditionalExecution) {
+                        if (exp.operatorToken.kind === ts.SyntaxKind.QuestionQuestionEqualsToken) {
+                            if (target[memberName] !== null && target[memberName] !== undefined) {
+                                return
+                            }
+                        }
+
+                        if (!isUnion(target[memberName])) {
+                            target[memberName] = createUnion([solve(right)])
+                        } else {
+                            target[memberName] = createUnion([...target[memberName], solve(right)])
+                        }
+
+                        return
                     }
 
                     if (exp.operatorToken.kind === ts.SyntaxKind.QuestionQuestionEqualsToken) {
@@ -989,17 +1018,53 @@ export function createStaticSolver(
         function solveSwitchStatement(node: ts.SwitchStatement) {
             const exp = solve(node.expression)
             for (const clause of node.caseBlock.clauses) {
-                solveCaseOrDefaultClause(clause)
+                const ret = solveCaseOrDefaultClause(clause, exp)
+                if (ret !== undefined) {
+                    return ret
+                }
             }
         }
 
-        function solveCaseOrDefaultClause(node: ts.CaseOrDefaultClause) {
-            const scopedState = new Map<string, any>()
-            const solver = createSolver(scopedState, getSubstitute)
-
-            if (ts.isCaseClause(node)) {
-                const val = solver.solve(node.expression)
+        function isSubset(a: any, b: any) {
+            if (isUnknown(b)) {
+                return true
             }
+
+            if (isUnion(a)) {
+                if (!isUnion(b)) {
+                    return false
+                }
+
+                const s = new Set(b)
+                for (const v of a) {
+                    if (!s.has(v)) {
+                        return false
+                    }
+                }
+
+                return true
+            }
+
+            if (!isUnion(b)) {
+                return a === b
+            }
+
+            for (const v of b) {
+                if (a === v) {
+                    return true
+                }
+            }
+
+            return false
+        }
+
+        function solveCaseOrDefaultClause(node: ts.CaseOrDefaultClause, exp: any) {
+            const val = ts.isCaseClause(node) ? solve(node.expression) : uninitialized
+            // TODO: only execute the block if `val` is a subset of `exp`
+            // We need to be careful with this due to lazy evaluation
+
+            const scopedState = new Map<string, any>()
+            const solver = createSolver(scopedState, getSubstitute, true)
 
             for (const statement of node.statements) {
                 solver.solve(statement)

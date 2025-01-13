@@ -53,7 +53,7 @@ export enum AssetType {
 export class Bundle extends core.Closure {
     public constructor(target: ((...args: any[]) => any) | Record<string, any>, opt?: BundleOptions) {
         const normalizedLocation = opt?.destination 
-            ? path.relative(core.cwd(), opt.destination)
+            ? path.relative(process.cwd(), opt.destination)
             : undefined
 
         super({
@@ -84,7 +84,7 @@ interface ExportProps {
 export class Export extends core.Closure {
     public constructor(target: any, opt?: ExportProps) {
         const normalizedLocation = opt?.destination 
-            ? path.relative(core.cwd(), opt.destination)
+            ? path.relative(process.cwd(), opt.destination)
             : undefined
 
         super({

@@ -258,8 +258,8 @@ function createSyncWrapper<T extends Record<string, (...args: any[]) => any>>(ob
 }
 
 function createScreenWriter(stream = process.stdout) {
-    async function waitForDrain() {
-        await new Promise<void>((r) => stream.once('drain', r))
+    function waitForDrain() {
+        return new Promise<void>((r) => stream.once('drain', r))
     }
 
     async function runAndDrain<T = void>(fn: (cb: (val: T) => void) => boolean) {
@@ -268,7 +268,7 @@ function createScreenWriter(stream = process.stdout) {
             didDrain = fn(resolve)
         })
 
-        if (!didDrain) {
+        if (!didDrain && stream.writableNeedDrain) {
             await waitForDrain()
         }
 
@@ -521,25 +521,36 @@ function registerTty() {
         return { dispose: () => emitter.removeListener('signal', listener) }
     }
 
-    const previousRawMode = process.stdin.isRaw
-
+    let disposed = false
+    let previousRawMode: boolean
     function dispose() {
+        if (disposed) {
+            return
+        }
+
+        disposed = true
         emitter.emit('close')
         emitter.removeAllListeners()
-        process.stdin.removeListener('data', handleInput)
-        process.stdin.setRawMode(previousRawMode)
+
+        if (didSetup) {
+            process.stdin.setRawMode(previousRawMode)
+            process.stdin.removeListener('end', dispose)
+            process.stdin.removeListener('data', handleInput)
+            process.stdin.pause() // Remove the handler from the event loop
+        }
     }
 
     let didSetup = false
     function setup() {
-        if (didSetup) {
+        if (didSetup || disposed) {
             return
         }
 
         didSetup = true
+        previousRawMode = process.stdin.isRaw
         process.stdin.setRawMode(true)
-        process.stdin.on('end', dispose)
         process.stdin.on('data', handleInput)
+        process.stdin.once('end', dispose)
 
         onSignal(ev => {
             if (ev.signal === 'SIGINT') {

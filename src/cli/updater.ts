@@ -38,16 +38,30 @@ export async function checkForUpdates(opt?: { force?: boolean; tag?: string }) {
     }
 }
 
-export async function tryUpgrade(opt?: { force?: boolean; tag?: string }) {
-    const updateInfo = await checkForUpdates(opt)
-    if (!updateInfo) {
-        return printLine(colorize('green', 'Already on the latest version'))
+interface UpgradeOptions {
+    readonly force?: boolean
+    readonly tag?: string
+    readonly hash?: string
+
+    // internal/dev options
+    readonly installDir?: string
+    readonly stepKeyHash?: string 
+}
+
+export async function tryUpgrade(opt?: UpgradeOptions) {
+    if (!opt?.hash && !opt?.stepKeyHash) {
+        const updateInfo = await checkForUpdates(opt)
+        if (!updateInfo) {
+            return printLine(colorize('green', 'Already on the latest version'))
+        }
+    
+        // Not using `printLine` here because something else will be writing to `stdout`
+        process.stdout.write(`Found newer version ${updateInfo.version}. Upgrading...\n`)
+    } else {
+        process.stdout.write(`Installing from hash: ${opt.hash ?? opt.stepKeyHash}\n`)
     }
 
-    // Not using `printLine` here because something else will be writing to `stdout`
-    process.stdout.write(`Found newer version ${updateInfo.version}. Upgrading...\n`)
-
-    const installDir = process.env.SYNAPSE_INSTALL ?? path.resolve(homedir(), '.synapse')
+    const installDir = opt?.installDir ?? process.env.SYNAPSE_INSTALL ?? path.resolve(homedir(), '.synapse')
     const execPath = path.resolve(installDir, 'app', 'bin', 'synapse.exe')
     const oldExecPath = path.resolve(installDir, 'synapse-old.exe')
 
@@ -57,16 +71,38 @@ export async function tryUpgrade(opt?: { force?: boolean; tag?: string }) {
         await rename(execPath, oldExecPath)
     }
 
+    function getSearchPart() {
+        if (!opt?.hash && !opt?.stepKeyHash) {
+            return ''
+        }
+
+        const params: Record<string, string> = {}
+        if (opt.hash) {
+            params.hash = opt.hash
+        }
+
+        if (opt.stepKeyHash) {
+            params.stepKeyHash = opt.stepKeyHash
+        }
+
+        return '?' + new URLSearchParams(params).toString()
+    }
+
     const cmd = process.platform === 'win32'
-        ? 'irm https://synap.sh/install.ps1 | iex'
-        : 'curl -fsSL https://synap.sh/install | bash'
+        ? `irm https://synap.sh/install.ps1${getSearchPart()} | iex`
+        : `curl -fsSL https://synap.sh/install${getSearchPart()} | bash`
+
+    const env = { ...process.env, SYNAPSE_INSTALL_IS_UPGRADE: 'true' } as Record<string, string>
+    if (opt?.installDir) {
+        env.SYNAPSE_INSTALL = opt.installDir
+    }
 
     await new Promise<void>((resolve, reject) => {
         const proc = child_process.spawn(cmd, { 
             shell: process.platform === 'win32' ? 'powershell.exe' : true, 
             stdio: 'inherit', 
             windowsHide: true,
-            env: { ...process.env, SYNAPSE_INSTALL_IS_UPGRADE: 'true', }
+            env,
         })
 
         proc.on('error', reject)

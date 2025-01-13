@@ -34,6 +34,8 @@ export interface LocalMetadata {
 
     readonly sourceDelta?: { line: number; column: number }
     // TODO: use a generic `data` field for everything except dependencies/pointers
+
+    readonly workspaceSourceInfo?: WorkspaceSourceInfo
 }
 
 export interface ArtifactMetadata extends Omit<LocalMetadata, 'dependencies'> {
@@ -108,8 +110,6 @@ interface BaseArtifactStore {
     readArtifactSync(hash: string): Uint8Array
     listArtifacts(): Promise<Record<string, Record<string, ArtifactMetadata>>>
     listArtifactsSync(): Record<string, Record<string, ArtifactMetadata>>
-
-    // listDependencies(): Promise<Record<string, CommitedArtifactStore>>
     resolveMetadata(metadata: LocalMetadata): ArtifactMetadata
 }
 
@@ -129,14 +129,22 @@ export interface OpenedArtifactStore extends BaseArtifactStore {
 
 export type ArtifactStore = OpenedArtifactStore | ClosedArtifactStore
 
+export interface WorkspaceSourceInfo {
+    readonly projectId: string
+    readonly programId: string
+    readonly deploymentId?: string
+}
+
 interface DenormalizedStoreManifest {
     readonly type?: 'denormalized'
     readonly artifacts: Record<string, Record<string, ArtifactMetadata>>
+    readonly sources?: WorkspaceSourceInfo[]
 }
 
 interface FlatStoreManifest {
     readonly type: 'flat'
     readonly artifacts: Record<string, ArtifactMetadata>
+    readonly sources?: WorkspaceSourceInfo[]
 }
 
 type ArtifactStoreManifest = DenormalizedStoreManifest | FlatStoreManifest
@@ -146,6 +154,7 @@ interface ArtifactStoreState2 {
     readonly status: 'opened' | 'closed'
     readonly mode: 'flat'
     readonly workingMetadata: FlatStoreManifest['artifacts']
+    readonly sources?: WorkspaceSourceInfo[]
 }
 
 interface ArtifactStoreState3 {
@@ -153,6 +162,7 @@ interface ArtifactStoreState3 {
     readonly status: 'opened' | 'closed'
     readonly mode: 'denormalized'
     readonly workingMetadata: DenormalizedStoreManifest['artifacts']
+    readonly sources?: WorkspaceSourceInfo[]
 }
 
 type ArtifactStoreState = ArtifactStoreState2 | ArtifactStoreState3
@@ -164,61 +174,6 @@ function initArtifactStoreState(): ArtifactStoreState {
         workingMetadata: {},
     }
 }
-
-function cow<T extends Record<string, any>>(val: T): T {
-    let copied: Partial<T> | undefined
-    function getClone() {
-        return copied ??= deepClone(val)
-    }
-
-    if (val instanceof Map) {
-        return new Proxy(val, {
-            get: (_, prop, recv) => {
-                if (copied) {
-                    return Reflect.get(copied, prop, recv)
-                }
-
-                if (prop === 'set' || prop === 'delete' || prop === 'clear') {
-                    return (...args: any[]) => (Reflect.get(getClone(), prop, recv) as any)(...args)
-                }
-
-                return Reflect.get(val, prop, recv)
-            },
-        })
-    }
-
-    if (val instanceof Set || val instanceof Array) {
-        throw new Error(`Not implemented`)
-    }
-
-    return new Proxy(val, {
-        get: (_, prop, recv) => {
-            if (copied === undefined) {
-                copied = {} as T
-            }
-            if (prop in copied) {
-                return copied[prop as any]
-            }
-
-            const v = val[prop as any]
-
-            return (copied as any)[prop] = typeof v !== 'object' || !v ? v : cow(v)
-        },
-        set: (_, prop, newValue, recv) => {
-            if (copied === undefined) {
-                copied = {} as T
-            }
-            (copied as any)[prop] = newValue
-
-            return true
-        },
-    }) as T
-}
-
-// Artifact store 3.0 (call this a "build unit"?)
-// * Inputs -> named committed stores
-// * Output -> pruned & committed store
-// * Attributes (metadata)
 
 interface ResolveArtifactOpts {
     sync?: boolean
@@ -410,6 +365,7 @@ let storeIdCounter = 0
 // They should not be re-used for the same operation. But they should be re-used for subsequent operations.
 function createArtifactStore(root: RootArtifactStore, state = initArtifactStoreState()) {
     const id = `${storeIdCounter++}`
+    let hasSources = state.sources !== undefined && state.sources.length > 0
 
     function close() {
         ;(state as Mutable<typeof state>).status = 'closed'
@@ -422,6 +378,12 @@ function createArtifactStore(root: RootArtifactStore, state = initArtifactStoreS
             if (source === (state.hash ?? '')) {
                 const m = state.workingMetadata[hash]
                 if (m) {
+                    if (hasSources && typeof m.workspaceSourceInfo !== 'object') {
+                        return {
+                            ...m,
+                            workspaceSourceInfo: !m.workspaceSourceInfo ? state.sources![0] : state.sources![m.workspaceSourceInfo as any as number],
+                        }
+                    }
                     return m
                 }
             }
@@ -527,6 +489,26 @@ function createArtifactStore(root: RootArtifactStore, state = initArtifactStoreS
         return !!state.workingMetadata?.[source]?.[hash]
     }
 
+    function isSameSource(a: WorkspaceSourceInfo, b: WorkspaceSourceInfo) {
+        if (a === b) {
+            return true
+        }
+
+        return a.deploymentId === b.deploymentId && a.programId === b.programId && a.projectId === b.projectId
+    }
+
+    function indexWorkspaceSourceInfo(info: WorkspaceSourceInfo) {
+        const sources = (state as Mutable<typeof state>).sources ??= []
+        const index = sources.findIndex(el => isSameSource(info, el))
+        if (index !== -1) {
+            return index
+        }
+
+        hasSources ||= true
+
+        return sources.push(info) - 1
+    }
+
     function resolveMetadata(metadata: LocalMetadata) {
         const dependencies: Record<string, string[]> = {}
         if (metadata.dependencies) {
@@ -565,6 +547,15 @@ function createArtifactStore(root: RootArtifactStore, state = initArtifactStoreS
             ...metadata,
             sourcemaps: Object.keys(sourcemaps).length > 0 ? sourcemaps : undefined,
             dependencies: Object.keys(dependencies).length > 0 ? dependencies : undefined,
+        }
+
+        if (metadata.workspaceSourceInfo) {
+            const index = indexWorkspaceSourceInfo(metadata.workspaceSourceInfo)
+            if (index !== 0) {
+                ;(result as any).workspaceSourceInfo = index
+            } else {
+                delete result.workspaceSourceInfo
+            }
         }
 
         const pruned = Object.fromEntries(Object.entries(result).filter(([_, v]) => v !== undefined))
@@ -2040,10 +2031,14 @@ function createStructuredArtifactWriter(key: string, writer: Pick<BuildFsV2, 'wr
 //  * Resource-bound artifact store
 
 export interface InstallationAttributes {
-    readonly packageLockTimestamp: number
-    readonly packages: Record<string, NpmPackageInfo & { isSynapsePackage?: boolean }>
-    readonly importMap?: FlatImportMap
     readonly mode: 'all' | 'types' | 'none'
+    readonly importMap?: FlatImportMap
+    readonly packageLockTimestamp: number
+    readonly packages: Record<string, NpmPackageInfo & { 
+        readonly isSynapsePackage?: boolean
+        readonly projectId?: string
+        readonly programId?: string 
+    }>
 }
 
 interface StatsEntry {
@@ -2756,6 +2751,9 @@ interface NormalizedData {
 interface NormalizerOptions {
     // Removes any non-critical data (e.g. sourcemaps)
     readonly strip?: boolean
+
+    // Only relevant when `strip` is `false`
+    readonly sourceInfo?: WorkspaceSourceInfo
 }
 
 function createNormalizer(repo: DataRepository, opt?: NormalizerOptions) {
@@ -2809,15 +2807,24 @@ function createNormalizer(repo: DataRepository, opt?: NormalizerOptions) {
             dependencies![k] = [...v].sort()
         }
 
-        const sourcemaps = opt?.strip ? undefined : metadata.sourcemaps
+        function finalizeMetadata() {
+            if (opt?.strip) {
+                const m = { ...metadata, pointers, dependencies }
+                delete m.sourcemaps
+                delete m.workspaceSourceInfo
 
-        const result = sortRecord({
-            ...metadata,
-            sourcemaps,
-            pointers,
-            dependencies,
-        })
+                return m
+            }
 
+            return {
+                ...metadata,
+                pointers,
+                dependencies,
+                workspaceSourceInfo: metadata.workspaceSourceInfo ?? opt?.sourceInfo,
+            }
+        }
+
+        const result = sortRecord(finalizeMetadata())
         const metadataHash = getHash(Buffer.from(JSON.stringify(result), 'utf-8'))
 
         return {
@@ -4001,6 +4008,7 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
         const manifest = {
             type: state.mode,
             artifacts: sorted,
+            sources: state.sources,
         } as ArtifactStoreManifest
 
         const data = Buffer.from(JSON.stringify(manifest), 'utf-8')
@@ -4026,6 +4034,11 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
                 if (m.dependencies?.['']) {
                     m.dependencies[s] = m.dependencies['']
                     delete m.dependencies['']
+                }
+                if (manifest.sources) {
+                    ;(m as Mutable<ArtifactMetadata>).workspaceSourceInfo = m.workspaceSourceInfo 
+                        ? manifest.sources[m.workspaceSourceInfo as any] 
+                        : manifest.sources[0]
                 }
             }
         }
@@ -4061,6 +4074,7 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
             hash: hash,
             mode: manifest.type === 'flat' ? 'flat' : 'denormalized',
             workingMetadata: manifest.artifacts,
+            sources: manifest.sources,
         } as ArtifactStoreState) as ClosedArtifactStore
     }
 
@@ -4506,6 +4520,7 @@ export interface Snapshot {
     store?: ReadonlyBuildFs
     types?: TypesFileData
     modules?: Record<string, string> // maps `.js` files to source
+    workspace?: WorkspaceSourceInfo
 }
 
 export function resolveSnapshot(snapshot: Snapshot) {
@@ -4797,6 +4812,11 @@ export async function loadSnapshot(location: string): Promise<Snapshot | undefin
         pointers,
         types,
         modules,
+        workspace: {
+            programId: res.programId,
+            projectId: res.projectId,
+            deploymentId: res.deploymentId,
+        },
     }
 }
 
@@ -4846,6 +4866,11 @@ export async function createSnapshot(fsIndex: BuildFsIndex, programId: string, d
         moduleManifest,
         types: await getTypesFile(programFs),
         modules,
+        workspace: {
+            programId,
+            deploymentId,
+            projectId: getBuildTargetOrThrow().projectId,
+        }
     } satisfies Snapshot
 
     return { snapshot, committed }
@@ -4908,7 +4933,7 @@ async function syncHeads(repo: DataRepository, remote: RemoteArtifactRepository,
     if (isLocalNewer && localHead) {
         getLogger().debug(`Pushing local changes to remote`, localHead.id)
         await remote.push(localHead.storeHash)
-        if (localHead.programHash) {
+        if (localHead.programHash && localHead.programHash !== remoteHead?.programHash) {
             await remote.push(localHead.programHash)
         }
         await remote.putHead(localHead)

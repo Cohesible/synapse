@@ -41,6 +41,7 @@ export interface DeployOptions {
 
     skipCommit?: boolean
 
+    sync?: boolean // For CI
     syncAfter?: boolean // For CI
     noSave?: boolean
     loadRegistry?: boolean
@@ -365,7 +366,7 @@ export interface SessionContext extends DeploymentContext {
 
 class TfError extends Error {
     public constructor(summary: string, public readonly detail?: string, public readonly range?: TfDiagnostic['range']) {
-        super(summary)
+        super(detail ? `${summary}: ${detail}` : summary)
 
         // if (range) {
         //     getSnippet(this).then(m => process.stderr.write(`${m}\n`))

@@ -341,6 +341,12 @@ export function parsePackageInstallRequests(requests: string[]): Record<string, 
             continue
         }
 
+        // TODO: we need to validate
+        // if (p.scheme === 'spr') {
+        //     result[p.name.slice(1)] = r
+        //     continue
+        // }
+
         if (p.scheme && p.scheme !== 'npm') {
             throw new Error(`Not implemented: ${p.scheme}`)
         }
@@ -483,8 +489,6 @@ export function resolveWorkspaces(workspaces: string[], workspaceRootDir?: strin
     for (const v of workspaces) {
         const isPattern = v.endsWith('*') || v.endsWith('/')
         if (!isPattern) {
-            //             throw new Error(`Pattern not implemented: "${v}". A workspace pattern must end with "*"`)
-
             resolve(v)
             continue
         }

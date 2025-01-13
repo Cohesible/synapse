@@ -4,7 +4,7 @@ import { createRequire, isBuiltin, SourceMap, SourceOrigin } from 'node:module'
 import { SyncFs } from '../system'
 import { findSourceMap, SourceMapV3 } from './sourceMaps'
 import { getLogger } from '../logging'
-import { ArtifactMetadata, getDataRepository, type Artifact } from '../artifacts'
+import { ArtifactMetadata, getDataRepository, WorkspaceSourceInfo, type Artifact } from '../artifacts'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { ModuleResolver, ModuleTypeHint } from './resolver'
 import { Auth, createAuth, StoredCredentials } from '../auth'
@@ -674,7 +674,7 @@ export function createModuleLinker(fs: Pick<SyncFs, 'readFileSync'>, resolver: M
         }
 
         const resolved = resolver.resolveVirtualWithHint(spec, importer)
-        const hasTypeHint = typeof resolved !== 'string'
+        const hasTypeHint = typeof resolved !== 'string' // Array.isArray(resolved)
         const id = hasTypeHint ? resolved[0] : resolved
         if (modules[id]) {
             return modules[id]
@@ -1386,7 +1386,7 @@ export function createScriptModule(
         }
 
         if (cachedData && s.cachedDataRejected) {
-            getLogger().debug(`Rejected cached data`, location)
+            // getLogger().debug(`Rejected cached data`, location)
             cache!.evictCachedData(key!)
         } else if (produceCachedData) {
             cache!.setCachedData(key, s.createCachedData())
@@ -1459,6 +1459,20 @@ export function isSourceOrigin(o: SourceOrigin | {}): o is SourceOrigin {
     return Object.keys(o).length !== 0
 }
 
+function maybeGetArtifactWorkspaceSource(
+    manifest: { artifacts: Record<string, ArtifactMetadata>; sources?: WorkspaceSourceInfo[] },
+    hash: string
+) {
+    if (!manifest.sources) {
+        return
+    }
+
+    const m = manifest.artifacts[hash]
+    const index = m?.workspaceSourceInfo as number | undefined ?? 0
+
+    return manifest.sources[index]
+}
+
 export function getArtifactSourceMap(repo: BasicDataRepository, hash: string, storeHash: string) {
     if (isNullHash(storeHash)) {
         return false
@@ -1473,13 +1487,22 @@ export function getArtifactSourceMap(repo: BasicDataRepository, hash: string, st
     
         const runtimeSourceMap = m?.sourcemaps?.runtime
         if (!runtimeSourceMap) {
-            return false // Sourcemaps were intentionally excluded. Hide any traces.
+            return false // Sourcemaps were excluded. Hide any traces.
         }
-    
-        const [prefix, _, mapHash] = runtimeSourceMap.split(':')
-        const data = JSON.parse(repo.getDataSync(mapHash, 'utf-8'))
 
-        return data as SourceMapV3
+        const [prefix, _, mapHash] = runtimeSourceMap.split(':')
+        const data = JSON.parse(repo.getDataSync(mapHash, 'utf-8')) as SourceMapV3
+
+        const maybeSource = maybeGetArtifactWorkspaceSource(manifest, hash)
+        if (maybeSource) {
+            return { 
+                ...data, 
+                ...maybeSource,
+                workingDir: getWorkingDir(maybeSource.programId, maybeSource.projectId),
+            } as EnhancedSourceMap
+        }
+
+        return data 
     } catch (e){
         getLogger().warn(`Failed to get sourcemap for object: ${hash}`, e)
 
@@ -1503,12 +1526,16 @@ export function getArtifactOriginalLocation(pointer: string | DataPointer, type:
 
     const [_prefix, _storeHash, mapHash] = m.split(':')
     const data = JSON.parse(Buffer.from(repo.readDataSync(mapHash)).toString('utf-8')) as Required<SourceMapV3>
-    
+
     // Guesses the start line by skipping over empty lines
     let line = 0
     while (line < data.mappings.length && data.mappings[line] === ';') { line += 1 }
 
-    return getOriginalLocation(new SourceMap(data), pointer, line)
+    const workingDir = typeof metadata.workspaceSourceInfo === 'object' 
+        ? getWorkingDir(metadata.workspaceSourceInfo.programId, metadata.workspaceSourceInfo.projectId)
+        : undefined
+
+    return getOriginalLocation(new SourceMap(data), pointer, line, undefined, workingDir)
 }
 
 function getOriginalLocation(sourcemap: SourceMap, fileName: string, line = 0, column = 0, workingDirectory = getWorkingDir()) {
@@ -1519,22 +1546,30 @@ function getOriginalLocation(sourcemap: SourceMap, fileName: string, line = 0, c
 
     const dir = fileName.startsWith(pointerPrefix) ? workingDirectory : path.dirname(fileName)
     const source = path.resolve(dir, entry.originalSource)
+    const relSource = source.startsWith(getWorkingDir()) ? path.relative(getWorkingDir(), source) : source
 
-    return `${source}:${entry.originalLine + 1}:${entry.originalColumn + 1}`
+    return `${relSource}:${entry.originalLine + 1}:${entry.originalColumn + 1}`
 }
 
 // Needed to prune traces from the SEA build
 const selfPath = __filename
 
+interface EnhancedSourceMap extends SourceMapV3 {
+    readonly projectId?: string
+    readonly programId?: string
+    readonly deploymentId?: string
+    readonly workingDir?: string
+}
+
 export type SourceMapParser = ReturnType<typeof createSourceMapParser>
 export function createSourceMapParser(
     fs: SyncFs, 
     resolver?: ModuleResolver, 
-    workingDirectory = process.cwd(),
+    workingDirectory = getWorkingDir(),
     excludedDirs?: string[] // Excludes any frames from these directories
 ) {
-    const deferredSourceMaps = new Map<string, () => SourceMapV3 | false | undefined>()
-    const sourceMaps = new Map<string, SourceMap | undefined | false>()
+    const deferredSourceMaps = new Map<string, () => EnhancedSourceMap | false | undefined>()
+    const sourceMaps = new Map<string, (SourceMap & { workingDir?: string }) | undefined | false>()
     const files = new Map<string, string>()
     const isDebugMode = !!process.env['SYNAPSE_DEBUG']
     const aliases = new Map<string, string>()
@@ -1544,7 +1579,7 @@ export function createSourceMapParser(
     // TODO: remove usercode callsites that are from `__scope__`
     // TODO: remove the mapping for the wrapped user module (it's always at the last non-whitespace character)
 
-    function registerMapping(fileName: string, sourcemap: SourceMapV3) {
+    function registerMapping(fileName: string, sourcemap: EnhancedSourceMap) {
         if ((sourcemap as any).__internal) {
             internalModules.set(fileName, sourcemap.sources[0])
         }
@@ -1553,7 +1588,11 @@ export function createSourceMapParser(
         const mapping = new SourceMap(sourcemap as Required<typeof sourcemap>)
         sourceMaps.set(fileName, mapping)
 
-        return mapping
+        if (sourcemap.workingDir) {
+            Object.assign(mapping, { workingDir: sourcemap.workingDir })
+        }
+
+        return mapping as SourceMap & { workingDir?: string }
     }
 
     function setAlias(original: string, alias: string) {
@@ -1584,7 +1623,7 @@ export function createSourceMapParser(
         } catch (e) {
             throwIfNotFileNotFoundError(e)
 
-            getLogger().debug(`Missing file: ${fileName}`, (e as any).message)
+            getLogger().debug(`[sourcemaps]: missing file: ${fileName}`, (e as any).message)
         }
     }
 
@@ -1718,10 +1757,9 @@ export function createSourceMapParser(
                 continue
             }
 
+            const resolved = resolveAlias(fileName)
+            const dir = sourcemap.workingDir ?? (deferredSourceMaps.has(resolved) ? workingDirectory : path.dirname(resolved))
 
-            const dir = deferredSourceMaps.has(resolveAlias(fileName)) ? workingDirectory : path.dirname(resolveAlias(fileName)) // FIXME: `dirname` is probably wrong here
-            // const source = path.resolve(dir, entry.fileName)
-            // const originalLocation = `${source}:${entry.lineNumber}:${entry.columnNumber}`
             const source = path.resolve(dir, entry.originalSource)
             // Makes the traces more compact if the file is within the current dir
             const relSource = source.startsWith(workingDirectory) ? path.relative(workingDirectory, source) : source
@@ -1882,7 +1920,8 @@ function wrapProcess(
     return new Proxy(proc, {
         get: (target, prop, recv) => {
             if (prop === 'cwd') {
-                return () => workingDirectory
+                // TODO: `chdir`
+                return () => process.env['SYNAPSE_RUN_DIR'] ?? workingDirectory
             } else if (prop === 'arch') {
                 return arch
             } else if (prop === 'platform') {

@@ -209,16 +209,15 @@ export function createProgramBuilder(
             : undefined
 
         // Entrypoints for synthesis, not package entrypoints
-        const entrypoints = allDeps ?  [...allDeps.roots].map(x => path.relative(getWorkingDir(), x)) : []
         const deployables = Object.fromEntries(
-            [...infraFiles].map(f => [path.relative(getWorkingDir(), f), getOutputFilename(config.tsc.rootDir, config.tsc.cmd.options, f)])
+            [...infraFiles].map(f => [makeRelative(getWorkingDir(), f), getOutputFilename(config.tsc.rootDir, config.tsc.cmd.options, f)])
         )
 
         const entrypointsFile: EntrypointsFile = {
-            entrypoints,
+            entrypoints: Object.keys(deployables),
             deployables,
             executables: Object.fromEntries(
-                [...executables].map(f => [path.relative(getWorkingDir(), f), getOutputFilename(config.tsc.rootDir, config.tsc.cmd.options, f)])
+                [...executables].map(f => [makeRelative(getWorkingDir(), f), getOutputFilename(config.tsc.rootDir, config.tsc.cmd.options, f)])
             )
         }
 
@@ -495,8 +494,8 @@ export function createEmitHost() {
             } else {
                 const bt = getBuildTargetOrThrow()
                 compilerHost.addSource(
-                    path.relative(bt.workingDirectory, sourceFile.fileName), 
-                    compilerHost.getOutputFilename(sourceFile.fileName), 
+                    makeRelative(bt.workingDirectory, sourceFile.fileName), 
+                    makeRelative(bt.workingDirectory, compilerHost.getOutputFilename(sourceFile.fileName)), 
                     true
                 )
             }

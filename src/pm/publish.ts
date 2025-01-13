@@ -213,7 +213,7 @@ export async function linkPackage(opt?: PublishOptions & { globalInstall?: boole
         await pruneDeps()
     }
 
-    const { snapshot } = await createPackageForRelease(packageDir, resolvedDir, { skipBinaryDeps: true }, pkgName !== 'synapse', true, true)
+    const { snapshot } = await createPackageForRelease(packageDir, resolvedDir, { skipBinaryDeps: true }, pkgName !== 'synapse', true, true, opt?.includeSourceMaps)
 
     if (pkgName === 'synapse' || pkgName.startsWith('synapse-')) {
         await setPathKey(`projectOverrides.${pkgName}`, resolvedDir)

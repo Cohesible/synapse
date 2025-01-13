@@ -125,8 +125,9 @@ export function startGarbageCollection(buildDir?: string) {
 }
 
 
-interface GcTrigger extends AsyncDisposable {
+interface GcTrigger {
     cancel(): void
+    dispose(): Promise<void>
 }
 
 export function maybeCreateGcTrigger(alwaysRun = false): GcTrigger | undefined {
@@ -181,10 +182,7 @@ export function maybeCreateGcTrigger(alwaysRun = false): GcTrigger | undefined {
         }
     }
 
-    return {
-        cancel,
-        [Symbol.asyncDispose]: dispose,
-    }
+    return { cancel, dispose }
 }
 
 async function collectGarbage(repo: DataRepository, exclude: Set<string>, pruneAge = getPruneAge()) {

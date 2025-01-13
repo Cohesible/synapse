@@ -258,8 +258,6 @@ export function main(...args: string[]) {
             ? isCi ? logToStderr(getLogger(), logLevel) : logToFile(getLogger(), logLevel) 
             : undefined
 
-        let didThrow = false
-
         function handleUnknownError(e: unknown) {
             try {
                 if (process.stdout.isTTY) {
@@ -282,7 +280,6 @@ export function main(...args: string[]) {
             handledError = e
 
             if (e instanceof CancelError) {
-                didThrow = true
                 return
             }
 
@@ -296,8 +293,6 @@ export function main(...args: string[]) {
             } else {
                 handleUnknownError(e)
             }
-
-            didThrow = true
         } finally {
             await dispose()
             await disposable?.dispose() // No more log events will be emitted
@@ -308,20 +303,21 @@ export function main(...args: string[]) {
                 process.stderr.write(`Forcibly shutting down\n`)
                 if (process.env['SYNAPSE_DEBUG'] || process.env['CI']) {
                     process.stderr.write(`Active resources: ${(process as any).getActiveResourcesInfo()}\n`, () => {
-                        process.exit(didThrow ? 1 : undefined)
+                        process.exit(handledError ? 1 : undefined)
                     })
                 } else {
-                    process.exit(didThrow ? 1 : undefined)
+                    process.exit(handledError ? 1 : undefined)
                 }
             }, 5000).unref()
 
+            process.exitCode = process.exitCode || (handledError ? 1 : 0)
+
+            process.stdin.unref?.()
+            process.stdout.unref?.()
+            process.stderr.unref?.()
+
             if (process.stdout.isTTY) {
-                tryGracefulExit(didThrow ? 1 : undefined)
-            } else {
-                process.stdin.unref?.()
-                process.stdout.unref?.()
-                process.stderr.unref?.()    
-                process.exitCode = process.exitCode || (didThrow ? 1 : 0)
+                tryGracefulExit()
             }
         }
     }

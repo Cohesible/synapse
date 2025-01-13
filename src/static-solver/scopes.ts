@@ -29,6 +29,7 @@ export interface Scope {
     readonly node: ts.Node
     readonly symbol?: Symbol // Not all scopes have an associated symbol
     readonly thisSymbol?: Symbol
+    readonly superSymbol?: Symbol
     readonly staticThisSymbol?: Symbol
     readonly dependencies: Set<Symbol>
     readonly parent?: Scope
@@ -436,6 +437,38 @@ function createDependencyGraph() {
         return createGlobalSymbol('this')
     }
 
+    // FIXME: this impl. is incomplete and doesn't track static vs. non-static `super`
+    function createSuperSymbol(scope: Scope, val: ts.Node, isStatic?: boolean) {
+        const sym = createSymbol('super', val)
+        ;(sym as Mutable<Symbol>).parentScope = scope
+
+        return sym
+    }
+
+    function getSuperSymbol() {
+        for (let i = stack.length - 1; i >= 0; i--) {
+            const scope = stack[i]
+            const val = scope.symbol?.declaration
+            if (val === undefined || !ts.isClassLike(val)) {
+                continue
+            }
+            
+            if (scope.superSymbol !== undefined) {
+                return scope.superSymbol
+            }
+
+            const superExp = val.heritageClauses?.find(x => x.token === ts.SyntaxKind.ExtendsKeyword)?.types[0]
+            if (!superExp) break
+
+            const sym = createSuperSymbol(scope, superExp, false)
+            ;(scope as Mutable<Scope>).superSymbol = sym
+
+            return sym
+        }
+
+        return
+    }
+
     function findSymbol(name: string): Symbol | undefined {
         for (let i = stack.length - 1; i >= 0; i--) {
             const scope = stack[i].symbol?.declaration
@@ -502,7 +535,7 @@ function createDependencyGraph() {
             const parentSym = parentScope.symbol
             const parentVal = parentSym?.declaration
 
-            if (parentVal && (ts.isClassDeclaration(parentVal) || ts.isClassExpression(parentVal))) {
+            if (parentVal && ts.isClassLike(parentVal)) {
                 const targetSym = isStaticDeclaration(node) ? parentSym : getPrototypeSymbol(parentSym)
                 addMember(targetSym, symbol.name, symbol)
             }
@@ -675,15 +708,31 @@ function createDependencyGraph() {
     }
 
     function visitIdentifier(node: ts.Identifier) {
-        if (ts.isJsxAttribute(node.parent) && node.parent.name === node) {
-            return
+        // if (ts.isJsxAttribute(node.parent) && node.parent.name === node) {
+        //     return
+        // }
+
+        switch (node.parent.kind) {
+            // BIG HACK
+            // We're exploiting the fact that lowercase tags are intrinsic instead of fixing the real problem
+            case ts.SyntaxKind.JsxOpeningElement:
+            case ts.SyntaxKind.JsxClosingElement:
+            case ts.SyntaxKind.JsxSelfClosingElement:
+                if ((node.parent as ts.JsxOpeningElement).tagName === node && node.text.toLowerCase() === node.text) {
+                    return
+                }
+                break
+
+            case ts.SyntaxKind.JsxAttribute:
+                if ((node.parent as ts.JsxAttribute).name === node) {
+                    return
+                }
+                break
         }
 
-        // BIG HACK
-        // We're exploiting the fact that lowercase tags are intrinsic instead of fixing the real problem
-        if ((ts.isJsxOpeningElement(node.parent) || ts.isJsxClosingElement(node.parent) || ts.isJsxSelfClosingElement(node.parent)) && node.parent.tagName === node && node.text.toLowerCase() === node.text) {
-            return
-        }
+        // if ((ts.isJsxOpeningElement(node.parent) || ts.isJsxClosingElement(node.parent) || ts.isJsxSelfClosingElement(node.parent)) && node.parent.tagName === node && node.text.toLowerCase() === node.text) {
+        //     return
+        // }
 
         const name = node.text
 
@@ -711,6 +760,15 @@ function createDependencyGraph() {
         return thisSymbol
     }
 
+    function visitSuperExpression(node: ts.SuperExpression) {
+        const sym = getSuperSymbol()
+        if (!sym) return
+
+        addReference(node, sym)
+
+        return sym
+    }
+
     function getMemberSymbol(target: Symbol, member: string | Symbol): Symbol {
         if (target.members.has(member)) {
             return target.members.get(member)!
@@ -719,11 +777,10 @@ function createDependencyGraph() {
         const name = typeof member === 'string' ? member : printSymbol(member)
         const memberSym = createSymbol(name, undefined, typeof member !== 'string')
         target.members.set(member, memberSym)
+        ;(memberSym as Mutable<Symbol>).parent = target
+        ;(memberSym as Mutable<Symbol>).argSymbol = typeof member !== 'string' ? member : undefined
 
-        return Object.assign(memberSym, { 
-            parent: target,
-            argSymbol: typeof member !== 'string' ? member : undefined
-        })
+        return memberSym
     }
 
     function visitPropertyAccessExpression(node: ts.PropertyAccessExpression): Symbol | undefined {
@@ -795,9 +852,8 @@ function createDependencyGraph() {
 
         const currentScope = stack[stack.length - 1]
         const memberSymbol = createSymbol(node.name.text, node)
-        currentScope.symbol!.members.set(node.name.text, Object.assign(memberSymbol, {
-            parent: currentScope.symbol
-        }))
+        ;(memberSymbol as Mutable<Symbol>).parent = currentScope.symbol
+        currentScope.symbol!.members.set(node.name.text, memberSymbol)
 
         return memberSymbol
     }
@@ -806,29 +862,29 @@ function createDependencyGraph() {
         const left = visitExpression(node.left)
         const right = visitExpression(node.right)
 
-        switch (node.operatorToken.kind) {
-            case ts.SyntaxKind.EqualsToken:
-            case ts.SyntaxKind.PlusEqualsToken: 
-            case ts.SyntaxKind.MinusEqualsToken:
-            case ts.SyntaxKind.AsteriskAsteriskEqualsToken:
-            case ts.SyntaxKind.AsteriskEqualsToken:
-            case ts.SyntaxKind.SlashEqualsToken:
-            case ts.SyntaxKind.PercentEqualsToken:
-            case ts.SyntaxKind.AmpersandEqualsToken:
-            case ts.SyntaxKind.BarEqualsToken:
-            case ts.SyntaxKind.CaretEqualsToken:
-            case ts.SyntaxKind.LessThanLessThanEqualsToken:
-            case ts.SyntaxKind.GreaterThanGreaterThanGreaterThanEqualsToken:
-            case ts.SyntaxKind.GreaterThanGreaterThanEqualsToken:
-            case ts.SyntaxKind.BarBarEqualsToken:
-            case ts.SyntaxKind.AmpersandAmpersandEqualsToken:
-            case ts.SyntaxKind.QuestionQuestionEqualsToken: {
-                // const target = isSymbol(left) ? getGraphFromSymbol(left) : left
-                // if (target && target !== stack[stack.length - 1]) {
-                //     target.sideEffects.push(node)
-                // }
-            }        
-        }
+        // switch (node.operatorToken.kind) {
+        //     case ts.SyntaxKind.EqualsToken:
+        //     case ts.SyntaxKind.PlusEqualsToken: 
+        //     case ts.SyntaxKind.MinusEqualsToken:
+        //     case ts.SyntaxKind.AsteriskAsteriskEqualsToken:
+        //     case ts.SyntaxKind.AsteriskEqualsToken:
+        //     case ts.SyntaxKind.SlashEqualsToken:
+        //     case ts.SyntaxKind.PercentEqualsToken:
+        //     case ts.SyntaxKind.AmpersandEqualsToken:
+        //     case ts.SyntaxKind.BarEqualsToken:
+        //     case ts.SyntaxKind.CaretEqualsToken:
+        //     case ts.SyntaxKind.LessThanLessThanEqualsToken:
+        //     case ts.SyntaxKind.GreaterThanGreaterThanGreaterThanEqualsToken:
+        //     case ts.SyntaxKind.GreaterThanGreaterThanEqualsToken:
+        //     case ts.SyntaxKind.BarBarEqualsToken:
+        //     case ts.SyntaxKind.AmpersandAmpersandEqualsToken:
+        //     case ts.SyntaxKind.QuestionQuestionEqualsToken: {
+        //         const target = isSymbol(left) ? getGraphFromSymbol(left) : left
+        //         if (target && target !== stack[stack.length - 1]) {
+        //             target.sideEffects.push(node)
+        //         }
+        //     }        
+        // }
     
         return undefined
     }
@@ -874,6 +930,8 @@ function createDependencyGraph() {
                     return visitIdentifier(node as ts.Identifier)
                 case ts.SyntaxKind.ThisKeyword:
                     return visitThisExpression(node as ts.ThisExpression)
+                case ts.SyntaxKind.SuperKeyword:
+                    return visitSuperExpression(node as ts.SuperExpression)
                 case ts.SyntaxKind.PropertyAccessExpression:
                     return visitPropertyAccessExpression(node as ts.PropertyAccessExpression)
                 case ts.SyntaxKind.ElementAccessExpression:
@@ -913,7 +971,7 @@ function createDependencyGraph() {
     function visitImportDeclaration(node: ts.ImportDeclaration) {
         const clause = node.importClause
         if (!clause) {
-            // side-effect inducing
+            // side-effect import
             return
         }
 
@@ -927,9 +985,10 @@ function createDependencyGraph() {
             if (ts.isNamespaceImport(bindings)) {
                 bindWithClause(bindings.name)
             } else {
-                bindings.elements.forEach(e => {
-                    bindWithClause(e.name)
-                })
+                const len = bindings.elements.length
+                for (let i = 0; i < len; i++) {
+                    bindWithClause(bindings.elements[i].name)
+                }
             }
         }
 
@@ -996,63 +1055,60 @@ function createDependencyGraph() {
     }
 
     function visit(node: ts.Node) {
-        if (isTypeNode(node)) {
-            return
-        }
-
-        if (isScopeNode(node)) {
-            // XXX: this leaks the symbols into the outer scope. We're assuming that the method decl is apart of an object literal exp.
-            if (node.kind === ts.SyntaxKind.MethodDeclaration && (node as any).name.kind === ts.SyntaxKind.ComputedPropertyName && node.parent.kind === ts.SyntaxKind.ObjectLiteralExpression) {
-                visitExpression((node as any).name.expression)
+        switch (node.kind) {
+            case ts.SyntaxKind.PropertyAssignment: {
+                if (ts.isComputedPropertyName((node as ts.PropertyAssignment).name)) {
+                    const name = (node as ts.PropertyAssignment).name as ts.ComputedPropertyName
+                    visitExpression(name.expression)
+                }
+    
+                return void visit((node as ts.PropertyAssignment).initializer)
             }
+    
+            case ts.SyntaxKind.PropertyDeclaration:
+                return (node as ts.PropertyDeclaration).initializer 
+                    ? void visit((node as ts.PropertyDeclaration).initializer!) 
+                    : undefined
 
-            return void visitScopeNode(node)
-        }
+            case ts.SyntaxKind.ExpressionStatement:
+                return void visitExpression((node as ts.ExpressionStatement).expression)
+    
+            case ts.SyntaxKind.EnumMember:
+                return void visitEnumMember(node as ts.EnumMember)
+    
+            case ts.SyntaxKind.CatchClause:
+                return void visitCatchClause(node as ts.CatchClause)
 
-        if (ts.isPropertyAssignment(node)) {
-            if (ts.isComputedPropertyName(node.name)) {
-                visitExpression(node.name.expression)
-            }
+            case ts.SyntaxKind.ExportDeclaration:
+                return void visitExportDeclaration(node as ts.ExportDeclaration)
 
-            return void visit(node.initializer)
-        }
+            case ts.SyntaxKind.LabeledStatement:
+                return void visit((node as ts.LabeledStatement).statement)
 
-        if (ts.isPropertyDeclaration(node)) {
-            return node.initializer ? void visit(node.initializer) : void 0
+            // This will be visited earlier
+            case ts.SyntaxKind.ImportDeclaration:
+            // Skip labels
+            case ts.SyntaxKind.BreakStatement:
+            case ts.SyntaxKind.ContinueStatement:
+                return
+
         }
 
         if (ts.isExpression(node)) {
             return void visitExpression(node)
         }
 
-        if (ts.isExpressionStatement(node)) {
-            return void visitExpression(node.expression)
-        }
-
-        if (ts.isEnumMember(node)) {
-            return void visitEnumMember(node)
-        }
-
-        if (ts.isCatchClause(node)) {
-            return void visitCatchClause(node)
-        }
-
-        if (ts.isExportDeclaration(node)) {
-            return void visitExportDeclaration(node)
-        }
-
-        if (ts.isLabeledStatement(node)) {
-            return void visit(node.statement)
-        }
-
-        // Skip labels
-        if (ts.isBreakOrContinueStatement(node)) {
+        if (isTypeNode(node)) {
             return
         }
 
-        // This will be visited earlier
-        if (ts.isImportDeclaration(node)) {
-            return
+        if (isScopeNode(node)) {
+            // XXX: this leaks the symbols into the outer scope. We're assuming that the method decl is apart of an object literal exp.
+            if (ts.isMethodDeclaration(node) && ts.isComputedPropertyName(node.name) && ts.isObjectLiteralExpression(node.parent)) {
+                visitExpression(node.name.expression)
+            }
+
+            return void visitScopeNode(node)
         }
 
         node.forEachChild(visit)

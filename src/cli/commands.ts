@@ -553,6 +553,7 @@ registerTypedCommand(
             { name: 'plan-depth', type: 'number', hidden: true },
             { name: 'expect-no-changes', type: 'boolean', hidden: true }, // For tests
             { name: 'debug', type: 'boolean', hidden: true },
+            { name: 'sync', type: 'boolean', hidden: true },
             ...deployOptions, 
         ],
         requirements: { program: true, process: true },
@@ -578,6 +579,7 @@ registerTypedCommand(
         }
 
         await synapse.deploy(files, {
+            ...opt,
             symbols: opt['symbol'],
             forceRefresh: opt['refresh'],
             deployTarget: opt['target'],
@@ -673,6 +675,7 @@ registerTypedCommand(
         args: [varargsFiles],
         options: [
             ...buildTargetOptions, 
+            deployTargetOption,
             // TODO: should this include all compile/deploy options because this can do both?
             // I've wanted to do `test --target aws` a few times now
             // I'm thinking we'll categorize options by commands but still have options share a global namespace
@@ -691,7 +694,8 @@ registerTypedCommand(
     async (...args) => {
         const [files, opt] = unpackArgs(args)
 
-        await synapse.runTests(files, { 
+        await synapse.runTests(files, {
+            deployTarget: opt['target'],
             destroyAfter: opt['destroy-after'],
             rollbackIfFailed: opt['rollback-if-failed'],
             filter: opt['filter'],
@@ -723,7 +727,7 @@ registerTypedCommand(
             { name: 'infra', type: 'boolean' }
         ],
     },
-    (obj, opt) => synapse.showRemoteArtifact(obj, opt)
+    (obj, opt) => synapse.showPointer(obj, opt)
 )
 
 registerTypedCommand(
@@ -733,6 +737,7 @@ registerTypedCommand(
         hidden: true,
         options: [
             { name: 'local', type: 'boolean', description: 'Writes to the local Synapse package repository. This is scoped per-project, use `spr:#<pkg-name>` as the version string in consumer packages.' },
+            { name: 'sourcemaps', type: 'boolean', hidden: true },
             { name: 'remote', type: 'boolean', hidden: true },
             { name: 'dry-run', type: 'boolean', hidden: true },
             { name: 'skip-install', type: 'boolean', hidden: true },
@@ -891,6 +896,8 @@ registerTypedCommand(
             passthroughSwitch, 
             { name: 'skipValidation', type: 'boolean', hidden: true }, 
             { name: 'skipCompile', type: 'boolean', hidden: true }, 
+            { name: 'runDir', type: 'string', hidden: true }, 
+
             { name: 'no-deploy', type: 'boolean', description: 'Skips any prompts to deploy the program' },
             ...buildTargetOptions
         ],
@@ -1062,7 +1069,8 @@ registerTypedCommand(
             { name: 'force', type: 'boolean', description: 'Forcibly installs the CLI over the existing version' },
             // TODO: add implications to provider better generated docs.
             // I think `--tag` should imply `--force` 
-            { name: 'tag', type: 'string', description: 'Download the build associated with a git tag' }
+            { name: 'tag', type: 'string', description: 'Download the build associated with a git tag' },
+            { name: 'hash', type: 'string', hidden: true, description: 'Artifact hash. Does not check compat.' },
         ],
         requirements: { program: false }
     },
@@ -1134,6 +1142,7 @@ registerTypedCommand(
             { name: 'no-sea', type: 'boolean' },
             { name: 'minify', type: 'boolean' },
             { name: 'synapse-path', type: 'string' },
+            { name: 'optimize', hidden: true, type: 'boolean' },
 
             // Cross-compilation (currently broken due to v8 heap snapshots and/or code caches not being portable)
             { name: 'os', type: createEnumType('windows', 'linux', 'darwin'), hidden: true },
@@ -1150,6 +1159,7 @@ registerTypedCommand(
             minify: opt['minify'],
             lazyLoad: opt['lazy-load'],
             synapsePath: opt['synapse-path'],
+            useOptimizer: opt['optimize'],
         })
     },
 )
@@ -1930,11 +1940,19 @@ async function parseArgs(args: string[], desc: CommandDescriptor) {
     return { args: parsedArgs, options }
 }
 
+function getEnvironmentName(params: string[]) {
+    const environmentIndex = params.indexOf('--environment')
+    if (environmentIndex !== -1) {
+        return params[environmentIndex+1]
+    }
+
+    return process.env.SYNAPSE_ENV || undefined
+}
+
 async function getBuildTarget(cmd: CommandDescriptor, params: string[]) {
     const start = performance.now()
     const cwd = process.cwd()
-    const environmentIndex = params.indexOf('--environment')
-    const environmentName = (environmentIndex !== -1 ? params[environmentIndex+1] : undefined) ?? process.env.SYNAPSE_ENV
+    const environmentName = getEnvironmentName(params)
     const res = await resolveProgramBuildTarget(cwd, { environmentName })
     if (!res && cmd.inferBuildTarget) {
         const programFiles = params.filter(x => x.match(/\.tsx?$/))

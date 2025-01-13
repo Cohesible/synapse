@@ -641,8 +641,10 @@ export async function synth(entrypoints: string[], deployables: string[], opt: S
 
     const bt = getBuildTargetOrThrow()
     ;(bt as Mutable<typeof bt>).deploymentId = deploymentId
+
+    const deployTarget = opt.deployTarget ?? opt.compilerOptions?.deployTarget ?? 'local'
     process.env.SYNAPSE_ENV = bt.environmentName // XXX: not clean
-    process.env.SYNAPSE_TARGET = opt.deployTarget ?? opt.compilerOptions?.deployTarget ?? 'local'
+    process.env.SYNAPSE_TARGET = deployTarget
 
     const store = await afs.getCurrentProgramStore().getSynthStore()
     const vfs = toFs(bt.workingDirectory, store.afs, getFs())
@@ -752,8 +754,7 @@ export async function synth(entrypoints: string[], deployables: string[], opt: S
     const getInfraSource = (fileName: string, id: string, virtualLocation: string) => getSource(fileName, id, virtualLocation, 'infra')
     const runtime = loader.createRuntime(sources, getInfraSource, solvePerms, sourceMapping)
 
-    // The target module is always the _source_ file
-    const workingDirectory = opt.compilerOptions?.workingDirectory ?? process.cwd()
+    const workingDirectory = opt.compilerOptions?.workingDirectory ?? bt.workingDirectory
     const targetModules = entrypoints.map(x => path.resolve(workingDirectory, x)).map(x => {
         const resolved = sources.find(s => s.source === x)?.name
         if (!resolved) {
@@ -800,7 +801,7 @@ export async function synth(entrypoints: string[], deployables: string[], opt: S
 
         return terraform.finalize({ 
             synapseVersion, 
-            deployTarget: opt?.deployTarget,
+            deployTarget: deployTarget,
             envVarHashes: prunedEnvVars ? getEnvVarHashes(prunedEnvVars) : undefined,
         })
     }

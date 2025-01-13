@@ -2108,9 +2108,19 @@ function createJsonPathScanner(expression: string) {
     return { scan }
 }
 
-export function findAutomaticMoves(state: TfState, oldGraph: SymbolGraph, newGraph: SymbolGraph) {
+export function findAutomaticMoves(state: TfState, oldGraph: SymbolGraph, newGraph: SymbolGraph, currentMoved?: { from: string; to: string }[]) {
     const grouped = new Map<string, Set<string>>()
     const resources = new Map<string, TfResource>()
+
+    const ignoredOld = new Set<string>()
+    const ignoredNew = new Set<string>()
+
+    if (currentMoved) {
+        for (const m of currentMoved) {
+            ignoredOld.delete(m.from)
+            ignoredNew.delete(m.to)
+        }
+    }
 
     function getGroupKey(resourceKey: string, graph: SymbolGraph) {
         const ty = graph.getResourceType(resourceKey)
@@ -2133,6 +2143,7 @@ export function findAutomaticMoves(state: TfState, oldGraph: SymbolGraph, newGra
 
     for (const r of state.resources) {
         const key = `${r.type}.${r.name}`
+        if (ignoredOld.has(key)) continue
         if (!oldGraph.hasResource(key)) continue
 
         resources.set(key, r)
@@ -2155,6 +2166,8 @@ export function findAutomaticMoves(state: TfState, oldGraph: SymbolGraph, newGra
     const dupes = new Map<string, string>()
     const dupeSet = new Set<string>()
     for (const k of newGraph.getResourceKeys()) {
+        if (ignoredNew.has(k)) continue
+
         const abs = newGraph.getAbsoluteKey(k)
         const v = dupes.get(abs)
         if (v === undefined) {
@@ -2168,6 +2181,7 @@ export function findAutomaticMoves(state: TfState, oldGraph: SymbolGraph, newGra
     const moved: { from: string; to: string }[] = []
     const unmatched = new Map<string, Set<string>>()
     for (const k of newGraph.getResourceKeys()) {
+        if (ignoredNew.has(k)) continue
         if (dupeSet.has(k)) continue
 
         const groupKey = getGroupKey(k, newGraph)

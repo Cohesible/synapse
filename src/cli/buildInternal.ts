@@ -375,7 +375,8 @@ export async function createPackageForRelease(
     target?: Partial<QualifiedBuildTarget> & BuildTargetExtras, 
     isIntegration?: boolean, 
     useCompiledPkgJson = false, 
-    keepExportedTypes = false
+    keepExportedTypes = false,
+    keepSourcemaps = false,
 ) {
     const pkg = await getPackageJsonOrThrow(pkgDir) 
     const bt = await resolveProgramBuildTarget(pkgDir, { environmentName: target?.environmentName })
@@ -425,10 +426,16 @@ export async function createPackageForRelease(
     for (const f of Object.keys(pruned.files)) {
         if (isIntegration && (f.endsWith('.js') || f.endsWith('.d.ts')) || f === 'package.json') {
             filesToKeep.push(f)
+        } else if (keepSourcemaps && f.endsWith('.map')) {
+            filesToKeep.push(f)
         }
     }
 
-    const consolidated = await consolidateBuild(getDataRepository(), pruned, filesToKeep, { strip: true })
+    const consolidated = await consolidateBuild(getDataRepository(), pruned, filesToKeep, { 
+        strip: !keepSourcemaps,
+        sourceInfo: keepSourcemaps ? { programId: bt.programId, projectId: bt.projectId, deploymentId: bt.deploymentId } : undefined,
+    })
+
     const { snapshot } = await createSnapshot(consolidated.index, programId, deploymentId)
 
     pruneSnapshot(snapshot, filesToKeep, keepExportedTypes)

@@ -1,3 +1,4 @@
+import * as ui from '../cli/ui'
 import * as path from 'node:path'
 import { getFs } from '../execution'
 import { createNpmLikeCommandRunner } from '../pm/publish'
@@ -14,6 +15,7 @@ const expectFailCommand = '@expectFail'
 const skipCleanCommand = '@skipClean'
 const renameCommand = '@rename'
 const expectEqualCommand = '@expectEqual'
+const expectMatchCommand = '@expectMatch'
 const inputCommand = '@input'
 const commentCommand = '@toggleComment'
 
@@ -47,6 +49,7 @@ interface RunTestOptions {
     baseline?: boolean
     snapshot?: boolean
     synapseCmd?: string
+    title?: string
 }
 
 export async function runInternalTestFile(fileName: string, opt?: RunTestOptions) {
@@ -99,6 +102,16 @@ function renderCommands(fileName: string, commands: string[], synapseCmd = proce
             }
 
             inner.push(`if [[ "${actual}" != "${expected}" ]]; then echo "Unexpected output: ${actual}"; false; fi`)
+            continue
+        }
+
+        if (c.startsWith(expectMatchCommand)) {
+            const [actual, expected] = parseShell(c.slice(expectMatchCommand.length + 1))
+            if (!actual || !expected) {
+                throw new Error(`Expected two arguments`)
+            }
+
+            inner.push(`if [[ ! "${actual}" =~ "${expected}" ]]; then echo "Unexpected output: ${actual}"; false; fi`)
             continue
         }
 
@@ -209,6 +222,12 @@ async function createBackup(fileName: string) {
 }
 
 async function runTest(fileName: string, commands: string[], opt?: RunTestOptions) {
+    if (opt?.title) {
+        console.log()
+        console.log(`--------------- ${opt.title} ---------------`)
+        console.log()
+    }
+    
     // Force `bash` on windows
     const shell = process.platform === 'win32' ? 'bash' : undefined
     const { cmd, shouldClean, hasRenames } = renderCommands(fileName, commands, opt?.synapseCmd)
@@ -304,23 +323,33 @@ function parseShell(cmd: string) {
 export async function main(...patterns: string[]) {
     const testDir = path.resolve(getWorkingDir(), 'test', 'fixtures')
     const tests = await findTests(testDir, patterns.length === 0 ? undefined : patterns)
+    console.log(`Found ${tests.length} fixtures`)
+    console.log('')
 
     const failures: [string, unknown][] = []
     for (const test of tests) {
+        const title = path.relative(testDir, test.fileName)
         try {
-            await runTest(test.fileName, test.commands)
+            await runTest(test.fileName, test.commands, { title })
         } catch (e) {
             failures.push([test.fileName, e])
+            console.log('')
+            console.log(ui.colorize('red', `~~~~~~~~~~~~ ${title} FAILED ~~~~~~~~~~~`))
+            console.log('')
         }
     }
 
-    console.log(`${tests.length - failures.length} test fixtures passed`)
-
-    if (failures.length > 0) {
-        for (const [fileName, e] of failures) {
-            console.log(`Test "${path.relative(testDir, fileName)}" failed`, e)
-        }
-
-        return 1
+    if (failures.length === 0) {
+        console.log(ui.colorize('green', 'All fixtures passed'))
+        return
     }
+
+    console.log(ui.colorize('brightRed', `${failures.length} fixtures failed`))
+    console.log()
+ 
+    for (const [fileName, e] of failures) {
+        console.log(ui.colorize('red', ` - ${path.relative(testDir, fileName)}`))
+    }
+
+    return 1
 }

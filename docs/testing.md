@@ -34,6 +34,24 @@ Use the command `synapse test` to run all tests. You can provide specific filena
 
 Note that tests are considered a "resource" (albeit a local one). That means a "deploy" operation is required to create/update tests. This happens automatically when you run `synapse test`. Any resources that your tests depend on could be updated which might not be wanted. A future release may include ways to control this behavior. 
 
+## Assertion functions
+
+`synapse:test` exports a few basic functions for making comparisons (equivalents are from `node:assert`):
+* `expect` - truthy check, equivalent to `ok`
+* `expectEqual` - deep comparison, equivalent to `assertDeepStrictEqual`
+* `expectReferenceEqual` - shallow comparison, equivalent to `assertStrictEqual`
+
+Something that should stand out is the swapping of deep equal and shallow equal. This was done because structural equality is far more useful and common for distributed systems.
+
+## Hooks
+
+Per-test lifecycle hooks can be registered using `before` and `after` which run before and after each test, respectively. Nested suites inherit the hooks of their parents.
+
+The order of execution for "inherited" hooks is different between `before` and `after`:
+`before` - top-down execution, start with the hooks in the top-most suite and work down
+`after`- bottom-up execution, start with the hooks in the bottom-most suite and work up
+
+
 ## Test isolation
 
 In contrast to many JS test frameworks, `synapse:test` executes each test in isolation.
@@ -59,25 +77,45 @@ Not everything is isolated between tests. The following are still shared for per
 
 This should not cause problems in the vast majority of cases. If you run into any problems, please create an issue and we can figure out a solution.
 
-## Assertion functions
+### Sharing state
 
-`synapse:test` exports a few basic functions for making comparisons (equivalents are from `node:assert`):
-* `expect` - truthy check, equivalent to `ok`
-* `expectEqual` - deep comparison, equivalent to `assertDeepStrictEqual`
-* `expectReferenceEqual` - shallow comparison, equivalent to `assertStrictEqual`
+Resources, by design, are not isolated across tests nor individual executions. **All tests see the same resource in a given environment.** 
 
-Something that should stand out is the swapping of deep equal and shallow equal. This was done because structural equality is far more useful and common for distributed systems.
+This can result in broken tests if not accounted for:
 
-## Hooks
+```ts
+import { Bucket } from 'synapse:srl/storage'
+import { test, expectEqual } from 'synapse:test'
 
-Per-test lifecycle hooks can be registered using `before` and `after` which run before and after each test, respectively. Nested suites inherit the hooks of their parents.
+const b = new Bucket()
 
-The order of execution for "inherited" hooks is different between `before` and `after`:
-`before` - top-down execution, start with the hooks in the top-most suite and work down
-`after`- bottom-up execution, start with the hooks in the bottom-most suite and work up
+test('put into bucket', () => {
+    await b.put('a', 'b')
+    expectEqual(await b.get('a', 'utf-8'), 'b')
+})
+
+// This test is not reliable!
+test('has nothing', () => {
+    const keys = await b.list()
+    expectEqual(keys, [])
+})
+```
+
+The suggested approach here is to add hooks to clean the resource before and/or after each test. For granular isolation, you can create resources isolated to a suite:
+
+```ts
+suite('empty bucket', () => {
+    const b = new Bucket()
+
+    test('has nothing', () => {
+        const keys = await b.list()
+        expectEqual(keys, [])
+    }) 
+})
+```
 
 ## Using other testing frameworks
 
-Other frameworks have not been tested, however, it might be possible to use existing frameworks with varying degrees of functionality. 
+Other frameworks have not been tested, however, it should be possible to use existing frameworks with varying degrees of functionality. 
 
 In general, mocking and assertion utilities should be compatible.

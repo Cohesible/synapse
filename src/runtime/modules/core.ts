@@ -95,7 +95,7 @@ export function asset(path: string): OpaquePointer {
     throw new Error(`Failed to transform "asset" calls`)
 }
 
-/** @internal */
+/** @internal @deprecated */
 export function cwd() {
     if (typeof __cwd === 'undefined') {
         return process.cwd()
@@ -480,6 +480,11 @@ export function getBoundContext<T = unknown>(target: any, ctor: ContextConstruct
     const type = ctor[contextType]
     
     return contexts?.[type]?.[0]
+}
+
+/** @internal */
+export function getResourceId(obj: any) {
+    return terraform.getResourceId(obj)
 }
 
 /** @internal */

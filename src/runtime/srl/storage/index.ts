@@ -12,6 +12,8 @@ import { HostedZone } from 'synapse:srl/net'
 //# resource = true
 export declare class Queue<T = unknown> {
     send(val: T): Promise<void> 
+
+    // TODO: this should return Promise<{ result: U } | undefined> or similar
     /** @internal */
     consume<U>(fn: (val: T) => U | Promise<U>): Promise<U> 
 

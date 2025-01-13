@@ -69,7 +69,7 @@ function createSynthLogger(p: typeof process, c: typeof console): SynthLogger {
     return { console: consoleWrap, stdout: p.stdout, stderr: p.stderr }
 }
 
-function wrapProcess(proc: typeof process) {
+function wrapProcess(proc: typeof process, workingDir: string) {
     // We'll track values globally for now because synthesis is still global
     const capturedEnv = new Map<string, string | undefined>()
 
@@ -100,8 +100,10 @@ function wrapProcess(proc: typeof process) {
         }
     })
 
+    const cwd = () => workingDir
+
     return {
-        process: wrapWithProxy(proc, { env }),
+        process: wrapWithProxy(proc, { env, cwd }),
         getCapturedEnvVars: () => capturedEnv.size === 0 ? undefined : Object.fromEntries(capturedEnv),
     } 
 }
@@ -151,7 +153,7 @@ export function createrLoader(
 
         const context = createContextStorage(workingDirectory, runtimeToSourceFile, moduleResolver, sourceMapping)
 
-        const wrappedProc = wrapProcess(process)
+        const wrappedProc = wrapProcess(process, workingDirectory)
 
         function createTerraformState(): terraform.State {
             return {
@@ -481,6 +483,7 @@ export function createrLoader(
                 Error,
                 setTimeout,
                 clearTimeout,
+                queueMicrotask,
                 // Initializing `Response` is fairly slow
                 get Response() {
                     return Response
@@ -528,7 +531,6 @@ export function createrLoader(
                     const ctx = context.save()
                     deferred.push({ ctx, fn })
                 },
-                __cwd: () => workingDirectory,
                 __buildTarget: buildTarget,
                 __deployTarget: deployTarget,
                 get __runCommand() {

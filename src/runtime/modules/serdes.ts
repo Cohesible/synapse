@@ -247,7 +247,8 @@ export function resolveValue(
         }
 
         if (privateFields !== undefined && deserialize in obj) {
-            obj[deserialize]({ __privateFields: privateFields })
+            // XXX: `__privateFields` is legacy/temporary
+            obj[deserialize]({ privateFields, __privateFields: privateFields })
         }
 
         return obj
@@ -347,7 +348,6 @@ export function resolveValue(
             }
 
             const val = resolveValueType()
-
             if (id !== undefined) {
                 resolveCache.set(id, val)
             }

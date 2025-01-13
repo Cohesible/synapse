@@ -1539,6 +1539,12 @@ export function throwIfNotFileNotFoundError(err: unknown): asserts err is Error 
     }
 }
 
+export function throwIfNotMissingOrDir(err: unknown): asserts err is Error & { code: 'EISDIR' | 'ENOENT' } {
+    if (util.types.isNativeError(err) && !['EISDIR', 'ENOENT'].includes((err as any).code)) {
+        throw err
+    }
+}
+
 export async function tryReadJson<T>(fs: Pick<Fs, 'readFile'>, fileName: string) {
     try {
         return JSON.parse(await fs.readFile(fileName, 'utf8')) as T

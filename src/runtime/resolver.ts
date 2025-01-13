@@ -2,182 +2,16 @@ import * as path from 'node:path'
 import { isBuiltin } from 'node:module'
 import { SyncFs } from '../system'
 import { getSpecifierComponents, resolveBareSpecifier, resolvePrivateImport } from '../pm/packages'
-import { createTrie, isRelativeSpecifier, keyedMemoize, memoize, throwIfNotFileNotFoundError } from '../utils'
+import { isRelativeSpecifier, keyedMemoize, memoize, throwIfNotFileNotFoundError } from '../utils'
 import { ImportMap, SourceInfo } from './importMaps'
 import { PackageJson } from '../pm/packageJson'
 import { isDataPointer } from '../build-fs/pointers'
 import { getLogger } from '../logging'
+import { createLookupTable, MapNode } from './lookup'
 
 const pointerPrefix = 'pointer:'
 export const synapsePrefix = 'synapse:'
 export const providerPrefix = 'synapse-provider:'
-
-type LocationType = 'module' | 'package'
-
-interface Mapping {
-    readonly virtualLocation: string
-    readonly physicalLocation: string
-    readonly locationType?: LocationType
-}
-
-export interface MapNode {
-    readonly location: string
-    readonly locationType?: LocationType
-    readonly mappings: Record<string, Mapping>
-    readonly source?: SourceInfo
-}
-
-function createLookupTable() {
-    const trie = createTrie<MapNode, string[]>()
-    const keys = new Map<ImportMap[string], string>()
-
-    function getMapKey(map: ImportMap[string]) {
-        if (keys.has(map)) {
-            return keys.get(map)!
-        }
-
-        const k = `__vp${keys.size}`
-        keys.set(map, k)
-
-        return k
-    }
-
-    const locationKeys = new Map<string, string[]>()
-    function getLocationKey(location: string): string[] {
-        const cached = locationKeys.get(location)
-        if (cached !== undefined) {
-            return cached
-        }
-
-        const segments = location.split(path.sep)
-        const trimmed = location.endsWith(path.sep) ? segments.slice(-1) : segments
-        locationKeys.set(location, trimmed)
-
-        return trimmed
-    }
-
-    function updateNode(key: string[], map: ImportMap, location: string, rootKey = key, locationType?: LocationType, source?: SourceInfo, visited = new Set<ImportMap>) {
-        if (visited.has(map)) return
-        visited.add(map)
-
-        const mappings = trie.get(key)?.mappings ?? {}
-        trie.insert(key, { location, locationType, mappings, source })
-
-        for (const [k, v] of Object.entries(map)) {
-            const ck = getMapKey(v)
-            const key = [...rootKey, ck]
-            const virtualLocation = key.join(path.sep)
-            locationKeys.set(virtualLocation, key)
-            mappings[k] = {
-                virtualLocation,
-                physicalLocation: v.location,
-                locationType: v.locationType,
-            }
-
-            // Sift the mapping upwards to simulate node (TODO: is this still needed?)
-            if (key !== rootKey) {
-                const m = trie.get(rootKey)?.mappings
-                if (m && !m[k]) {
-                    m[k] = mappings[k]
-                }
-            }
-
-            updateNode(key, v.mapping ?? {}, v.location, rootKey, v.locationType, v.source, new Set([...visited]))
-        }
-    }
-
-    function lookup(specifier: string, location: string): Mapping | undefined {
-        const stack = trie.traverseAll(getLocationKey(location))
-
-        while (stack.length > 0) {
-            const v = stack.pop()!.mappings[specifier]
-            if (v) {
-                return v
-            }
-        }
-    }
-
-    function resolve(location: string) {
-        const key = getLocationKey(location)
-        const stack: (MapNode | undefined)[] = []
-        for (const v of trie.traverse(key)) {
-            stack.push(v)
-        }
-
-        const last = stack.pop()
-        if (!last || last.location === '/') {
-            return location
-        }
-
-        // We add 1 because we popped the stack
-        const suffix = key.slice(stack.length + 1)
-        if (last.locationType === 'module' && suffix.length > 0) {
-            return [path.dirname(last.location), ...suffix].join(path.sep)
-        }
-
-        return [last.location, ...suffix].join(path.sep)
-    }
-
-    function registerMapping(map: ImportMap, location: string = '/') {
-        const key = getLocationKey(location)
-        updateNode(key, map, location)
-    }
-
-    function getSource(location: string) {
-        const key = getLocationKey(location)
-        const stack: (MapNode | undefined)[] = []
-        for (const v of trie.traverse(key)) {
-            stack.push(v)
-        }
-
-        return stack[stack.length - 1]
-    }
-
-    function getSourceWithRemainder(location: string) {
-        const key = getLocationKey(location)
-        const stack = trie.traverseAll(key)
-
-        const node = stack[stack.length - 1]
-        if (!node) {
-            return
-        }
-
-        let specifier: string | undefined
-        let virtualLocation: string | undefined
-        if (stack.length > 1) {
-            const prior = stack[stack.length - 2].mappings
-            for (const k of Object.keys(prior)) {
-                if (prior[k].physicalLocation === node.location) {
-                    specifier = k
-                    virtualLocation = prior[k].virtualLocation
-                    break
-                }
-            }
-        }
-
-        return {
-            node,
-            specifier,
-            remainder: virtualLocation ? location.slice(virtualLocation.length + 1) : undefined, 
-        }
-    }
-
-    function inspect() {
-        function visit(key?: string[], value?: MapNode, depth = 0) {
-            for (const k of trie.keys(key)) {
-                const nk = key ? [...key, k] : [k]
-                const value = trie.get(nk)
-                console.log(`${' '.repeat(depth + 1)} -- ${k} -- ${value?.location}`)
-
-                visit(nk, value, depth + 1)
-            }
-        }
-
-        visit()
-    }
-
-    return { lookup, resolve, registerMapping, getSource, getSourceWithRemainder, inspect }
-}
 
 export interface PatchedPackage {
     readonly name: string
@@ -360,7 +194,7 @@ export function createModuleResolver(fs: Pick<SyncFs, 'readFileSync' | 'fileExis
         if (res !== undefined) {
             const filePath = res.physicalLocation
             if (res.locationType === 'module') {
-                return filePath
+                return filePath // res.virtualLocation
             }
 
             const pkg = getPackage(filePath)

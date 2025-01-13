@@ -569,7 +569,7 @@ async function getDefaultBranchCached(projectId: string) {
         return defaultBranchName
     }
 
-    const defaultBranch = await getDefaultBranch(proj.url)
+    const defaultBranch = await getDefaultBranch(proj.url, proj.directory)
     proj.defaultBranch = defaultBranch
     await setEntities(ents)
 
@@ -1152,7 +1152,17 @@ export async function findRemotePackage(spec: string): Promise<string | undefine
         const app = state.apps[v.appId]
         if (!app) continue
 
-        const env = app.environments[bt.environmentName ?? app.defaultEnvironment ?? 'local']
+        // We will match up `local` to any environment as long as it's the only environment
+        function getEnvironmentName(app: projects.AppInfo) {
+            const envs = Object.keys(app.environments)
+            if (envs.length === 1 && envs[0] === 'local') {
+                return envs[0]
+            }
+
+            return bt.environmentName ?? app.defaultEnvironment ?? 'local'
+        }
+
+        const env = app.environments[getEnvironmentName(app)]
         if (!env?.packageId) continue
 
         const dir = v.workingDirectory ? path.resolve(bt.rootDirectory, v.workingDirectory) : bt.rootDirectory
@@ -1281,7 +1291,6 @@ function getRemotePackageId(branch: Branch, programId: string) {
     const appId = branch.programs[programId]?.appId
     if (!appId) {
         return
-        // throw new Error(`No app id found for program: ${programId}`)
     }
 
     const app = branch.apps[appId]

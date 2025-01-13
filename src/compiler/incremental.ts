@@ -1,6 +1,6 @@
 import ts from 'typescript'
 import * as path from 'node:path'
-import { createFileHasher, isWindows, keyedMemoize, memoize, throwIfNotFileNotFoundError } from '../utils'
+import { createFileHasher, isWindows, keyedMemoize, memoize, throwIfNotFileNotFoundError, throwIfNotMissingOrDir } from '../utils'
 import { Fs } from '../system'
 import { getGlobalCacheDirectory } from '../workspaces'
 import { getFs, pushDisposable } from '../execution'
@@ -203,7 +203,7 @@ export function createIncrementalHost(opt: ts.CompilerOptions) {
         
         async function check(k: string, v: { hash: string; dependencies?: Dependency[] }) {
             const r = await checkFile(k).catch(e => {
-                throwIfNotFileNotFoundError(e)
+                throwIfNotMissingOrDir(e)
                 invalidated.add(k)
             })
 
@@ -231,7 +231,7 @@ export function createIncrementalHost(opt: ts.CompilerOptions) {
                 updatedCache[sf] = { hash: r.hash }
                 changed.add(sf)
             }).catch(e => {
-                throwIfNotFileNotFoundError(e)
+                throwIfNotMissingOrDir(e)
                 delete updatedCache[sf]
             }))
         }
@@ -392,22 +392,9 @@ export function getAllDependencies(graph: CompilationGraph, files: string[]) {
         visit(f)
     }
 
-    // Roots have to be determined by looking at the transitive dependencies
-    // of the original set of files rather than the entire graph
-    //
-    // IMPORTANT: cycles in the graph will be deleted by this method
-    // TODO: find the minimum feedback arc set
-    const roots = new Set(files)
-    for (const f of deps) {
-        const z = index[f]
-        if (z) {
-            for (const d of z) {
-                roots.delete(d)
-            }
-        }
-    }
+    // TODO: find the minimum feedback arc set?
 
-    return { roots, deps }
+    return { deps }
 }
 
 

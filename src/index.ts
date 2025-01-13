@@ -5,7 +5,7 @@ import { FailedTestEvent, TestEvent, runTask } from './logging'
 import { BoundTerraformSession, DeployOptions, SessionContext, SessionError, createStatePersister, createZipFromDir, getChangeType, getDiff, getTerraformPath, isTriggeredReplaced, parsePlan, startTerraformSession } from './deploy/deployment'
 import { LocalWorkspace, getV8CacheDirectory, initProject, getLinkedPackagesDirectory, Program, getRootDirectory, getDeploymentBuildDirectory, getTargetDeploymentIdOrThrow, getOrCreateDeployment, getWorkingDir } from './workspaces'
 import { createLocalFs } from './system'
-import { AmbientDeclarationFileResult, Mutable, acquireFsLock, createHasher, createRwMutex, getCiType, gunzip, isNonNullable, isWindows, keyedMemoize, makeExecutable, makeRelative, memoize, printNodes, replaceWithTilde, resolveRelative, showArtifact, throwIfNotFileNotFoundError, toAmbientDeclarationFile, wrapWithProxy } from './utils'
+import { AmbientDeclarationFileResult, Mutable, acquireFsLock, createHasher, createRwMutex, getCiType, gunzip, isNonNullable, isWindows, keyedMemoize, makeExecutable, makeRelative, memoize, printNodes, replaceWithTilde, resolveRelative, showArtifact, throwIfNotFileNotFoundError, throwIfNotMissingOrDir, toAmbientDeclarationFile, wrapWithProxy } from './utils'
 import { MoveWithSymbols, SymbolGraph, SymbolNode, createMergedGraph, createSymbolGraph, createSymbolGraphFromTemplate, deleteSourceMapResource, detectRefactors, findAutomaticMoves, getKeyFromScopes, getMovesWithSymbols, getRenderedStatementFromScope, isOldSourceMapFormat, normalizeConfigs, renderSymbol, renderSymbolLocation } from './refactoring'
 import { SourceMapHost } from './static-solver/utils'
 import { getLogger } from './logging'
@@ -41,7 +41,7 @@ import { cleanDataRepo, maybeCreateGcTrigger } from './build-fs/gc'
 import { createArchive, createPackageForRelease, lazyNodeModules } from './cli/buildInternal'
 import { runCommand, which } from './utils/process'
 import { transformNodePrimordials } from './utils/convertNodePrimordials'
-import { createCompileView, getPreviousDeploymentData } from './cli/views/compile'
+import { createCompileView, getPreviousDeploymentData, renderCompilerOptions } from './cli/views/compile'
 import { createSessionContext, getModuleLoader, getSession, shutdownSessions } from './deploy/session'
 import { findArtifactByPrefix, getMetadata } from './build-fs/utils'
 import { collectAllStats, collectStats, diffFileInLatestCommit, diffIndices, diffObjects, mergeRepoStats, printStats, printTopNLargestObjects } from './build-fs/stats'
@@ -73,7 +73,6 @@ import { initOrUpdateWatcherState, maybeDetectChanges } from './utils/stateless-
 
 export type CombinedOptions = CompilerOptions & DeployOptions & { 
     forceRefresh?: boolean
-    cwd?: string
     project?: string
     program?: string
     process?: string
@@ -101,7 +100,6 @@ export async function syncModule(deploymentId: string, bt = getBuildTargetOrThro
 
 type PublishOptions = CompilerOptions & DeployOptions & { 
     remote?: boolean
-    newFormat?: boolean
     archive?: string
     dryRun?: boolean
     local?: boolean
@@ -109,6 +107,7 @@ type PublishOptions = CompilerOptions & DeployOptions & {
     overwrite?: boolean
     visibility?: 'public' | 'private'
     ref?: string
+    sourcemaps?: boolean
 }
 
 export async function publish(target: string, opt?: PublishOptions) {
@@ -128,7 +127,7 @@ export async function publish(target: string, opt?: PublishOptions) {
         const bt = getBuildTargetOrThrow()
 
         try {
-            await createPackageForRelease(packageDir, tmpDest, { environmentName: bt.environmentName }, true, true, true)
+            await createPackageForRelease(packageDir, tmpDest, { environmentName: bt.environmentName }, true, true, true, opt?.sourcemaps)
             await createArchive(tmpDest, dest, false)
         } finally {
             await getFs().deleteFile(tmpDest).catch(throwIfNotFileNotFoundError)
@@ -138,7 +137,7 @@ export async function publish(target: string, opt?: PublishOptions) {
     }
 
     if (opt?.local) {
-        await linkPackage({ dryRun: opt?.dryRun, skipInstall: opt?.skipInstall })
+        await linkPackage({ dryRun: opt?.dryRun, skipInstall: opt?.skipInstall, includeSourceMaps: true })
         return
     }
 
@@ -275,7 +274,6 @@ async function assertSameCloudTarget(template: TfJson) {
 // the norm. Right now that just isn't a common thing.
 
 type DeployOpt2 = CombinedOptions & { 
-    tsOptions?: ts.CompilerOptions; 
     autoDeploy?: boolean; 
     sessionCtx?: SessionContext; 
     dryRun?: boolean; 
@@ -283,6 +281,9 @@ type DeployOpt2 = CombinedOptions & {
     hideNextSteps?: boolean
     rollbackIfFailed?: boolean
     useOptimizer?: boolean
+
+    // TODO: this would be useful in CI contexts
+    destroyIfFailed?: boolean
 }
 
 async function validateTargets(targets: string[]) {
@@ -387,6 +388,15 @@ export async function deploy(targets: string[], opt: DeployOpt2 = {}) {
 
     await validateTargets(targets)
 
+    if (opt?.sync) {
+        const bt = getBuildTarget()
+        if (bt?.deploymentId) {
+            await syncModule(bt.deploymentId)
+        } else {
+            getLogger().log('Nothing to sync in program', bt?.programId)
+        }
+    }
+
     const programFsHash = opt?.sessionCtx?.buildTarget.programHash
     const maybeMoved = await checkCompileForDeploy(targets, opt)
     // TODO: return early if there is nothing to deploy
@@ -448,7 +458,7 @@ export async function deploy(targets: string[], opt: DeployOpt2 = {}) {
         // TODO: in theory this should happen right after saving the state to disk
         // We just want to make sure that if `syncModule` fails, it doesn't prevent
         // a rollback from happening.
-        if (opt?.syncAfter) {
+        if (opt?.syncAfter || opt?.sync) {
             await syncModule(deploymentId)
         }
 
@@ -498,10 +508,7 @@ async function showNextStepsAfterDeploy(template: TfJson, state: TfState) {
 }
 
 export async function install(targets: string[], opt?: { dev?: boolean; mode?: 'all' | 'types'; remove?: boolean }) {
-    const cwd = getBuildTarget()?.workingDirectory ?? process.cwd()
-    if (cwd !== process.cwd()) {
-        printLine(colorize(`yellow`, `Treating ${getBuildTarget()?.workingDirectory} as the working directory`))
-    }
+    const cwd = getWorkingDir()
 
     const view = createInstallView()
     const pkg = await getCurrentPkg() // FIXME: this needs to update the stored package when it changes
@@ -862,13 +869,14 @@ type TestOptions = DeployOptions & {
     filter?: string,
     noCache?: boolean
     showLogs?: boolean
+    deployTarget?: string
 }
 
 // This assumes that the "primary" deployment is already active
 export async function runTests(targets: string[], opt?: TestOptions) {
     // TODO: handle the other cases
     // await validateTargetsForExecution(targets[0], (await getEntrypointsFile())?.deployables ?? {})
-    await compileIfNeeded(targets[0], false)
+    await compileIfNeeded(targets[0], false, opt)
 
     const deploymentId = getTargetDeploymentIdOrThrow()
 
@@ -1061,6 +1069,9 @@ export async function plan(targets: string[], opt: PlanOptions = {}) {
     if (opt?.debug) {
         const graph = createSymbolGraphFromTemplate(template)
 
+        const oldTemplate = await bfs.maybeRestoreTemplate()
+        const oldGraph = oldTemplate ? createSymbolGraphFromTemplate(oldTemplate) : undefined
+
         const changes = getPlannedChanges(res)
 
         function order(a: string) {
@@ -1072,11 +1083,14 @@ export async function plan(targets: string[], opt: PlanOptions = {}) {
             }
         }
 
-        const moved = await getMoved()
         const state = await readState()
         const remaining = new Set<string>(state?.resources.map(r => `${r.type}.${r.name}`) ?? [])
-        for (const m of moved ?? []) {
+        for (const m of maybeMoved ?? []) {
             remaining.delete(m.from)
+        }
+
+        for (const k of graph.getResourceKeys()) {
+            remaining.delete(k)
         }
 
         const potentialMatches = new Map<string, string[]>()
@@ -1091,7 +1105,7 @@ export async function plan(targets: string[], opt: PlanOptions = {}) {
             const ty = graph.getResourceType(k)
             const name = s?.value.name
 
-            const wasMoved = moved?.find(x => x.to === k)
+            const wasMoved = maybeMoved?.find(x => x.to === k)
 
             const text = `${v.change} - ${name ? `${name} [${k}]` : k}${wasMoved ? `[moved]` : ''}`
             if (v.change === 'replace') {
@@ -1099,6 +1113,11 @@ export async function plan(targets: string[], opt: PlanOptions = {}) {
                 if (k.startsWith('aws_s3_object.')) {
                     continue
                 }
+
+                if (ty.kind === 'synapse') {
+                    continue
+                }
+
                 printLine(colorize('yellow', text))
 
                 printLine(`    reason: ${v.plan.reason}`)
@@ -1122,7 +1141,8 @@ export async function plan(targets: string[], opt: PlanOptions = {}) {
         for (const [k, v] of potentialMatches) {
             printLine(`maybe match ${friendlyNames.get(k)!}`)
             for (const d of v) {
-                printLine(`    ${d.split('.')[1]}`)
+                const name = oldGraph?.findSymbolFromResourceKey(d)?.value.name
+                printLine(`    ${d.split('.')[1]}${name ? ` [${name}]` : ''}`)
             }
         }
 
@@ -1777,9 +1797,9 @@ export async function moveResource(from: string, to: string) {
         }
 
         printLine(colorize('yellow', 'The following resources were not moved:'))
-        for (const n of missed) {
-            
-            printLine(`  * ${renderSym({ ...n, fileName: path.relative(getWorkingDir(), n.fileName) })}`)
+        const renderedMissed = [...missed].map(n => renderSym({ ...n, fileName: path.relative(getWorkingDir(), n.fileName) }))
+        for (const n of new Set(renderedMissed)) {
+            printLine(`  * ${n}`)
         }
     }
 
@@ -2229,7 +2249,7 @@ export async function emitBlocks(dest: string) {
     )
 }
 
-export async function showRemoteArtifact(target: string, opt?: { captured?: boolean; deployed?: boolean; infra?: boolean }) {
+export async function showPointer(target: string, opt?: { captured?: boolean; deployed?: boolean; infra?: boolean }) {
     const repo = getDataRepository()
 
     if (target.startsWith(pointerPrefix)) {
@@ -2447,6 +2467,14 @@ export async function migrateIdentifiers(targets: string[], opt?: CombinedOption
 
     const oldResources = gatherResources(oldTemplate, targetFiles, excludedOld)
 
+    if (!opt?.reset) {
+        const currentMoved = await getMoved()
+        for (const m of currentMoved ?? []) {
+            excludedOld.add(m.from)
+            excludedNew.add(m.to)
+        }
+    }
+
     for (const k of excludedNew) {
         deleteSourceMapResource(newSourceMap, k)
     }
@@ -2456,7 +2484,6 @@ export async function migrateIdentifiers(targets: string[], opt?: CombinedOption
     }
 
     // TODO: we _need_ to cross-reference the template with the actual state before proceeding
-    // TODO: check existing moves
 
     const moves = runTask(
         'refactoring', 
@@ -2513,7 +2540,7 @@ function showMoves(moves: MoveWithSymbols[]) {
     }
 }
 
-async function tryFindAutomaticMoves(state: TfState) {
+async function tryFindAutomaticMoves(state: TfState, currentMoved?: { from: string; to: string }[]) {
     const [oldTemplate, newTemplate] = await Promise.all([
         bfs.maybeRestoreTemplate(),
         bfs.getCurrentTemplate(),
@@ -2531,7 +2558,8 @@ async function tryFindAutomaticMoves(state: TfState) {
     const autoMoves = findAutomaticMoves(
         state, 
         createSymbolGraph(oldSourceMap, oldResources), 
-        createSymbolGraph(newSourceMap, newResources)
+        createSymbolGraph(newSourceMap, newResources),
+        currentMoved,
     )
 
     getLogger().debug('Unmatched from state', autoMoves.unmatched.state)
@@ -2555,7 +2583,6 @@ async function loadMovedIntoTemplate(fileName: string, merge = true) {
     }
 
     const resourceSet = new Set(state?.resources.map(r => `${r.type}.${r.name}`))
-
     const [checked = [], autoMoved] = await Promise.all([
         merge ? getMoved() : undefined,
         tryFindAutomaticMoves(state),
@@ -2697,7 +2724,8 @@ export async function listDeployments(type?: string, opt?: CombinedOptions & { a
 }
 
 export async function testGcDaemon(type?: string, opt?: CombinedOptions) {
-    await using trigger = maybeCreateGcTrigger(true)
+    const trigger = maybeCreateGcTrigger(true)
+    await trigger?.dispose()
 }
 
 export async function schemas(type?: string, opt?: CombinedOptions) {
@@ -2725,8 +2753,8 @@ async function initFromRepo(name: string, dest: string) {
         await repo.dispose()
     }
 }
-
-// `null` means "this is written somewhere else"
+ 
+// `null` means "this is written somewhere else" 
 async function checkFilesAndInit(dir: string, files: Record<string, string | Uint8Array | Promise<Uint8Array> | null>) {
     const toRootDir = (f: string): string => [f, '.'].includes(path.dirname(f)) ? f : toRootDir(path.dirname(f))
 
@@ -2753,7 +2781,7 @@ async function checkFilesAndInit(dir: string, files: Record<string, string | Uin
 }
 
 export async function init(opt?: { template?: string }) {
-    const dir = process.cwd()
+    const dir = getWorkingDir()
 
     async function compilePrograms(files: string[]) {
         const programDirs = new Set<string>()
@@ -2764,7 +2792,7 @@ export async function init(opt?: { template?: string }) {
         }
 
         const programs = [...programDirs]
-        if (programs.length === 1 && programs[0] === process.cwd()) {
+        if (programs.length === 1 && programs[0] === dir) {
             return compile([], { skipSynth: true })
         }
 
@@ -2776,7 +2804,7 @@ export async function init(opt?: { template?: string }) {
         // Building a project with multiple programs/packages requires more sophisticated logic
         // that I have not yet implemented. We need to construct a package-level dependency
         // graph and compile/publish the nodes. Of course, publishing a package without deployment 
-        // leaves the package as a stub which may or may not play nicely with dependent packages.
+        // leaves the package with stubs which may or may not play nicely with dependent packages.
         getLogger().log('Skipping compile due to multiple programs', programs)
     }
 
@@ -2805,7 +2833,7 @@ export async function init(opt?: { template?: string }) {
 
         const readmeFile = filesCreated.find(f => f.toLowerCase().endsWith('readme.md'))
         if (readmeFile) {
-            const relPath = path.relative(process.cwd(), path.resolve(dir, readmeFile))
+            const relPath = path.relative(dir, path.resolve(dir, readmeFile))
             const relPathWithDir = path.dirname(relPath) === '.' ? `./${relPath}` : relPath // Little enhancement for `vscode`
             printLine(`Open ${relPathWithDir} to get started`)
 
@@ -2935,14 +2963,19 @@ export async function processProf(t?: string, opt?: CombinedOptions) {
     }
 }
 
-async function runProgramExecutable(fileName: string, args: string[]) {
+async function runProgramExecutable(fileName: string, args: string[], runDir?: string) {
     const moduleLoader = await runTask('init', 'loader', () => getModuleLoader(false, true), 1) // 8ms on simple hello world no infra
+
+    await runTask('ui', 'release tty', () => getDisplay().releaseTty(false), 1)
+
     const m = await moduleLoader.loadModule(fileName)    
     if (typeof m.main !== 'function') {
         throw new Error(`Missing main function in file "${fileName}", found exports: ${Object.keys(m)}`)
     }
 
-    await runTask('ui', 'release tty', () => getDisplay().releaseTty(false), 1)
+    if (runDir) {
+        process.env['SYNAPSE_RUN_DIR'] = path.resolve(getWorkingDir(), runDir)
+    }
 
     try {
         const exitCode = await m.main(...args)
@@ -2980,7 +3013,8 @@ async function getChangedEnvVarsForSynth() {
     return diff
 }
 
-async function compileIfNeeded(target?: string, skipSynth = true) {
+// FIXME: this should recompile if `deployTarget` changes
+async function compileIfNeeded(target?: string, skipSynth = true, opt?: CompileOptions) {
     // XXX: we should normalize everything at program entrypoints
     if (isWindows() && target) {
         target = target.replaceAll('/', '\\')
@@ -2989,7 +3023,14 @@ async function compileIfNeeded(target?: string, skipSynth = true) {
     // TODO: we can skip synth if the stale files aren't apart of the synthesis dependency graph
     // TODO: if `run` automatically compiles anything, it should _always_ use the last-used settings
     const { stale, removed, sources } = await getStaleSources() ?? {}
-    const compileOpt = { incremental: true, skipSummary: true, skipSynth: !!stale && skipSynth, skipWatcher: !!sources }
+    const compileOpt = { 
+        ...opt, 
+        incremental: true, 
+        skipSummary: true, 
+        skipWatcher: !!sources,
+        skipSynth: !!stale && skipSynth 
+    }
+
     if (!sources || (stale && stale.size > 0) || (!skipSynth && removed && removed.size > 0)) {
         // We don't need to generate a template, we just want updated program analyses
         // TODO: mark the current compilation as "needs synth"
@@ -3024,23 +3065,23 @@ async function compileIfNeeded(target?: string, skipSynth = true) {
 async function getDeploymentStatus(target: string, deployables: Record<string, string>) {
     const opt = await getResolvedTsConfig()
     const incr = createIncrementalHost(opt?.options ?? {})
+    const resolvedSource = path.resolve(getWorkingDir(), target)
 
     const [deps, info, sources] = await Promise.all([
-        incr.getCachedDependencies(path.resolve(getWorkingDir(), target)),
+        incr.getCachedDependencies(resolvedSource),
         getPreviousDeployInfo(),
         bfs.readSources(),
     ])
 
-    const allDeps = getAllDependencies(deps, [path.resolve(getWorkingDir(), target)])
-    const resolvedSource = path.resolve(getWorkingDir(), target)
+    const allDeps = getAllDependencies(deps, [resolvedSource])
     const deployableSet = new Set(Object.keys(deployables).map(k => path.resolve(getWorkingDir(), k)))
 
     // BUG: synthesis removes unused imports, but we don't check that here
     const isTargetDeployable = deployableSet.has(resolvedSource)
-    const toCheck = isTargetDeployable ? [resolvedSource] : allDeps.deps
+
     const needsDeploy: string[] = []
     const staleDeploys: string[] = []
-    for (const d of toCheck) {
+    for (const d of allDeps.deps) {
         if (!deployableSet.has(d)) continue
 
         const relPath = path.relative(getWorkingDir(), d)
@@ -3107,7 +3148,7 @@ async function validateTargetsForExecution(targets: string, deployables: Record<
         printSuggestion()
     }
 
-    async function promptForDeploy(message: string) {
+    async function promptForDeploy(message: string, needsDeploy: string[]) {
         printLine(message)
         print(colorize('blue', 'Deploy now?'))
 
@@ -3139,7 +3180,7 @@ async function validateTargetsForExecution(targets: string, deployables: Record<
             return false
         }
     
-        await deploy([targets])
+        await deploy(needsDeploy, { hideNextSteps: true })
         return true
     }
 
@@ -3148,7 +3189,7 @@ async function validateTargetsForExecution(targets: string, deployables: Record<
             throw new RenderableError('Program not deployed', printNotDeployedError)
         }
 
-        if (!(await promptForDeploy(resourcesNeedDeployMessage))) {
+        if (!(await promptForDeploy(resourcesNeedDeployMessage, status.needsDeploy))) {
             throw new CancelError('Cancelled deploy')
         }
 
@@ -3169,14 +3210,19 @@ async function validateTargetsForExecution(targets: string, deployables: Record<
         if (!canPrompt) {
             printLine(needsUpdateMessage)
         } else {
-            await promptForDeploy(needsUpdateMessage)
+            await promptForDeploy(needsUpdateMessage, status.staleDeploys)
         }
     }
 
     return status
 }
 
-type RunOptions = CombinedOptions & { skipValidation?: boolean; skipCompile?: boolean; noDeploy?: boolean }
+type RunOptions = CombinedOptions & { 
+    skipValidation?: boolean
+    skipCompile?: boolean
+    noDeploy?: boolean
+    runDir?: string
+}
 
 export async function run(name: string | undefined, args: string[], opt?: RunOptions) {
     const maybeCmd = name ? await maybeGetPkgScript(name) : undefined
@@ -3226,10 +3272,10 @@ export async function run(name: string | undefined, args: string[], opt?: RunOpt
             ? await resolveReplTarget(source)
             : path.resolve(getWorkingDir(), output)
     
-        return runProgramExecutable(resolved, args)
+        return runProgramExecutable(resolved, args, opt?.runDir)
     }
 
-    return runProgramExecutable(path.resolve(getWorkingDir(), output), args)
+    return runProgramExecutable(path.resolve(getWorkingDir(), output), args, opt?.runDir)
 }
 
 // need to add this to a few places to make sure we handle abs paths
@@ -3348,7 +3394,7 @@ async function getStaleSources(include?: Set<string>) {
         const source = resolveRelative(workingDir, k)
         if (include && !include.has(source)) return
 
-        const hash = await hasher.getHash(source).catch(throwIfNotFileNotFoundError)
+        const hash = await hasher.getHash(source).catch(throwIfNotMissingOrDir)
         if (!hash) {
             delete sources![k]
         } else if (v.hash !== hash) {
@@ -3392,11 +3438,6 @@ export async function showStatus(opt?: { verbose?: boolean }) {
     // Projects?
 
     const bt = getBuildTargetOrThrow()
-    if (bt.environmentName && bt.environmentName !== 'local') {
-        printLine(`env: ${colorize('cyan', bt.environmentName)}`)
-        printLine()
-    }
-
     const programFs = getProgramFs()
     const installation = await getInstallation(programFs)
     if (installation?.packages) {
@@ -3415,13 +3456,23 @@ export async function showStatus(opt?: { verbose?: boolean }) {
     if (!staleSources) {
         printLine(colorize('red', 'Not compiled'))
     } else {
+        const currentTemplate = await bfs.getTemplate(programFs)
+        const deployTarget = currentTemplate?.['//']?.deployTarget
+        const environmentName = bt.environmentName !== 'local' ? bt.environmentName : undefined
+
+        function renderOpt() {        
+            const text = renderCompilerOptions({ deployTarget, environmentName }, { dim: false })
+
+            return text ? ` ${text}` : ''
+        }
+
         if (staleSources.size > 0) {
-            printLine(colorize('yellow', 'Stale compilation'))
+            printLine(colorize('yellow', 'Stale compilation') + renderOpt())
             for (const f of staleSources) {
                 printLine(colorize('yellow', `  ${path.relative(getWorkingDir(), f)}`))
             }
         } else {
-            printLine(colorize('green', 'Compiled'))
+            printLine(colorize('green', 'Compiled') + renderOpt())
         }
     } 
 
@@ -3634,6 +3685,7 @@ interface BuildExecutableOpt {
     readonly minify?: boolean
     readonly lazyLoad?: string[]
     readonly synapsePath?: string
+    readonly useOptimizer?: boolean
 }
 
 export async function buildExecutables(targets: string[], opt: BuildExecutableOpt) {

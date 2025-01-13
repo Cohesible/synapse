@@ -1,5 +1,5 @@
 import ts from 'typescript'
-import { createStaticSolver, createUnknown, isUnion, isUnknown, isInternalFunction, getSourceCode, evaluate as evaluateUnion } from './static-solver'
+import { createStaticSolver, createUnknown, isUnion, isUnknown, isInternalFunction, getSourceCode, evaluate as evaluateUnion, createUnion } from './static-solver'
 import { getLogger, LogLevel } from './logging'
 import { dedupe, memoize, wrapWithProxy } from './utils'
 import { getArtifactOriginalLocation } from './runtime/loader'
@@ -22,6 +22,16 @@ export function isModuleExport(node: ts.Node): node is ts.ExpressionStatement & 
         ts.isIdentifier(exp.left.expression) && 
         exp.left.expression.text === 'module'
     )
+}
+
+class _Map<K, V> extends Map<K, V> {
+    get(key: K) {
+        if (isUnknown(key)) {
+            return createUnion(super.values.bind(this)) as any
+        }
+
+        return super.get(key)
+    }
 }
 
 export function createSolver(substitute?: (node: ts.Node) => any) {
@@ -202,6 +212,8 @@ export function createSolver(substitute?: (node: ts.Node) => any) {
 
         if (ts.isIdentifier(node)) {
             switch (node.text) {
+                case 'Map':
+                    return _Map
                 case 'Array':
                     return Array
                 case 'Number':
@@ -618,6 +630,10 @@ export function createCapturedSolver(
                 }
 
                 if (typeof o === 'object') {
+                    if (o.constructor === Map) {
+                        return new _Map([...o.entries()].map(([k, v]) => [resolve(k), resolve(v)]))
+                    }
+
                     return resolveObject(o)
                 }
     

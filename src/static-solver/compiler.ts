@@ -91,26 +91,25 @@ function addModuleSymbolToMethod(
     serializationData: ts.Expression,
     factory = ts.factory,
 ) {
-    if (!node.name) {
-        failOnNode('Expected name', node)
-    }
+    // const className = ts.isClassLike(node.parent) ? node.parent.name : undefined
+    // if (!className) {
+    //     // This should only happen for `export default class {}`
+    //     // Until we allow methods over `const C = class {}`
+    //     failOnNode('Expected class name', node.parent)
+    //     return
+    // }
 
-    if (ts.isPrivateIdentifier(node.name)) {
-        failOnNode('Cannot serialize private methods', node.name)
-    }
+    const isStatic = node.modifiers?.find(x => x.kind === ts.SyntaxKind.StaticKeyword)
+    const className = factory.createThis()
 
-    const className = ts.isClassLike(node.parent) ? node.parent.name : undefined
-    if (!className) {
-        failOnNode('Expected class name', node.parent)
-    }
-
-    const classIdent = factory.createIdentifier(className.text)
+    const subject = isStatic ? className : factory.createPropertyAccessExpression(className, 'prototype')
     const accessExp = ts.isIdentifier(node.name) 
-        ? factory.createPropertyAccessExpression(classIdent, node.name)
+        ? factory.createPropertyAccessExpression(subject, node.name)
         : factory.createElementAccessExpression(
-            factory.createIdentifier(className.text),
+            subject,
             ts.isComputedPropertyName(node.name) ? node.name.expression : node.name
         )
+
     const access = factory.createElementAccessExpression(
         accessExp,
         createMovablePropertyName(factory)
@@ -620,7 +619,7 @@ function addDeserializeConstructor(
     const descIdent = factory.createIdentifier('desc')
     const tag = createSymbolPropertyName('deserialize', factory)
     const fields = node.members.filter(isPrivateField)
-    const privateFieldsIdent = factory.createIdentifier('__privateFields')
+    const privateFieldsIdent = factory.createIdentifier('privateFields')
     const privateFields = factory.createVariableStatement(
         undefined,
         factory.createVariableDeclarationList(
@@ -630,7 +629,7 @@ function addDeserializeConstructor(
             undefined,
             factory.createCallExpression(
                 factory.createPropertyAccessExpression(
-                    factory.createPropertyAccessExpression(descIdent, '__privateFields'),
+                    factory.createPropertyAccessExpression(descIdent, 'privateFields'),
                     'pop'
                 ),
                 undefined,
@@ -942,6 +941,9 @@ function rewriteCapturedSymbols(
     depth = 0,
     factory = ts.factory
 ) {
+    const inner = scope.node
+    const isMethod = ts.isMethodDeclaration(inner)
+
     const refs = new Map<Symbol, ts.Node[]>(
         [...captured, ...globals].map(c => [c, getReferencesInScope(c, scope)]),
     )
@@ -1015,6 +1017,10 @@ function rewriteCapturedSymbols(
                         }
                     }
                 } else {
+                    // Don't rewrite `this` immediately inside a method declaration.
+                    // We can't capture the reference to `this` directly.
+                    if (isMethod && root.name === 'this') continue
+
                     reduced.set(root, getReferencesInScope(root, scope))
                 }
 
@@ -1105,8 +1111,6 @@ function rewriteCapturedSymbols(
             replacements.set(n, exp)
         }
     }
-
-    const inner = scope.node
 
     try {
         const node = runtimeTransformer?.(inner) ?? inner
@@ -1384,7 +1388,7 @@ function isClassElementModifier(modifier: ts.ModifierLike) {
 }
 
 function convertMethodToFunction(node: ts.MethodDeclaration) {
-    const name = ts.factory.createIdentifier('__fn')
+    const name = ts.factory.createIdentifier('__fn') // TODO: use the method name and sanitize keywords
     const modifiers = node.modifiers?.filter(x => !isClassElementModifier(x))
 
     return ts.factory.createFunctionDeclaration(
@@ -1944,11 +1948,27 @@ export function createSerializer(
             })
         }
 
-        function hoistMethodSerializationData(node: ts.MethodDeclaration, name: string, captured: ts.Expression[]) {
+        function addClassMethodSerialization(node: ts.MethodDeclaration, name: string, captured: ts.Expression[]) {
             const serializationData = createSerializationData(name, captured, context.factory, compiler.moduleType)
-            addStatementUpdate(ts.getOriginalNode(node).parent as ts.Statement, {
-                after: [addModuleSymbolToMethod(node, serializationData, context.factory)]
-            })
+            const instrumentation = addModuleSymbolToMethod(node, serializationData, context.factory)
+            staticStack[staticStack.length-1].push(instrumentation)
+        }
+
+        // TODO: methods in object literals
+        function addObjectMethodSerialization(node: ts.MethodDeclaration, name: string, captured: ts.Expression[]) {
+            const serializationData = createSerializationData(name, captured, context.factory, compiler.moduleType)
+            const statement = ts.findAncestor(ts.getOriginalNode(node), ts.isStatement)
+   
+            // const parent = ts.getOriginalNode(node).parent
+            // if (!ts.isClassLike(parent)) {
+            //     return
+            // }
+
+            const instrumentation = addModuleSymbolToMethod(node, serializationData, context.factory)
+            // if (instrumentation) {
+            //     addStatementUpdate(parent, { after: [instrumentation] })
+            // }
+            staticStack[staticStack.length-1].push(instrumentation)
         }
 
         function addUseServerSymbol(node: ts.FunctionDeclaration | ts.VariableDeclaration) {
@@ -2028,8 +2048,8 @@ export function createSerializer(
         // then `instanceof` won't work between "moved" instances and instantiations within the export
         //
         // Isolating every declaration is one way to solve this
-        function extractClassDeclaration(node: ts.ClassDeclaration) {
-            node = ts.getOriginalNode(node) as ts.ClassDeclaration
+        function extractClassDeclaration(node: ts.ClassDeclaration | ts.ClassExpression) {
+            node = ts.getOriginalNode(node) as ts.ClassDeclaration | ts.ClassExpression
             const name = getName(node)
 
             // XXX: visit heritage clauses first
@@ -2086,7 +2106,7 @@ export function createSerializer(
             return result
 
             function transform() {
-                if (ts.isClassDeclaration(node)) {
+                if (ts.isClassLike(node)) {
                     return visitClassDeclaration(node)
                 }
     
@@ -2098,9 +2118,9 @@ export function createSerializer(
                     return visitFunctionDeclaration(node)
                 }
 
-                // if (ts.isMethodDeclaration(node)) {
-                //     return visitMethodDeclaration(node)
-                // }
+                if (ts.isMethodDeclaration(node)) {
+                    return visitMethodDeclaration(node)
+                }
     
                 if (ts.isArrowFunction(node) || ts.isFunctionExpression(node)) {
                     return visitArrowFunctionOrExpression(node)
@@ -2123,16 +2143,23 @@ export function createSerializer(
             }
         }
 
-        function visitClassDeclaration(node: ts.ClassDeclaration) {
+        // Tracks statements meant to be added to a static class block
+        const staticStack: ts.Statement[][] = []
+        function visitClassDeclaration(node: ts.ClassDeclaration | ts.ClassExpression) {
             if (compiler.isDeclared(node)) {
                 return node
             }
 
             const r = extractClassDeclaration(node)
+
+            staticStack.push([])
+
             const name = getName(node)
             nameStack.push(name)
             const visitedClass = ts.visitEachChild(node, visit, context)
             nameStack.pop()
+
+            const staticStatements = staticStack.pop()!
 
             return addSerializerSymbolToClass(
                 visitedClass,
@@ -2143,14 +2170,41 @@ export function createSerializer(
                     compiler.moduleType,
                 ),
                 r.clauseReplacement,
+                staticStatements,
                 context,
             )
         }
 
         function visitMethodDeclaration(node: ts.MethodDeclaration) {
+            // TODO: methods in object literals
+            if (staticStack.length === 0 || !ts.isClassLike(ts.getOriginalNode(node).parent) || ts.isPrivateIdentifier(node.name)) {
+                return ts.visitEachChild(node, visit, context)
+            }
+
+            const sym = compiler.getSymbol(node)
+            if (!sym?.parentScope) {
+                return ts.visitEachChild(node, visit, context)
+            }
+
+            // We can't serialize methods with private fields directly without rewriting them
+            // So we need to bail on serializing methods that reference private fields
+            for (const d of sym.parentScope.dependencies) {
+                const [r, s] = getRootAndSuccessorSymbol(d)
+                if (r.parentScope?.symbol !== sym) {
+                    if (r.name === 'super') {
+                        return ts.visitEachChild(node, visit, context)
+                    }
+                    continue
+                }
+
+                if (s?.name[0] === '#') {
+                    return ts.visitEachChild(node, visit, context)
+                }
+            }
+
             const name = getName(node)
             const r = compiler.compileNode(name, node, context.factory, runtimeTransformer, createInfraTransformer(name, innerTransformer), undefined, jsxRuntime, undefined, depth)
-            hoistMethodSerializationData(node, getRelativeName(name), renderCapturedSymbols(r.captured, r.assets))
+            addClassMethodSerialization(node, getRelativeName(name), renderCapturedSymbols(r.captured, r.assets))
 
             nameStack.push(name)
             const res = ts.visitEachChild(node, visit, context)
@@ -2362,6 +2416,7 @@ function addSerializerSymbolToClass(
     node: ts.ClassDeclaration | ts.ClassExpression,
     serializationData: ts.Expression,
     clauseReplacement: [clause: ts.HeritageClause, ident: ts.Identifier] | undefined,
+    staticStatements: ts.Statement[],
     context: ts.TransformationContext,
 ) {
     const factory = context.factory
@@ -2376,7 +2431,7 @@ function addSerializerSymbolToClass(
         )
     ]))
 
-    const ident = factory.createIdentifier("__privateFields")
+    const ident = factory.createIdentifier("privateFields")
     const init = factory.createBinaryExpression(
         factory.createPropertyAccessExpression(
           factory.createIdentifier("desc"),
@@ -2411,7 +2466,7 @@ function addSerializerSymbolToClass(
     )
 
     const description = {
-        __privateFields: ident,
+        privateFields: ident,
     }
 
     // Private members will live on a stack
@@ -2500,12 +2555,14 @@ function addSerializerSymbolToClass(
         return c
     })
 
-    const props: ClassProps = {
-        members: [...node.members, serialize, move],
-        heritageClauses: heritageClauses,
+    const members = [...node.members, serialize, move]
+    if (staticStatements.length > 0) {
+        members.push(
+            factory.createClassStaticBlockDeclaration(factory.createBlock(staticStatements))
+        )
     }
 
-    return updateClass(node, props, factory)
+    return updateClass(node, { members, heritageClauses }, factory)
 }
 
 function getPrivateFields(node: ts.ClassDeclaration | ts.ClassExpression) {

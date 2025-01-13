@@ -743,7 +743,7 @@ export function createSerializer(
                 ;(decomposed as any).__constructor = ctor
             }
     
-            const finalDesc = (serializeSym in obj && typeof obj[serializeSym] === 'function') 
+            const finalDesc = typeof obj[serializeSym] === 'function'
                 ? obj[serializeSym](decomposed) 
                 : decomposed
 
@@ -754,7 +754,7 @@ export function createSerializer(
                 constructor: serialize(finalDesc.__constructor),
                 prototype: serialize(finalDesc.__prototype),
                 descriptors: serializeObjectLiteral(finalDesc.descriptors),
-                __privateFields: serializeObjectLiteral(finalDesc.__privateFields),
+                privateFields: serialize(finalDesc.privateFields),
                 symbols: serializeObjectLiteral(finalDesc.symbols),
             }
         }
@@ -967,23 +967,35 @@ export function createProxy<T = unknown>(
 
     return new Proxy(target, {
         get: (target, prop, receiver) => {
-            if (prop === internalState) {
-                return state
+            if (typeof prop === 'symbol') {
+                if (prop === internalState) {
+                    return state
+                }
+    
+                if (prop === expressionSym) {
+                    return expression
+                }
+    
+                if (prop === mappingsSym) {
+                    return mappings
+                }
+    
+                if (prop === originalSym) {
+                    return original
+                }
+
+                if (prop === Symbol.toPrimitive) {
+                    return toString
+                }
+
+                if (original && Reflect.has(original, prop)) {
+                    return Reflect.get(original, prop, receiver)
+                }
+    
+                return target?.[prop] ?? (state as any)?.[prop]
             }
 
-            if (prop === expressionSym) {
-                return expression
-            }
-
-            if (prop === mappingsSym) {
-                return mappings
-            }
-
-            if (prop === originalSym) {
-                return original
-            }
-
-            if (prop === 'toString' || prop === 'toJSON' || prop === Symbol.toPrimitive) {
+            if (prop === 'toString' || prop === 'toJSON') {
                 return toString
             }
 
@@ -994,10 +1006,6 @@ export function createProxy<T = unknown>(
 
             if (original && Reflect.has(original, prop)) {
                 return Reflect.get(original, prop, receiver)
-            }
-
-            if (typeof prop === 'symbol') {
-                return target?.[prop] ?? (state as any)?.[prop]
             }
 
             // Terraform doesn't allow expressions on providers
@@ -1120,6 +1128,19 @@ function isDefaultProviderName(name: string, type: string) {
 
 function isDefaultProvider(element: TerraformElement) {
     return isDefaultProviderName(element.name, element.type)
+}
+
+export function getResourceId(obj: any) {
+    if (!isElement(obj)) {
+        return
+    }
+    
+    const state = obj[internalState]
+    if (!state?.name || !state.type || state.kind !== 'resource') {
+        return
+    }
+
+    return `${state.type}.${state.name}`
 }
 
 export interface HookContext {
@@ -2051,6 +2072,7 @@ function createBinarySerializer() {
             offset += 4
     
             for (const [k, v] of entries) {
+                // FIXME: `k` can be an expression rather than a raw string
                 writeIndexedString(k)
                 writeValue(v)
             }
@@ -2291,7 +2313,6 @@ function createBinarySerializer() {
             return
         }
 
-        // writeStringChecked(parts.map(renderResourceIdPart).join('.'))
         writeStringChecked(parts.join('.'))
     }
 

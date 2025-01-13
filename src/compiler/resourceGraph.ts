@@ -100,6 +100,11 @@ export function createResourceGraph(
             return fileSymbols.get(fileName)!
         }
 
+        const sf = program.getSourceFile(fileName)
+        if (!sf || program.isSourceFileFromExternalLibrary(sf)) {
+            return {}
+        }
+
         const checker = getSourceFileTypeChecker(fileName)
         fileSymbols.set(fileName, checker.exported)
         checker.init()

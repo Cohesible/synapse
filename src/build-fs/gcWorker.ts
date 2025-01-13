@@ -9,8 +9,6 @@ import { Bundle } from 'synapse:lib'
 import { getGcInfoPath, startGarbageCollection } from './gc'
 import { logToStderr } from '../cli/logger'
 
-interface GcInfo {}
-
 async function runGc() {
     const buildDir = process.argv[2]
     if (!buildDir) {
