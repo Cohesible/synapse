@@ -37,10 +37,6 @@ export function createLookupTable() {
 
     const locationKeys = new Map<string, string[]>()
     function getLocationKey(location: string): string[] {
-        if (isWin) {
-            location = location[0] === '\\' ? location : `\\${location}`
-        }
-
         const cached = locationKeys.get(location)
         if (cached !== undefined) {
             return cached
@@ -104,16 +100,24 @@ export function createLookupTable() {
 
         const last = stack.pop()
         if (!last || last.location === sep) {
-            return location
+            return isWin && location[0] === '\\' ? location.slice(1) : location
         }
+
+        let result: string
 
         // We add 1 because we popped the stack
         const suffix = key.slice(stack.length + 1)
         if (last.locationType === 'module' && suffix.length > 0) {
-            return [path.dirname(last.location), ...suffix].join(sep)
+            result = [path.dirname(last.location), ...suffix].join(sep)
+        } else {
+            result = [last.location, ...suffix].join(sep)
         }
 
-        return [last.location, ...suffix].join(sep)
+        if (isWin && result[0] === '\\') {
+            result = result.slice(1)
+        }
+
+        return result
     }
 
     function registerMapping(map: ImportMap, location: string = sep) {

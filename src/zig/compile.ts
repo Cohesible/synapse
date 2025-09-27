@@ -4,7 +4,7 @@ import * as github from '../utils/github'
 import { runCommand } from "../utils/process"
 import { getLogger } from '../logging'
 import { getGlobalCacheDirectory, getGlobalZigBuildDir, getTempZigBuildDir, getWorkingDir } from '../workspaces'
-import { getFs } from '../execution'
+import { getFs, getSelfPathOrThrow } from '../execution'
 import { ensureDir, getHash, keyedMemoize, makeRelative, memoize, sortRecord, throwIfNotFileNotFoundError } from '../utils'
 import { ResolvedProgramConfig, getOutputFilename } from '../compiler/config'
 import { getProgramFs, NativeModule } from '../artifacts'
@@ -352,10 +352,14 @@ function init() {
     }
 
     const path = require('node:path');
-    const { fileURLToPath } = require('node:url');
-    const __filename = fileURLToPath(import.meta.url)
-    const __dirname = path.dirname(__filename)
-    const p = path.resolve(__dirname, '${relPath}');
+    let dir = typeof __dirname !== 'undefined' ? __dirname : undefined
+    if (!dir) {
+        const { fileURLToPath } = require('node:url');
+        const __filename = fileURLToPath(import.meta.url)
+        dir = path.dirname(__filename)
+    }
+
+    const p = path.resolve(dir, '${relPath}');
     process.dlopen(module, p);
     didInit = true;
     bind();
@@ -527,7 +531,7 @@ async function getPerModuleArgs(
         args.push('-target', toZigTarget(hostTarget))
         if (hostTarget.os === 'windows' && canAddNodeLib) {
             // need to link against a `.lib` file for Windows
-            const libPath = await downloadNodeLib()
+            const libPath = await getNodeLib()
             if (libPath) {
                 args.push(libPath, '-lc')
             }
@@ -873,7 +877,7 @@ async function compileZig(file: string, opt: ResolvedProgramConfig, target: Comp
 
     const builtinFilename = await writeSynapseBuiltin({
         features: {
-            fast_calls: true,
+            fast_calls: false,
             threadpool_schedule: false,
             slightly_faster_buffers: false,
         }
@@ -984,8 +988,27 @@ export async function compileAllZig(files: string[], config: ResolvedProgramConf
     }
 }
 
-export async function downloadNodeLib(owner = 'Cohesible', repo = 'node') {
-    const dest = path.resolve('dist', 'node.lib')
+async function getNodeLib() {
+    if (process.env.SYNAPSE_USE_PRIVATE_NODE_LIB) {
+        return downloadNodeLib('Cohesible', 'synapse-node-private')
+    }
+
+    {
+        const dest = path.resolve('dist', 'node.lib')
+        if (await getFs().fileExists(dest)) {
+            return dest
+        }
+    }
+
+    const dest = path.resolve(getSelfPathOrThrow(), '..', 'node.lib')
+    if (await getFs().fileExists(dest)) {
+        return dest
+    }
+    return downloadNodeLib()
+}
+
+export async function downloadNodeLib(owner = 'Cohesible', repo = 'node', parentDir = '.') {
+    const dest = path.resolve(parentDir, 'dist', 'node.lib')
     if (await getFs().fileExists(dest)) {
         return dest
     }
@@ -993,15 +1016,15 @@ export async function downloadNodeLib(owner = 'Cohesible', repo = 'node') {
     const assetName = 'node-lib-windows-x64'
 
     async function downloadAndExtract(url: string) {
-        const archive = await github.fetchData(url)
+        const archive = await github.fetchData(url, undefined, true)
         const files = await listFilesInZip(archive)
         if (files.length === 0) {
             throw new Error(`Archive contains no files: ${url}`)
         }
     
         const file = await extractFileFromZip(archive, files[0])
-        await getFs().writeFile(path.resolve('dist', 'node.lib'), file)
-        getLogger().log('Downloaded node.lib to dist/node.lib')
+        await getFs().writeFile(dest, file)
+        getLogger().log('Downloaded node.lib to', dest)
 
         return dest
     }

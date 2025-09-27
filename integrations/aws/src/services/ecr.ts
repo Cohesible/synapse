@@ -17,6 +17,7 @@ interface DockerfileProps {
     postCopyCommands?: string[]
     extraFiles?: [core.DataPointer, string][]
     jsCommand?: string
+    args?: string[]
 }
 
 // TODO: we should _not_ resolve pointers here. They should
@@ -45,6 +46,7 @@ export class GeneratedDockerfile extends core.defineResource({
             ? `"${props.entrypoint}"` 
             : (props?.baseImage ? `"${jsCommand}", "./${localPath}"` : `"node", "-e", "require('./${localPath}').default()"`)
 
+        const cmd = props?.args ? `CMD [ ${props.args.map(x => `"${x}"`).join(', ')} ]` : `CMD [ ${entrypoint} ]`
         const preCopyCommands = props?.preCopyCommands?.join('\n') ?? ''
         const postCopyCommands = props?.postCopyCommands?.join('\n') ?? ''
         const inlinedDockerfile = `
@@ -54,7 +56,7 @@ ${preCopyCommands}
 COPY [ "${localPath}", "./" ]
 ${extraFileCommands.join('\n')}
 ${postCopyCommands}
-CMD [ ${entrypoint} ]
+${cmd}
 `.trim()
     
         const pointer = await artifactFs.writeArtifact(Buffer.from(inlinedDockerfile), {
@@ -139,6 +141,9 @@ export async function deployToEcr(props: EcrDockerfileDeployment) {
 
     const workingDir = props.workingDirectory ?? path.dirname(props.dockerfilePath)
     // TODO: run `logout` to clear credentials?
+    // FIXME: this should be shared in a single "deploy ctx"
+    // trying to deploy multiple images can fail....
+    // Error saving credentials: error storing credentials - err: exit status 1, out: `error storing credentials - err: exit status 1, out: `The specified item already exists in the keychain.``
     await runDocker(['login', '--username', creds.username, '--password-stdin', props.repositoryUrl], creds.password, workingDir)
     await runDocker(['build', '-t', props.repoName, '-f', props.dockerfilePath, '.'], undefined, workingDir)
     const buildId = await getLatestBuildId(props.repoName)
@@ -255,7 +260,7 @@ export class DockerfileDeployment extends core.defineResource({
             console.log(result.stdout)
             console.log(result.stderr)
         } catch (e) {
-            if (!(e instanceof Error) || !e.message.includes('No such image')) {
+            if (!e?.message.includes('No such image')) {
                 throw e
             }
         }

@@ -13,9 +13,10 @@ import { Provider } from '..'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { addResourceStatement, getPermissionsLater } from '../permissions'
 import { getLogEvents, listLogStreams } from './cloudwatch-logs'
+import { Vpc } from './ec2'
+import { createClient } from './clients'
 
 interface LambdaOptions {
-    /** @unused */
     network?: net.Network
     timeout?: number
     name?: string
@@ -27,6 +28,7 @@ interface LambdaOptions {
     external?: string[]
     memory?: number
     reservedConcurrency?: number
+    provisionedConcurrency?: number
     ephemeralStorage?: number
     servicePrincipals?: string[]
     /** @unused */
@@ -56,11 +58,17 @@ export class LambdaFunction<T extends any[] = any[], U = unknown> implements com
         const environment = opt?.env ?? {}
 
         const policyArn = 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        const managedPolicyArns: string[] = [policyArn]
+
+        if (opt?.network) {
+            managedPolicyArns.push('arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole')
+        }
+
         const servicePrincipals = opt?.servicePrincipals ? [...opt.servicePrincipals, 'lambda.amazonaws.com'] : 'lambda.amazonaws.com'
         const role = new Role({
             name: opt?.name ? `${opt.name}` : undefined,
             assumeRolePolicy: JSON.stringify(spPolicy(servicePrincipals)),
-            managedPolicyArns: [policyArn],
+            managedPolicyArns,
         })
 
         getPermissionsLater(target, statements => {
@@ -78,6 +86,8 @@ export class LambdaFunction<T extends any[] = any[], U = unknown> implements com
 
         const architectures = arch === 'aarch64' ? ['arm64'] : arch === 'x64' ? ['x86_64'] : undefined
 
+        const vpcConfig = opt?.network ? getVpcConfig(opt.network) : undefined
+
         if (opt?.createImage) {
             const { repo, deployment } = createImage(handler, entryPoint, opt.imageCommands, opt.baseImage, opt.name)
             const imageUri = `${repo.repositoryUrl}:${deployment.tagName}`
@@ -88,6 +98,7 @@ export class LambdaFunction<T extends any[] = any[], U = unknown> implements com
                 packageType: 'Image',
                 architectures,
                 role: role.resource.arn,
+                vpcConfig,
                 environment: {
                     variables: {
                         ...environment,
@@ -102,10 +113,6 @@ export class LambdaFunction<T extends any[] = any[], U = unknown> implements com
                 publish: opt.publish,
                 reservedConcurrentExecutions: opt.reservedConcurrency,
                 ephemeralStorage,
-                // vpcConfig: opt?.network ? {
-                //     subnetIds: opt.network.subnets.map(s => s.id),
-                //     securityGroupIds: [opt.network.resource.defaultSecurityGroupId],
-                // } : undefined
             });
             this.resource = fn
         } else {
@@ -123,6 +130,7 @@ export class LambdaFunction<T extends any[] = any[], U = unknown> implements com
                 s3Key: obj.key,
                 handler,
                 architectures,
+                vpcConfig,
                 timeout: opt?.timeout ?? 900,
                 memorySize: opt?.memory ?? 1024,
                 packageType: 'Zip',
@@ -133,15 +141,24 @@ export class LambdaFunction<T extends any[] = any[], U = unknown> implements com
                         ...environment,
                     },
                 },
-                publish: opt?.publish,
+                
+                publish: opt?.publish ?? !!opt?.provisionedConcurrency,
                 reservedConcurrentExecutions: opt?.reservedConcurrency,
                 ephemeralStorage,
                 // vpcConfig: opt?.network ? {
                 //     subnetIds: opt.network.subnets.map(s => s.id),
                 //     securityGroupIds: [opt.network.resource.defaultSecurityGroupId],
                 // } : undefined
-            });
+            })
             this.resource = fn
+
+            if (opt?.provisionedConcurrency) {
+                const provisionedConcurrencyConfig = new ProvisionedConcurrencyConfig({
+                    functionName: this.resource.functionName,
+                    provisionedConcurrentExecutions: opt.provisionedConcurrency,
+                    qualifier: fn.version,
+                })
+            }
 
             // if (opt?.publish) {
             //     const published = new LambdaPublishment(fn, code.hash)
@@ -158,6 +175,7 @@ export class LambdaFunction<T extends any[] = any[], U = unknown> implements com
             FunctionName: this.resource.functionName,
             Payload: payload,
             InvocationType: opt?.type === 'async' ? 'Event' : undefined,
+            Qualifier: this.resource.version === '$LATEST' ? undefined : this.resource.version,
         })
 
         // FIXME: check for "StatusCode": 202 before returning ??
@@ -194,6 +212,75 @@ export class LambdaFunction<T extends any[] = any[], U = unknown> implements com
 
     public async invokeAsync(...args: T): Promise<void> {
         return this.doInvoke(args, { type: 'async' })
+    }
+}
+
+interface ProvisionedConcurrencyConfigProps {
+    readonly functionName: string
+    readonly provisionedConcurrentExecutions: number
+    readonly qualifier: string
+}
+
+class ProvisionedConcurrencyConfig extends core.defineResource({
+    create: async (props: ProvisionedConcurrencyConfigProps) => {
+        const client = createClient(Lambda.Lambda)
+        const resp = await client.putProvisionedConcurrencyConfig({
+            FunctionName: props.functionName,
+            Qualifier: props.qualifier,
+            ProvisionedConcurrentExecutions: props.provisionedConcurrentExecutions,
+        })
+
+        if (resp.Status === 'FAILED') {
+            throw new Error(`request failed: ${resp.StatusReason}`)
+        }
+
+        return props
+    },
+    update: async (state, props) => {
+        if (
+            state.functionName === props.functionName && 
+            state.qualifier === props.qualifier && 
+            state.provisionedConcurrentExecutions === props.provisionedConcurrentExecutions
+        ) {
+            return state
+        }
+
+        const client = createClient(Lambda.Lambda)
+
+        const resp = await client.putProvisionedConcurrencyConfig({
+            FunctionName: props.functionName,
+            Qualifier: props.qualifier,
+            ProvisionedConcurrentExecutions: props.provisionedConcurrentExecutions,
+        })
+
+        if (resp.Status === 'FAILED') {
+            throw new Error(`request failed: ${resp.StatusReason}`)
+        }
+
+        await client.deleteProvisionedConcurrencyConfig({
+            FunctionName: state.functionName,
+            Qualifier: state.qualifier,
+        })
+
+        return props
+    },
+    delete: async (state) => {
+        const client = createClient(Lambda.Lambda)
+        const resp = await client.deleteProvisionedConcurrencyConfig({
+            FunctionName: state.functionName,
+            Qualifier: state.qualifier,
+        })
+    },
+}) {}
+
+function getVpcConfig(network: net.Network): aws.LambdaFunctionVpcConfigProps {
+    if (!(network instanceof Vpc)) {
+        throw new Error('Not an AWS vpc')
+    }
+
+    return {
+        subnetIds: [network.subnets[0].id], // TODO: better configuration
+        securityGroupIds: [network.resource.defaultSecurityGroupId],
     }
 }
 
@@ -422,6 +509,8 @@ function createImage(handler: string, entrypoint: lib.Bundle, extraCommands?: st
     return { repo, deployment }
 }
 
+// TODO: multi-account
+// this would (preferably) have auth/creds be apart of the core
 async function getLogs(fn: aws.LambdaFunction) {
     const region = fn.qualifiedArn.split(':')[3]
     const logGroup = fn.loggingConfig?.logGroup ?? `/aws/lambda/${fn.functionName}`

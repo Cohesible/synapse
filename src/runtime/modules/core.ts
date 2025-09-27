@@ -108,6 +108,10 @@ const pointerPrefix = 'pointer:'
 
 /** @internal */
 export function importArtifact(id: string): Promise<any> {
+    if (typeof dynamicImport === 'undefined') {
+        throw new Error('No dynamic importer function registered')
+    }
+
     // A bare hash is OK, metadata may be applied separately
     if (typeof id !== 'string' || id.startsWith(pointerPrefix)) {
         return dynamicImport(id)

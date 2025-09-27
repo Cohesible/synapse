@@ -37,7 +37,7 @@ export class HostedZone implements net.HostedZone {
             ttl: record.ttl,
             type: record.type,
             zoneId: this.resource.zoneId,
-            records: [record.value],
+            records: Array.isArray(record.value) ? record.value : [record.value],
         })
     }
 }

@@ -10,7 +10,7 @@ interface State<T> {
 async function getState<T = any>(bucket: storage.Bucket): Promise<State<T>> {
     const data = await bucket.get('state', 'utf-8')
 
-    return data !== undefined ? JSON.parse(data) : {}
+    return data !== undefined ? JSON.parse(data) as State<T> : { buffer: [] }
 }
 
 class QueueListener extends core.defineResource({

@@ -666,13 +666,6 @@ const CFunction = opaque {
         any,
     };
 
-    const CSeqType = enum(u32) {
-        scalar,
-        seq,
-        typed_array,
-        array_buffer,
-    };
-
     const TypeFlag = enum(u32) {
         none = 0,
         allow_shared = 1 << 0,      // Must be an ArrayBuffer or TypedArray
@@ -683,7 +676,6 @@ const CFunction = opaque {
 
     const CTypeDef = extern struct {
         ty: CType,
-        sequence_type: CSeqType = .scalar,
         flags: TypeFlag = .none,
     };
 
@@ -1043,6 +1035,7 @@ pub const FastOneByteString = extern struct {
     length: u32,
 };
 
+// broken?
 pub const FastU32Array = extern struct {
     length: usize,
     data: [*]u32,
@@ -1067,7 +1060,7 @@ fn toCTypeDef(comptime T: type) ?CFunction.CTypeDef {
         f64 => CFunction.CTypeDef{ .ty = .float64 },
 
         // []u8 => CFunction.CTypeDef{ .ty = .uint8, .sequence_type = .typed_array },
-        FastU32Array => CFunction.CTypeDef{ .ty = .uint32, .sequence_type = .typed_array },
+        // FastU32Array => CFunction.CTypeDef{ .ty = .uint32, .sequence_type = .typed_array },
         FastOneByteString => CFunction.CTypeDef{ .ty = .seq_one_byte_string },
         *anyopaque => CFunction.CTypeDef{ .ty = .pointer },
 
@@ -1512,10 +1505,8 @@ inline fn getErrorMessage(maybe_trace: ?*std.builtin.StackTrace) ![:0]const u8 {
     const Stream = std.io.GenericWriter(*std.ArrayList(u8), anyerror, writer);
     const s = Stream{ .context = &buf };
 
-    const debug_info = std.debug.getSelfDebugInfo() catch  {
-        // stderr.print("Unable to dump stack trace: Unable to open debug info: {s}\n", .{@errorName(err)}) catch return;
-        // return;
-        unreachable;
+    const debug_info = std.debug.getSelfDebugInfo() catch {
+        return "Native error";
     };
 
     // XXX: no clue why the call graph analysis yields a depth of 0 here

@@ -64,7 +64,7 @@ function createBinaryDeserializer(buf: Buffer) {
             }
 
             case ValueKind.u32: {
-                const val = buf.readInt32LE(offset)
+                const val = buf.readUint32LE(offset)
                 offset += 4
 
                 return val
@@ -84,8 +84,12 @@ function createBinaryDeserializer(buf: Buffer) {
                 return Number(val) // FIXME
             }
 
-            case ValueKind.f64:
-                throw new Error(`TODO: 64 bit numbers`)
+            case ValueKind.f64: {
+                const val = buf.readDoubleLE(offset)
+                offset += 8
+
+                return val
+            }
 
             case ValueKind.CallExpression:
                 return readCallExpression()
@@ -93,9 +97,14 @@ function createBinaryDeserializer(buf: Buffer) {
             case ValueKind.PropertyAccess:
                 return readPropertyAccess()
 
-            case ValueKind.AddExpression:
+            case ValueKind.AddExpression: 
+                // readSize()
+                // console.log(readValue(), readValue())
+                // return '<add>'
+            
             case ValueKind.ElementAccess:
                 const s = readSize()
+                // console.log(readValue(),readValue())  
                 offset += s
                 return {} // TODO
 
@@ -150,6 +159,11 @@ function createBinaryDeserializer(buf: Buffer) {
     function readCallExpression() {
         const s = readSize()
         const ident = readStringLike()
+        // if (ident === 'jsonencode') {
+        //     const args = readArray()
+        //     return args[0]
+        // }
+
         if (ident !== 'markpointer') {
             // TODO
             offset += s - 4

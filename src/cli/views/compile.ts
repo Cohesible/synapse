@@ -4,7 +4,7 @@ import { bold, colorize, dim, getDisplay, renderDuration } from '../ui'
 import { CompilerOptions } from '../../compiler/host'
 import { ResolvedProgramConfig } from '../../compiler/config'
 import { getLogger, levelToString } from '../../logging'
-import { getPreviousDeploymentProgramHash, getTemplate, getTemplateFromProgramHash, readState } from '../../artifacts'
+import { getPreviousDeploymentCommit, getTemplate, getTemplateFromProgramHash, readState } from '../../artifacts'
 import { TfJson } from '../../runtime/modules/terraform'
 import { getBuildTarget } from '../../execution'
 import { getWorkingDir } from '../../workspaces'
@@ -222,7 +222,8 @@ export async function getPreviousDeploymentData() {
         return
     }
 
-    const programHash = await getPreviousDeploymentProgramHash()
+    const commit = await getPreviousDeploymentCommit()
+    const programHash = commit?.programHash
     const [state, oldTemplate] = await Promise.all([
         readState(),
         programHash ? getTemplateFromProgramHash(programHash) : undefined,

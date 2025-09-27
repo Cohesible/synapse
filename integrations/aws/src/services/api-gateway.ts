@@ -7,10 +7,11 @@ import { LambdaFunction } from './lambda'
 import { signRequest } from '../sigv4'
 import { NodeHttpHandler } from '@smithy/node-http-handler'
 import { HostedZone } from './route53'
-import { Middleware, RouteRegexp, buildRouteRegexp, matchRoutes, HttpResponse, HttpError, HttpRoute, PathArgs, createPathBindings, applyRoute, compareRoutes, HttpRequest, RequestHandler, RequestHandlerWithBody, PathArgsWithBody } from 'synapse:http'
+import { Middleware, RouteRegexp, buildRouteRegexp, matchRoutes, HttpResponse, HttpError, HttpRoute, runWithRequestCtx, getSetCookieHeaders, createPathBindings, applyRoute, compareRoutes, HttpRequest, RequestHandler, RequestHandlerWithBody, PathArgsWithBody } from 'synapse:http'
 import { createSerializedPolicy } from './iam'
 import { generateIdentifier } from 'synapse:lib'
 import * as compute from 'synapse:srl/compute'
+import * as net from 'synapse:srl/net'
 import { Provider } from '..'
 import { addResourceStatement, getPermissionsLater } from '../permissions'
 
@@ -25,7 +26,10 @@ export class Gateway {
 
     private requestRouter?: ReturnType<typeof createRequestRouter> & { fn: LambdaFunction }
 
-    public constructor(readonly props?: compute.HttpServiceOptions & { mergeHandlers?: boolean; allowedOrigins?: string[] }) {
+    // `network` sets the placement for the compute but not the gateway
+    // A network solver becomes desirable to avoid configuration overload.
+    // Then users only need to say what should be public. Everything else is private by default.
+    public constructor(readonly props?: compute.HttpServiceOptions & { mergeHandlers?: boolean; allowedOrigins?: string[]; network?: net.Network; _lambdaOpt?: any; rateLimiter?: GlobalRateLimiterFn }) {
         const domain = (props?.domain && 'resource' in props.domain) ? props.domain as HostedZone : undefined
 
         const apig = new aws.Apigatewayv2Api({
@@ -68,7 +72,7 @@ export class Gateway {
         this.region = region.name
 
         if (mergeHandlers) {
-            const router = createRequestRouter()
+            const router = createRequestRouter(props?.rateLimiter)
             this.requestRouter = {
                 ...router,
                 fn: this.addRouteInfra('$default', router.routeRequest)
@@ -148,12 +152,17 @@ export class Gateway {
     }
 
     private addRouteInfra(route: string, handler: ApiGatewayHandler) {
-        const fn = new LambdaFunction(handler)
+        const fn = new LambdaFunction(handler, {
+            network: this.props?.network,
+            ...this.props?._lambdaOpt,
+        })
 
         const integration = new aws.Apigatewayv2Integration({
             apiId: this.resource.id,
             integrationType: 'AWS_PROXY',
-            integrationUri: fn.resource.arn,
+            integrationUri: this.props?._lambdaOpt?.provisionedConcurrency
+                ? `${fn.resource.arn}:${fn.resource.version}`
+                : fn.resource.arn,
             payloadFormatVersion: '2.0',
         })
 
@@ -170,6 +179,7 @@ export class Gateway {
             action: "lambda:InvokeFunction",
             principal: "apigateway.amazonaws.com",
             sourceArn: `${this.resource.executionArn}/*/*`,
+            qualifier: this.props?._lambdaOpt?.provisionedConcurrency ? fn.resource.version : undefined,
         })
 
         return fn
@@ -243,7 +253,10 @@ interface RequestContextBase {
     stage: string
     time: string
     timeEpoch: number
-    // identity?: { sourceIp: string }
+    identity?: { 
+        sourceIp: string
+        userAgent: string
+    }
 }
 
 interface ApiGatewayRequestPayloadV2 {
@@ -251,7 +264,7 @@ interface ApiGatewayRequestPayloadV2 {
     readonly routeKey: string
     readonly rawPath: string
     readonly rawQueryString: string
-    readonly cookies: string[]
+    readonly cookies?: string[]
     readonly headers: Record<string, string>
     readonly queryStringParameters: Record<string, string>
     readonly requestContext: RequestContextBase & {
@@ -277,6 +290,12 @@ const TypedArray = Object.getPrototypeOf(Uint8Array)
 async function runHandler<T>(fn: () => Promise<T> | T): Promise<T | HttpResponse> {
     try {
         const resp = await fn()
+        const setCookies = getSetCookieHeaders()
+        const extraHeaders: Record<string, string> = {}
+        if (setCookies && setCookies.length > 0) {
+            extraHeaders['set-cookie'] = setCookies[0]
+        }
+
         if (resp instanceof Response) {
             if (resp.headers.get('content-type')?.startsWith('image/')) {
                 const body = Buffer.from(await resp.arrayBuffer()).toString('base64')
@@ -299,7 +318,7 @@ async function runHandler<T>(fn: () => Promise<T> | T): Promise<T | HttpResponse
         }
 
         if (resp === undefined) {
-            return { statusCode: 204 }
+            return { statusCode: 204, headers: extraHeaders }
         }
 
         if (resp instanceof TypedArray || resp instanceof Blob) {
@@ -311,6 +330,7 @@ async function runHandler<T>(fn: () => Promise<T> | T): Promise<T | HttpResponse
                 isBase64Encoded: true,
                 headers: {
                     'content-type': 'application/octet-stream',
+                    ...extraHeaders,
                 }
             } as any
         }
@@ -322,6 +342,18 @@ async function runHandler<T>(fn: () => Promise<T> | T): Promise<T | HttpResponse
                 headers: {
                     'access-control-allow-origin': '*', // FIXME: use `allowedOrigins` if available
                     'content-type': 'application/json',
+                    ...extraHeaders,
+                },
+            }
+        }
+
+        if (setCookies && setCookies.length > 0) {
+            return {
+                body: Buffer.from(JSON.stringify(resp)).toString('utf-8'),
+                statusCode: 200,
+                headers: {
+                    'content-type': 'application/json',
+                    ...extraHeaders,
                 },
             }
         }
@@ -333,7 +365,7 @@ async function runHandler<T>(fn: () => Promise<T> | T): Promise<T | HttpResponse
         if (e instanceof HttpError) {
             return {
                 body: JSON.stringify({ message: e.message }),
-                statusCode: e.fields.statusCode,
+                statusCode: e.fields.status ?? e.fields.statusCode,
             }
         }
 
@@ -375,7 +407,8 @@ function wrapRequestHandler(
             duplex: 'half', // specific to node
         } as RequestInit)
 
-        ;(newReq as any).cookeis = request.cookies
+        ;(newReq as any)._decoded = decoded // XXX
+        ;(newReq as any).cookies = request.cookies
         ;(newReq as any).context = request.requestContext
         ;(newReq as any).pathParameters = request.pathParameters
 
@@ -393,19 +426,42 @@ function wrapRequestHandler(
     return handleRequest
 }
 
+type GlobalRateLimiterFn = (context: ApiGatewayRequestPayloadV2['requestContext'], cookies?: string[]) => Promise<void | boolean | number | object> | void | boolean | number | object
+
+const canLog = !process.env['SYNAPSE_NO_LOG']
+
 type ApiGatewayHandler = ReturnType<typeof wrapRequestHandler>
-function createRequestRouter() {
+function createRequestRouter(rateLimiter?: GlobalRateLimiterFn) {
     interface RouteEntry {
         readonly route: string
         readonly pattern: RouteRegexp<string>
         readonly handler: ApiGatewayHandler
     }
 
-    const routeTable: { [method: string]: RouteEntry[] } = {}
+    const routeTable = new Map<string, RouteEntry[]>()
+    const mergedRouteTable = new Map<string, [pattern: RouteRegexp<string>, route: RouteEntry][]>()
+    function getRouteArray(method: string) {
+        let arr = mergedRouteTable.get(method)
+        if (!arr) {
+            arr = [
+                ...(routeTable.get(method) ?? []),
+                ...(routeTable.get('ANY') ?? []),
+            ].map(e => [e.pattern, e] as [RouteRegexp<string>, RouteEntry])
+
+            arr.sort((a, b) => compareRoutes(b[1].route, a[1].route))
+
+            routeTable.delete(method)
+            mergedRouteTable.set(method, arr)
+        }
+        return arr
+    }
 
     function addRoute(route: string, handler: ApiGatewayHandler) {
         const [method, path] = route.split(' ')
-        const routes = routeTable[method] ??= []
+        let routes = routeTable.get(method)
+        if (!routes) {
+            routeTable.set(method, routes = [])
+        }
         routes.push({
             route,
             handler,
@@ -413,36 +469,60 @@ function createRequestRouter() {
         })
     }
 
-    function findRoute(path: string, routes: RouteEntry[]) {
-        const matched = Array.from(
-            matchRoutes(path, routes.map(e => [e.pattern, e]))
-        )
-
-        console.log('all matched routes:', matched.map(r => r.value.route))
-
-        const sorted = matched.sort((a, b) => compareRoutes(b.value.route, a.value.route))
-        const first = sorted[0]
-        if (first === undefined) {
+    function findRoute(path: string, routes: [pattern: RouteRegexp<string>, route: RouteEntry][]) {
+        const g = matchRoutes(path, routes)
+        const r = g.next()
+        if (!r.value) {
             throw new HttpError(`Resource does not exist: ${path}`, { statusCode: 404 })
         }
 
-        return first
+        return r.value
     }
 
-    function routeRequest(request: ApiGatewayRequestPayloadV2) {
+    async function routeRequest(request: ApiGatewayRequestPayloadV2) {
+        if (rateLimiter) {
+            const resp = await rateLimiter(request.requestContext, request.cookies)
+            if (resp) {
+                if (typeof resp === 'object') return resp
+
+                const headers: Record<string, string> = {}
+                if (typeof resp === 'number') {
+                    headers['retry-after'] = String(resp)
+                }
+
+                return {
+                    statusCode: 429,
+                    headers,
+                }
+            }
+        }
+
         const method = request.requestContext.http.method
-        const routes = [
-            ...(routeTable[method] ?? []),
-            ...(routeTable['ANY'] ?? []),
-        ]
+        const routes = getRouteArray(method)
 
         const stage = request.requestContext.stage
         const trimmedPath = request.rawPath.replace(`/${stage}`, '')
-        console.log('got request, stage:', stage, 'pathname:', trimmedPath)
+        if (canLog) {
+            console.log('got request, stage:', stage, 'pathname:', trimmedPath)
+        }
 
-        return runHandler(async () => {
+        const reqCtx = { 
+            priorCookies: new Map<string, string>(), 
+            setCookies: (request.requestContext as any).setCookies,
+        }
+        if (request.cookies) {
+            for (const c of request.cookies) {
+                const [key, value] = c.split('=', 2)
+                reqCtx.priorCookies.set(key, value)
+            }
+        }
+
+        // I think `multiValueHeaders` is broken
+        return runWithRequestCtx(reqCtx, () => runHandler(async () => {
             const selectedRoute = findRoute(trimmedPath, routes)
-            console.log('using route:', selectedRoute.value.route)
+            if (canLog) {
+                console.log('using route:', selectedRoute.value.route)
+            }
             request.pathParameters = selectedRoute.match.groups ?? {}
 
             const resp = await selectedRoute.value.handler(request)
@@ -461,7 +541,7 @@ function createRequestRouter() {
             }
 
             return resp
-        })
+        }))
     }
 
     return { addRoute, routeRequest }

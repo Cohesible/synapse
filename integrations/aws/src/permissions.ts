@@ -80,7 +80,7 @@ interface ArnProps {
 
 function getArn(props: ArnProps, ctx?: Provider) {
     const resource = props.resource?.toString()
-    if (resource?.startsWith('arn:')) {
+    if (resource === '*' || resource?.startsWith('arn:')) {
         return props.resource
     }
 

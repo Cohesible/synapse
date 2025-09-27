@@ -658,7 +658,7 @@ export function createSerializer(
                 }
     
                 if (typeof obj === 'function') {
-                    if (obj.name === 'Object' && Object.keys(Object).every(k => Object.hasOwn(obj, k))) {
+                    if (obj === Object) {
                         return {
                             id,
                             valueType: 'reflection',
@@ -2182,7 +2182,7 @@ function createBinarySerializer() {
         }
 
         if (n < 0) {
-            if (n <= i32Threshold) {
+            if (n >= i32Threshold) {
                 writeKind(ValueKind.i32)
                 buf.writeInt32LE(n, offset)
                 offset += 4

@@ -89,17 +89,34 @@ if (isSea) {
 }
 
 export function main(...args: string[]) {
+    // Check if node-like options were passed
     const arg0 = args[0]
-    if (arg0 === '--version') {
-        const version = getCurrentVersion()
-        if (args[1] === '--json') {
-            process.stdout.write(JSON.stringify(version, undefined, 4) + '\n')
-        } else {
-            const includeRevision = !isProdBuild || args[1] === '--revision'
-            const versionStr = `synapse ${version.semver}${(version.revision && includeRevision) ? `-${version.revision}` : ''}`
-            process.stdout.write(versionStr + '\n')
+    if (arg0?.startsWith('--')) {
+        if (arg0 === '--version') {
+            const version = getCurrentVersion()
+            if (args[1] === '--json') {
+                process.stdout.write(JSON.stringify(version, undefined, 4) + '\n')
+            } else {
+                const includeRevision = !isProdBuild || args[1] === '--revision'
+                const versionStr = `synapse ${version.semver}${(version.revision && includeRevision) ? `-${version.revision}` : ''}`
+                process.stdout.write(versionStr + '\n')
+            }
+            return
         }
-        return
+
+        const nodeOpt: Record<string, string | boolean> = {}
+        while (args.length && args[0].startsWith('--')) {
+            const opt = args.shift()!.slice(2)
+            nodeOpt[opt] = true
+        }
+
+        if (nodeOpt['inspect']) {
+            const inspector = require('node:inspector') as typeof import('node:inspector')
+            inspector.open()
+            inspector.waitForDebugger()
+        }
+
+        return main(...args)
     }
 
     if (process.env['SYNAPSE_USE_DEV_LOADER'] && isSea) {
@@ -171,7 +188,17 @@ export function main(...args: string[]) {
         process.argv.splice(isSea ? 1 : 2, 1)
 
         const fs = require('node:fs') as typeof import('node:fs')
-        const resolved = fs.realpathSync(path.resolve(arg0))
+        
+        // Might have to infer the extname (node compat)
+        let targetScript = arg0
+        if (!path.extname(targetScript)) {
+            if (fs.existsSync(targetScript + '.js')) {
+                targetScript = targetScript + '.js'
+            } 
+        }
+
+        const resolved = fs.realpathSync(targetScript)
+
         setContext({ selfPath, selfBuildType })
 
         return synapse.runUserScript(resolved, process.argv.slice(2))
@@ -180,12 +207,6 @@ export function main(...args: string[]) {
     Error.stackTraceLimit = 100
     process.on('uncaughtException', e => getLogger().error('Uncaught exception', e))
     process.on('unhandledRejection', e => getLogger().error('Unhandled rejection', e))
-
-    // if (args.includes('--inspect')) {
-    //     const inspector = require('node:inspector') as typeof import('node:inspector')
-    //     inspector.open()
-    //     inspector.waitForDebugger()
-    // }
 
     function tryGracefulExit(exitCode = process.exitCode) {
         let loops = 0

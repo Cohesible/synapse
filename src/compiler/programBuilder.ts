@@ -126,7 +126,7 @@ export function createProgramBuilder(
         // ZIG COMPILATION
         const zigGraph = await runTask('zig', 'graph', () => preprocessZigModules([...allNonDeclarationFiles], workingDir), 1)
         if (zigGraph?.changed) {
-            // TODO: check this earlier or make it not required
+            // TODO: warn here instead?
             if (!config.tsc.cmd.options.allowArbitraryExtensions) {
                 throw new Error('Compiling with Zig modules requires adding "allowArbitraryExtensions" to your tsconfig.json "compilerOptions" section')
             }
@@ -176,6 +176,10 @@ export function createProgramBuilder(
                     getLogger().debug(`Marked ${f} for runtime transforms`)
                     needsRuntimeTransform.add(f)
                 }
+                // } else if (f.endsWith('.tsx')) {
+                //     getLogger().debug(`Marked ${f} for runtime transforms (JSX)`)
+                //     needsRuntimeTransform.add(f)
+                // }
 
                 if (!incremental) {
                     if (hasMainFunction(getSourceFileOrThrow(program, f), getTypeChecker)) {

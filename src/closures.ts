@@ -221,12 +221,12 @@ export function normalizeSymbolIds(obj: ReturnType<typeof createDataTable>, incl
 
 function applySymbolMappings(obj: ReturnType<typeof createDataTable>, getId: (symbolId: string | number) => string) {
     function visit(val: any): any {
-        if (Array.isArray(val)) {
-            return val.map(visit)
+        if (typeof val !== 'object' || val === null) {
+            return val
         }
 
-        if (typeof val !== 'object' || !val) {
-            return val
+        if (Array.isArray(val)) {
+            return val.map(visit)
         }
 
         if (isDataPointer(val)) {
@@ -235,7 +235,7 @@ function applySymbolMappings(obj: ReturnType<typeof createDataTable>, getId: (sy
 
         const result: Record<string, any> = {}
         for (const [k, v] of Object.entries(val)) {
-            if (k !== moveableStr || typeof v !== 'object' || !v) {
+            if (k !== moveableStr || typeof v !== 'object' || v === null) {
                 result[k] = visit(v)
                 continue
             }
@@ -254,7 +254,7 @@ function applySymbolMappings(obj: ReturnType<typeof createDataTable>, getId: (sy
     const table: Record<string, ({ id: string } & ExternalValue)> = {}
     for (const [k, v] of Object.entries(obj.table)) {
         const mapped = getId(k)
-        if (typeof v === 'object' && !!v && 'id' in v) {
+        if (typeof v === 'object' && v !== null && 'id' in v) {
             v.id = mapped
             if (v.valueType === 'binding') {
                 if (typeof v.valueType === 'object') {
@@ -446,6 +446,8 @@ function createOptimizer(fs: { readDataSync: (hash: string) => Uint8Array; write
 
 function createNativeCompiler(workingDirectory: string, tsOptions: ts.CompilerOptions, opt?: InternalBundleOptions) {
     const systemTarget = resolveBuildTarget()
+    const _arch = opt?.arch ?? systemTarget.arch
+    const arch = _arch === 'arm64' ? 'aarch64' : _arch
             
     return (fileName: string) => {
         return compileZigDirect(fileName, {
@@ -453,7 +455,7 @@ function createNativeCompiler(workingDirectory: string, tsOptions: ts.CompilerOp
             rootDir: tsOptions.rootDir ?? workingDirectory,
             outDir: tsOptions.outDir,
             hostTarget: {
-                arch: opt?.arch ?? systemTarget.arch,
+                arch,
                 os: opt?.os ?? systemTarget.os,
                 libc: opt?.libc ?? systemTarget.libc,
                 endianness: opt?.endianness ?? systemTarget.endianness,
@@ -727,7 +729,12 @@ export async function bundleClosure(
         outfile,
         { 
             workingDirectory, 
-            bundleOptions: { ...opt, bundled, serializerHost, minifyKeepWhitespace: true },
+            bundleOptions: { 
+                ...opt, 
+                bundled, 
+                serializerHost, 
+                minifyKeepWhitespace: opt?.minify ?? true,
+            },
         }
     )    
 

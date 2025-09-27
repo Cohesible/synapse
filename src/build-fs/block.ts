@@ -26,17 +26,6 @@ function cmpBuffer(a: Buffer, b: Buffer) {
     return 0
 }
 
-function cmpBufferWithOffsets(a: Buffer, b: Buffer, c: number, d: number, l: number) {
-    for (let i = 0; i < l; i += 4) {
-        const z = a.readUInt32LE(i + c) - b.readUInt32LE(i + d)
-        if (z !== 0) {
-            return z
-        }
-    }
-
-    return 0
-}
-
 function cmpTypedArray(a: Uint32Array, b: Uint32Array) {
     if (a.length !== b.length) {
         return a.length - b.length
@@ -93,12 +82,23 @@ export function openBlock(block: Buffer) {
         throw new Error(`Corrupted block: ${block.byteLength} <= ${dataStart}`)
     }
 
+    function cmpBufferWithOffsets(b: Buffer, c: number) {
+        for (let i = 0; i < 32; i += 4) {
+            const z = block.readUInt32LE(i + c) - b.readUInt32LE(i)
+            if (z !== 0) {
+                return z
+            }
+        }
+
+        return 0
+    }
+
     function binarySearch(b: Buffer) {
         let lo = 0
         let hi = numObjects - 1
         while (lo <= hi) {
             const m = Math.floor((lo + hi) / 2)
-            const z = cmpBufferWithOffsets(block, b, 4 + (m * objRecordSize), 0, 32)
+            const z = cmpBufferWithOffsets(b, 4 + (m * objRecordSize))
             if (z < 0) {
                 lo = m + 1
             } else if (z > 0) {
@@ -154,7 +154,11 @@ export function openBlock(block: Buffer) {
         return hashes
     }
 
-    return { readObject, hasObject, listObjects }
+    return { 
+        readObject, 
+        hasObject, 
+        listObjects,
+    }
 }
 
 export function getBlockInfo(block: Buffer) {

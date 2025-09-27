@@ -8,6 +8,7 @@ import { PackageInfo } from '../../runtime/modules/serdes'
 import { getFs } from '../../execution'
 import { extractTarball, extractToDir, hasBsdTar } from '../../utils/tar'
 import { findRemotePackage, listRemotePackages, isRemoteDisabled } from '../../workspaces'
+import { getLogger } from '../../logging'
 
 export const sprPrefix = 'spr:'
 
@@ -46,6 +47,8 @@ async function maybeParseRefsFromPipeline() {
     const result: Record<string, string> = {}
     for (const [k, v] of Object.entries(parsed)) {
         if (typeof v !== 'string') continue // TODO
+
+        // TODO: use pipeline-fs
 
         const found = await findRemotePackage(k)
         if (found) {

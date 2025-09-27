@@ -789,7 +789,7 @@ export function createModuleLinker(fs: Pick<SyncFs, 'readFileSync'>, resolver: M
 
         const fileName = module.fileName
         if (!fileName) {
-            throw new Error(`Only built-in modules can be missing a filename`)
+            throw new Error(`Only built-in modules should lack a filename`)
         }
 
         const extname = path.extname(fileName)
@@ -1269,6 +1269,7 @@ export function createModuleLoader(
         }
 
         return Object.assign(require, { 
+            // these are added for compat with node
             resolve,
             cache: cacheProxy,
             main: requireMain,
@@ -1344,7 +1345,7 @@ export function createScriptModule(
     cacheKey?: string,
     sourceMapParser?: Pick<SourceMapParser, 'registerFile' | 'setAlias'>,
     _process?: typeof process,
-    dynamicImporter?: (id: string) => Promise<any>,
+    dynamicImport?: (id: string) => Promise<any>,
     moduleImporter?: ModuleCreateOptions['importModuleDynamically'],
     moduleObj?: { exports: any }, 
 ): CjsModule {
@@ -1360,16 +1361,7 @@ export function createScriptModule(
     }
 
     const cachedData = key ? cache?.getCachedData(key) : undefined
-
-    const dynamicImport = (id: string) => {
-        if (!dynamicImporter) {
-            throw new Error('No dynamic import callback registered')
-        }
-
-        return dynamicImporter(id)
-    }
-
-    const produceCachedData = !!cache && !!key && !cachedData
+    const produceCachedData = !!cache && !cachedData && !!key
 
     function evaluate() {
         if (module.evaluated) {
@@ -1399,15 +1391,19 @@ export function createScriptModule(
         (moduleObj as any).evaluate = evaluate
     }
 
+    const __dirname = path.dirname(location)
+
     const module: CjsModule = (moduleObj as any) ?? {
         exports: {},
         evaluate,
+        // Backwards compat w/ node, this does not include global paths
+        paths: [__dirname],
     }
 
     const ext = { 
         require: requireFn,
         __filename: location,
-        __dirname: path.dirname(location),
+        __dirname,
         module,
         exports: module.exports,
 
@@ -1449,6 +1445,7 @@ export function createScriptModule(
     }
 
     sourceMapParser?.registerFile(location, text)
+
     const s = compileScript()
     module.script = s
 

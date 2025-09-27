@@ -42,21 +42,25 @@ export class Queue<T = string>  {
     }
 
     public async send(val: T): Promise<void> {
-        await sendMessage(this.resource, JSON.stringify(val))
+        await this.client.sendMessage({
+            QueueUrl: this.resource.url,
+            MessageBody: JSON.stringify(val),
+        })
     }
 
-    public async consume<U>(fn: (val: T) => U | Promise<U>): Promise<U> {
+    public async consume<U>(fn: (val: T) => U | Promise<U>, timeout = 20): Promise<U> {
         const resp = await this.client.receiveMessage({
             QueueUrl: this.resource.url,
             MaxNumberOfMessages: 1,
-            WaitTimeSeconds: 20,
+            WaitTimeSeconds: timeout,
         })
+
         const message = resp.Messages?.[0]
         if (!message) {
             throw new Error('No message in queue')
         }
-        const result = await fn(JSON.parse(message.Body!))
 
+        const result = await fn(JSON.parse(message.Body!))
         await this.client.deleteMessage({
             QueueUrl: this.resource.url,
             ReceiptHandle: message.ReceiptHandle,
@@ -66,14 +70,6 @@ export class Queue<T = string>  {
     }
 }
 
-async function sendMessage(target: aws.SqsQueue, message: string) {
-    const client = new SQS.SQS({})
-    await client.sendMessage({
-        QueueUrl: target.url,
-        MessageBody: message,
-    })
-}
-
 function addSqsStatement(recv: any, action: string | string[], resource = '*') {
     addResourceStatement({
         service: 'sqs',
@@ -81,11 +77,6 @@ function addSqsStatement(recv: any, action: string | string[], resource = '*') {
         resource,
     }, recv)
 }
-
-core.bindFunctionModel(sendMessage, function (target) {
-    addSqsStatement(this, 'SendMessage', target.name)
-})
-
 
 // https://docs.aws.html#example-standard-queue-message-event
 interface MessageRecord {
@@ -140,8 +131,21 @@ function forwardEvent<T>(target: (message: T) => Promise<void> | void, fifo = fa
 
 core.addTarget(storage.Queue, Queue, 'aws')
 
-// It's easier to create helper functions and bind permissions to those because
-// the APIs accept URLs rather than resource names/ARNs
+const parseQueueName = core.defineDataSource((url: string) => {
+    const segments = url.split('/').filter(x => !!x)
+
+    return segments.pop()!
+})
+
+function queueName(url: string) {
+    if (core.isUnknown(url)) {
+        return url
+    }
+
+    return parseQueueName(url)
+}
+
+// https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-api-permissions-reference.html
 core.bindModel(SQS.SQS, {
     'createQueue': function () {
         addSqsStatement(this, 'CreateQueue')
@@ -153,5 +157,19 @@ core.bindModel(SQS.SQS, {
 
         return core.createUnknown()
     },
-})
+    'sendMessage': function (req) {
+        addSqsStatement(this, 'SendMessage', queueName(req.QueueUrl))
 
+        return core.createUnknown()
+    },
+    'receiveMessage': function (req) {
+        addSqsStatement(this, 'ReceiveMessage', queueName(req.QueueUrl))
+
+        return core.createUnknown()
+    },
+    'deleteMessage': function (req) {
+        addSqsStatement(this, 'DeleteMessage', queueName(req.QueueUrl))
+
+        return core.createUnknown()
+    },
+})

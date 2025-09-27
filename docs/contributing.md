@@ -22,7 +22,7 @@ First setup this bash script:
 #/usr/bin/env bash
 set -e
 export SYNAPSE_USE_DEV_LOADER="1"
-PACKAGE_NAME=$(ls -t $SYNAPSE_INSTALL/cache/packages/linked | grep 'synapse-.*-.*-' | head -n 1)
+PACKAGE_NAME=$(ls -t $SYNAPSE_INSTALL/cache/packages/linked | grep -E 'synapse(-[0-9a-f]+){5}' | head -n 1)
 exec synapse "$SYNAPSE_INSTALL/cache/packages/linked/$PACKAGE_NAME/dist/src/cli/index.js" "$@"
 ```
 

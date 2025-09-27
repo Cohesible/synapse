@@ -343,14 +343,16 @@ export function resolveValue(
             }
 
             const id = payload.id
-            if (id !== undefined && resolveCache.has(id)) {
+            if (id === undefined) {
+                return resolveValueType()
+            }
+
+            if (resolveCache.has(id)) {
                 return resolveCache.get(id)
             }
 
             const val = resolveValueType()
-            if (id !== undefined) {
-                resolveCache.set(id, val)
-            }
+            resolveCache.set(id, val)
 
             return val
 

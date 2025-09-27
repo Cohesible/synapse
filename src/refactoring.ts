@@ -768,7 +768,7 @@ export function createSymbolGraph(sourceMap: TerraformSourceMap, resources: Reco
     function matchSymbolNodes(name: string, fileName?: string, attribute?: string) {
         const segments = name.split('/')
         const root = shallowMatchSymbolNodes(segments[0], fileName, attribute)
-        if (segments.length === 1 || root.length !== 1) {
+        if (segments.length === 1 || root.length < 1) {
             return root
         }        
 
@@ -2108,6 +2108,174 @@ function createJsonPathScanner(expression: string) {
     return { scan }
 }
 
+function createReducedGraph(resources: Resource[]) {
+    interface LeafNode {
+        parent: BranchNode
+        readonly kind: 'leaf'
+        readonly value: Resource
+    }
+
+    interface BranchNode {
+        parent?: BranchNode
+        readonly key: string
+        readonly kind: 'branch'
+        readonly children: Record<string, Node>
+    }
+
+    type Node = LeafNode | BranchNode
+
+    function putBranch(parent: BranchNode, key: string): BranchNode {
+        return (parent.children[key] as any) ??= { parent, key, kind: 'branch', children: {} }
+    }
+
+    function removeBranch(n: BranchNode) {
+        if (!n.parent) {
+            return
+        }
+
+        delete n.parent.children[n.key]
+
+        for (const [k, v] of Object.entries(n.children)) {
+            n.parent.children[k] = v
+            v.parent = n.parent
+        }
+    }
+
+    const root: BranchNode = { kind: 'branch', children: {}, key: '' }
+
+    function insertResource(r: Resource) {
+        let n = putBranch(root, r.scopes[0].callSite.fileName)
+        for (let i = 0; i < r.scopes.length - 1; i++) {
+            const s = r.scopes[i]
+            n = putBranch(n, s.assignment?.name ?? s.callSite.name)
+        }
+
+        const s = r.scopes.at(-1)!
+        const k = s.assignment?.name ?? s.callSite.name
+
+        return n.children[k] = { kind: 'leaf', parent: n, value: r }
+    }
+
+    function reduceEdges(leafs: LeafNode[]) {
+        let didChange = false
+        for (const n of leafs) {
+            const p = n.parent
+            const p2 = p.parent
+            if (!p2 || p2.key === '' || p2.parent?.key === '') continue
+
+            let conflicts = false
+            for (const k1 of Object.keys(p.children)) {
+                if (p2.children[k1]) {
+                    conflicts = true
+                    break
+                }
+            }
+
+            if (conflicts) continue
+
+            didChange = true
+            removeBranch(p)
+        }
+
+        return didChange
+    }
+
+    const leafs = resources.filter(r => r.scopes.length > 0).map(insertResource)
+
+    while (true) {
+        if (!reduceEdges(leafs)) {
+            break
+        }
+    }
+
+    function toKey(leaf: LeafNode) {
+        const parts: string[] = []
+        let n = leaf.parent
+        while (true) {
+            parts.push(n.key)
+            if (!n.parent?.key) break
+            n = n.parent
+        }
+
+        return parts.reverse().join('--')
+    }
+}
+
+function getReducedKeys(resources: Map<string, ResolvedScope[]>) {
+    function getModuleId(scope: ResolvedScope) {
+        return scope.callSite.packageRef ?? scope.callSite.specifier ?? scope.callSite.fileName
+    }
+
+    const scopesSet = new Map<string, ResolvedScope[]>()
+    function getExecutionScopeKey(scopes: ResolvedScope[]) {
+        if (scopes.length === 1) {
+            return getModuleId(scopes[0])
+        }
+
+        const parts: string[] = []
+        for (let i = 0; i < scopes.length - 1; i++) {
+            if (scopes[i].namespace) {
+                parts.push(...scopes[i].namespace!.map(x => x.name))
+            }
+            parts.push(scopes[i].callSite.name)
+        }
+
+        return `${getModuleId(scopes[0])}#${parts.join('--')}`
+    }
+
+    function indexScope(scopes: ResolvedScope[]) {
+        while (scopes.length) {
+            const k = getExecutionScopeKey(scopes)
+            if (!scopesSet.has(k)) {
+                scopesSet.set(k, [])
+            }
+
+            const l = scopes.pop()!
+            const match = scopesSet.get(k)!.find(s => s.callSite.name === l.callSite.name)
+            if (!match) {
+                scopesSet.get(k)!.push(l)
+            }
+        }
+    }
+
+    function isRelevant(scopes: ResolvedScope[]) {
+        const k = getExecutionScopeKey(scopes)
+
+        return scopesSet.get(k)!.length > 1
+    }
+
+    for (const scopes of resources.values()) {
+        indexScope([...scopes])
+    }
+
+    const keys = new Map<string, number>()
+    const result = new Map<string, string>()
+    for (const [el, scopes] of resources) {
+        if (scopes.length === 0) continue
+
+        const parts: string[] = []
+        for (let i = scopes.length - 1; i >= 0; i--) {
+            if (!isRelevant(scopes.slice(0, i+1))) continue
+
+            parts.push(scopes[i].assignment?.name ?? scopes[i].callSite.name)
+        }
+
+        if (parts.length === 0) {
+            parts.push(scopes[0].assignment?.name ?? scopes[0].callSite.name)
+        }
+
+        const base = `${el.split('.', 2)[0]}.${getModuleId(scopes[0])}#${parts.reverse().join('--')}`
+        const count = keys.get(base) ?? 0
+        const key = count ? `${base}_${count}` : base
+        keys.set(base, count + 1)
+        result.set(el, key)
+    }
+
+    return result
+}
+
+// tip: Kuhn-Munkres for finding the maximum weighted bipartite matching
+// A resource allocation site is only relevant when there’s more than one in some scope
 export function findAutomaticMoves(state: TfState, oldGraph: SymbolGraph, newGraph: SymbolGraph, currentMoved?: { from: string; to: string }[]) {
     const grouped = new Map<string, Set<string>>()
     const resources = new Map<string, TfResource>()
@@ -2117,8 +2285,8 @@ export function findAutomaticMoves(state: TfState, oldGraph: SymbolGraph, newGra
 
     if (currentMoved) {
         for (const m of currentMoved) {
-            ignoredOld.delete(m.from)
-            ignoredNew.delete(m.to)
+            ignoredOld.add(m.from)
+            ignoredNew.add(m.to)
         }
     }
 
@@ -2143,11 +2311,44 @@ export function findAutomaticMoves(state: TfState, oldGraph: SymbolGraph, newGra
 
     for (const r of state.resources) {
         const key = `${r.type}.${r.name}`
-        if (ignoredOld.has(key)) continue
-        if (!oldGraph.hasResource(key)) continue
+        if (newGraph.hasResource(key)) {
+            ignoredNew.add(key)
+            continue
+        }
+
+        if (ignoredOld.has(key) || !oldGraph.hasResource(key)) continue
 
         resources.set(key, r)
         addToGroup(oldGraph, grouped, key)
+    }
+
+    // Key reduction doesn't seem to hurt perf by much
+    const newResources = new Map<string, ResolvedScope[]>()
+    for (const n of newGraph.getSymbols()) {
+        for (const r of n.value.resources) {
+            const key = `${r.type}.${r.name}`
+            if (!oldGraph.hasResource(key)) {
+                newResources.set(key, r.scopes)
+            }
+        }
+    }
+
+    const oldResources = new Map<string, ResolvedScope[]>()
+    for (const n of oldGraph.getSymbols()) {
+        for (const r of n.value.resources) {
+            const key = `${r.type}.${r.name}`
+            if (!newGraph.hasResource(key)) {
+                oldResources.set(key, r.scopes)
+            }
+        }
+    }
+
+    const newReducedKeys = getReducedKeys(newResources)
+    const reducedKeyMap = new Map<string, string>()
+    for (const [k, v] of getReducedKeys(oldResources)) {
+        if (!newReducedKeys.has(k)) {
+            reducedKeyMap.set(v, k)
+        }
     }
 
     // TODO: don't look for multiple matches, this only exists for legacy deployments
@@ -2191,12 +2392,30 @@ export function findAutomaticMoves(state: TfState, oldGraph: SymbolGraph, newGra
             continue
         }
 
-        if (g.has(k)) {
-            g.delete(k)
-            if (g.size === 0) {
+        function removeFromGroup(key: string) {
+            g!.delete(key)
+            if (g!.size === 0) {
                 grouped.delete(groupKey)
             }
+        }    
+
+        if (g.has(k)) {
+            removeFromGroup(k)
             continue
+        }
+
+        const rk = newReducedKeys.get(k)
+        if (rk && reducedKeyMap.has(rk)) {
+            const from = reducedKeyMap.get(rk)!
+            const gk = getGroupKey(from, oldGraph)
+
+            // Guard against potentially erroneous moves
+            // But this means we aren't smart enough to detect renames of a resource definition
+            if (gk === groupKey) {
+                moved.push({ from, to: k })
+                removeFromGroup(from)
+                continue
+            }
         }
 
         // Search for a match using the absolute key
@@ -2204,6 +2423,7 @@ export function findAutomaticMoves(state: TfState, oldGraph: SymbolGraph, newGra
         const matches = findAbsMatches(abs, g)
         if (matches.length === 1) {
             moved.push({ from: matches[0], to: k })
+            removeFromGroup(matches[0])
         } else {
             addToGroup(newGraph, unmatched, k)
         }

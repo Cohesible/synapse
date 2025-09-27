@@ -9,7 +9,7 @@ import { ImportMap, SourceInfo } from './importMaps'
 import { throwIfNotFileNotFoundError } from '../utils'
 import { openBlock } from '../build-fs/block'
 import { homedir } from 'node:os'
-import { getDataRepository } from '../artifacts'
+import { DataRepository, getDataRepository } from '../artifacts'
 import { getFs, setContext } from '../execution'
 import { isNullHash } from '../build-fs/pointers'
 
@@ -60,7 +60,7 @@ function tryReadFile(fileName: string) {
 const getSynapseInstallDir = () => process.env['SYNAPSE_INSTALL'] || path.resolve(homedir(), '.synapse')
 const getGlobalBuildDir = () => path.resolve(getSynapseInstallDir(), 'build')
 
-function findDataRepoSync(dir: string): { dataDir: string; repo: BasicDataRepository } | undefined {
+function findDataRepoSync(dir: string): { dataDir: string; repo: BasicDataRepository; root: DataRepository } | undefined {
     const fileName = path.resolve(dir, '.synapse', 'snapshot.json')
     const d = tryReadFile(fileName)?.toString('utf-8')
     if (d) {
@@ -110,6 +110,7 @@ function findDataRepoSync(dir: string): { dataDir: string; repo: BasicDataReposi
             return {
                 dataDir: path.resolve(dir, '.synapse', 'data'),
                 repo: { getDataSync, getMetadata },
+                root: repo,
             }
         } 
     }
@@ -125,17 +126,57 @@ export async function devLoader(target: string) {
     const resolvedPath = await fs.promises.realpath(path.resolve(workingDirectory, target))
     const targetDir = path.dirname(resolvedPath)
     const importMap = await getImportMap(targetDir)
+    const found = findDataRepoSync(targetDir)
 
-    const resolver = createModuleResolver({
-        readFileSync: fs.readFileSync,
-        fileExistsSync: (fileName: string) => {
-            try {
-                fs.accessSync(fileName)
-                return true
-            } catch {
+    const vfsMappings = new Map<string, string>()
+
+    async function _loadIndex(hash: string) {
+        try {
+            return JSON.parse(found!.repo.getDataSync(hash, 'utf-8'))
+        } catch (err) {
+            if ((err as any).code !== 'ENOENT') {
+                throw err
+            }
+
+            const res = await found!.root.getBuildFs(hash)
+            return res.index
+        }
+    }
+
+    async function loadIndex(root: string, hash: string) {
+        if (!found) return
+
+        const index = await _loadIndex(hash)
+        for (const [k, v] of Object.entries(index.files)) {
+            vfsMappings.set(path.join(root, k), (v as any).hash)
+        }
+    }
+
+    function readFileSync(fileName: string, encoding?: BufferEncoding) {
+        const m = vfsMappings.get(fileName)
+        if (m === undefined) {
+            return fs.readFileSync(fileName, encoding)
+        }
+
+        return found!.repo.getDataSync(m, encoding as any) as any
+    }
+
+    function fileExistsSync(fileName: string) {
+        try {
+            fs.accessSync(fileName)
+            return true
+        } catch(err) {
+            if ((err as any).code !== 'ENOENT') {
                 return false
             }
+
+            return vfsMappings.has(fileName)
         }
+    }
+
+    const resolver = createModuleResolver({
+        readFileSync,
+        fileExistsSync,
     }, workingDirectory)
 
     if (importMap) {
@@ -147,6 +188,11 @@ export async function devLoader(target: string) {
             if (k.startsWith('synapse:')) {
                 globals[k] = v.location
             }
+            if (v.source?.type === 'package' && v.source.data.resolved?.isSynapsePackage && v.source.data.resolved.integrity) {
+                await loadIndex(v.location, v.source.data.resolved.integrity).catch(err => {
+                    throw new Error(`Failed to load index: ${k}`, { cause: err })
+                })
+            } 
         }
 
         resolver.registerGlobals(globals)
@@ -167,9 +213,8 @@ export async function devLoader(target: string) {
         },
     }, codeCachePath)
 
-    const found = findDataRepoSync(targetDir)
     const dataDir = found?.dataDir ?? (await findDataDir(targetDir) ?? await findDataDir(workingDirectory) ?? workingDirectory)
-    const loader = createModuleLoader(fs, dataDir, resolver, { 
+    const loader = createModuleLoader({ readFileSync }, dataDir, resolver, { 
         codeCache,
         deserializer: resolveValue,
         dataRepository: found?.repo,

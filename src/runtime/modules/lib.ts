@@ -23,7 +23,7 @@ export interface BundleOptions {
     readonly includeAssets?: boolean
 
     /** @internal */ 
-    readonly arch?: 'aarch64' | 'x64'
+    readonly arch?: 'aarch64' | 'arm64' | 'x64'
 
     /** @internal */
     readonly os?: 'windows' | 'darwin' | 'linux'

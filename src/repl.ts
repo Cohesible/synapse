@@ -2,13 +2,14 @@ import * as repl from 'node:repl'
 import * as net from 'node:net'
 import * as path from 'node:path'
 import * as fs from 'node:fs/promises'
+import * as vm from 'node:vm'
 import { CombinedOptions } from '.'
 import { getLogger } from './logging'
 import { getSocketsDirectory, getTargetDeploymentIdOrThrow, getUserSynapseDirectory, toProgramRef } from './workspaces'
 import { TfState } from './deploy/state'
 import { SessionContext } from './deploy/deployment'
 import { pointerPrefix } from './build-fs/pointers'
-import { getDisplay } from './cli/ui'
+import { getDisplay, printLine } from './cli/ui'
 import { getArtifactFs } from './artifacts'
 import { getBuildTargetOrThrow } from './execution'
 import { TypeInfo } from './compiler/resourceGraph'
@@ -192,8 +193,35 @@ async function createRepl(
 export async function enterRepl(
     target: string | undefined,
     loader: Pick<ReturnType<SessionContext['createModuleLoader']>, 'loadModule'>, 
-    options: CombinedOptions & { types?: Record<string, TypeInfo> }
+    options: CombinedOptions & { types?: Record<string, TypeInfo>; eval?: string }
 ) {
+    if (options.eval) {
+        if (!target) {
+            throw new Error('`eval` requires a target')
+        }
+
+        const t = await loader.loadModule(target)
+        const ctxObj = {} as any
+        for (const [k, v] of Object.entries(t)) {
+            if (k === '__esModule') continue
+
+            const ty = options?.types?.[k]
+            if (ty?.callable) {
+                ctxObj[k] = wrapCallable(v, ty.callable)
+            } else {
+                ctxObj[k] = v
+            }
+        } 
+
+        const ctx = vm.createContext(ctxObj)
+        const result = await vm.runInContext(options.eval, ctx)
+        if (result !== undefined) {
+            printLine(result)
+        }
+
+        return {}
+    }
+
     await getDisplay().releaseTty()
     const instance = await createRepl(target, loader, options)
 

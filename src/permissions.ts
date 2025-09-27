@@ -25,9 +25,20 @@ export function isModuleExport(node: ts.Node): node is ts.ExpressionStatement & 
 }
 
 class _Map<K, V> extends Map<K, V> {
+    constructor(...args: ConstructorParameters<typeof Map<K, V>>) {
+        if (isUnknown(args[0])) {
+            super()
+        } else {
+            super(...args)
+        }
+    }
+
     get(key: K) {
         if (isUnknown(key)) {
-            return createUnion(super.values.bind(this)) as any
+            if (super.has(key)) {
+                return super.get(key)
+            }
+            return createUnion([...super.values()]) as any
         }
 
         return super.get(key)
@@ -58,7 +69,7 @@ export function createSolver(substitute?: (node: ts.Node) => any) {
         },
     })
 
-    class MockPromise {
+    class MockPromise {   
         static all(args: any[]) {
             return args
         }
@@ -631,7 +642,14 @@ export function createCapturedSolver(
 
                 if (typeof o === 'object') {
                     if (o.constructor === Map) {
-                        return new _Map([...o.entries()].map(([k, v]) => [resolve(k), resolve(v)]))
+                        const m = new _Map()
+                        resolveCache.set(o, m)
+
+                        for (const [k, v] of o) {
+                            m.set(resolve(k), resolve(v))
+                        }
+
+                        return m
                     }
 
                     return resolveObject(o)

@@ -132,15 +132,47 @@ export function createModuleResolver(fs: Pick<SyncFs, 'readFileSync' | 'fileExis
         throw new Error(`Failed to resolve module: ${specifier} [importer: ${location}]`)
     }
 
+    function resolveAbsolute(absPath: string) {
+        const extname = path.extname(absPath)
+        if (extname) {
+            return absPath
+        }
+
+        const candidates = [
+            `${absPath}${path.sep}index.js`,
+            `${absPath}${path.sep}index.json`,
+            absPath
+        ]
+
+        if (includeTs) {
+            candidates.unshift(`${absPath}${path.sep}index.ts`)
+        }
+    
+        candidates.unshift(`${absPath}.json`)
+        candidates.unshift(`${absPath}.js`)
+
+        if (includeTs) {
+            candidates.unshift(`${absPath}.ts`)
+        }
+
+        for (const p of candidates) {
+            if (fs.fileExistsSync(p)) {
+                if (p === absPath) {
+                    try {
+                        const pkg = getPackage(absPath)
+                        if (pkg.data.main) {
+                            return path.resolve(absPath, pkg.data.main)
+                        }
+                    } catch {}
+                }
+                return p
+            }
+        }
+
+        throw new Error(`Failed to resolve absolute path module: ${absPath}`)
+    }
+
     function resolveWorker(specifier: string, importer?: string, mode: 'cjs' | 'esm' = 'cjs'): string | [fileName: string, typeHint: ModuleTypeHint] {
-        if (isBuiltin(specifier)) {
-            return specifier
-        }
-
-        if (globals[specifier]) {
-            return specifier
-        }
-
         if (specifier.startsWith(pointerPrefix)) {
             if (isDataPointer(specifier)) {
                 return [specifier, 'pointer']
@@ -151,6 +183,14 @@ export function createModuleResolver(fs: Pick<SyncFs, 'readFileSync' | 'fileExis
                 return res.virtualLocation
             }
 
+            return specifier
+        }
+
+        if (isBuiltin(specifier)) {
+            return specifier
+        }
+
+        if (globals[specifier]) {
             return specifier
         }
 
@@ -222,7 +262,7 @@ export function createModuleResolver(fs: Pick<SyncFs, 'readFileSync' | 'fileExis
         }
 
         if (path.isAbsolute(specifier)) {
-            return specifier
+            return resolveAbsolute(specifier)
         }
 
         getLogger().debug(`failed to resolve ${specifier} from ${importer}`)

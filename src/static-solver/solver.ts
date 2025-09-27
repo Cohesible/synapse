@@ -187,6 +187,10 @@ function* dedupeUnknown(union: Union) {
     }
 }
 
+function isIterable(o: any): o is Iterable<any> {
+    return ((typeof o === 'object' && o !== null) || typeof o === 'function') && Symbol.iterator in o
+}
+
 class _Array extends Array {
     join(sep: any) {
         if (this.some(x => isUnknown(x) || x === uninitialized)) {
@@ -492,13 +496,32 @@ export function createStaticSolver(
             return results
         }
 
+        function isSameCall(frame: [node: ts.Node, args: any[]], callArgs: Parameters<typeof call>) {
+            if (frame[0] !== callArgs[0]) {
+                return false
+            }
+
+            const frameArgs = frame[1]
+            if (frameArgs.length !== callArgs[3].length) {
+                return false
+            }
+
+            for (let i = 0; i < frameArgs.length; i++) {
+                if (frameArgs[i] !== callArgs[3][i]) {
+                    return false
+                }
+            }
+
+            return true
+        }
+
         // XXX: only used for recursion
         function callWithStack(...args: Parameters<typeof call>): any {
             if (callStack.length > 50) {
                 return createUnknown()
             }
 
-            const isRecursive = !!callStack.find(f => f[0] === args[0] && f[1].map((e, i) => e === args[3][i]).reduce((a, b) => a && b, true))
+            const isRecursive = !!callStack.find(x => isSameCall(x, args))
             if (isRecursive) {
                 return createUnknown()
             }
@@ -524,6 +547,16 @@ export function createStaticSolver(
                 })
             }
 
+            if (typeof fn !== 'function') {
+                // This is mostly to handle `.then` or `.catch`
+                // Whether or not a function truly returns a Promise is not always statically known
+                if (!fn) {
+                    return createUnknown()
+                }
+
+                failOnNode(`Not a function (type: ${typeof fn}): ${fn}`, source)
+            }
+
             if (isUnion(thisArg)) {
                 return createCachedUnion(function* () {
                     for (const t of thisArg) {
@@ -534,16 +567,6 @@ export function createStaticSolver(
                         }
                     }
                 }) 
-            }
-
-            if (typeof fn !== 'function') {
-                // This is mostly to handle `.then` or `.catch`
-                // Whether or not a function truly returns a Promise is not always statically known
-                if (!fn) {
-                    return createUnknown()
-                }
-
-                failOnNode(`Not a function (type: ${typeof fn}): ${fn}`, source)
             }
 
             if (ts.isNewExpression(source)) {
@@ -958,7 +981,12 @@ export function createStaticSolver(
                         if (isUnknown(part)) {
                             yield part
                         } else {
-                            yield substituteUnion([...head, part, ...parts.slice(unionIdx + 1)])
+                            const next = substituteUnion([...head, part, ...parts.slice(unionIdx + 1)])
+                            if (isUnion(next)) {
+                                yield* next
+                            } else {
+                                yield next
+                            }
                         }
                     }
                 })
@@ -1103,7 +1131,18 @@ export function createStaticSolver(
                     return !val
             }
 
-            failOnNode(`Not implemented: ${node.operator}`, node)
+            // failOnNode(`Not implemented: ${node.operator}`, node)
+        }
+
+        function solvePostfixUnaryExpression(node: ts.PostfixUnaryExpression) {
+            const val = solve(node.operand)
+            if (isUnknown(val)) {
+                return unknown
+            }
+
+            return unknown
+
+            // failOnNode(`Not implemented: ${node.operator}`, node)
         }
 
         function solveArrayLiteralExpression(node: ts.ArrayLiteralExpression) {
@@ -1187,56 +1226,78 @@ export function createStaticSolver(
             const decl = node.initializer.declarations[0]
             
             if (ts.isIdentifier(decl.name)) {
-                // TODO: this needs to convert iterables to unions, not just arrays
-                const mapped = isUnion(val) ? createUnion(function* () {
-                    for (const v of val) {
-                        if (Array.isArray(v)) {
-                            yield createUnion(v)
-                        } else {
-                            yield v
+                const name = decl.name.text
+
+                function visit(exp: any) {
+                    const scopedState = new Map<string, any>()
+                    scopedState.set(name, exp)
+    
+                    const solver = createSolver(scopedState, getSubstitute)
+                    solver.solve(node.statement)
+    
+                    // XXX: eval the entire body even if we don't reference anything directly
+                    for (const [k, v] of scopedState.entries()) {
+                        evaluate(v)
+                    }
+                }
+
+                if (isUnion(val)) {
+                    for (const v1 of val) {
+                        if (isUnknown(v1)) {
+                            visit(v1)
+                            break
+                        }
+
+                        // TODO: figure out where `undefined` is coming from
+                        if (v1 === undefined) continue
+                        for (const v2 of v1) {
+                            visit(v2)
                         }
                     }
-                }) : Array.isArray(val) ? createUnion(val) : val
-
-                const scopedState = new Map<string, any>()
-                scopedState.set(decl.name.text, mapped)
-
-                const solver = createSolver(scopedState, getSubstitute)
-                solver.solve(node.statement)
-
-                // XXX: eval the entire body even if we don't reference anything directly
-                for (const [k, v] of scopedState.entries()) {
-                    evaluate(v)
+                } else if (isUnknown(val)) {
+                    visit(val)
+                } else if (val) {
+                    if (isIterable(val)) {
+                        for (const v2 of val) {
+                            visit(v2)
+                        }
+                    }
                 }
-            }
+            } else if (ts.isArrayBindingPattern(decl.name)) {
+                const elements = decl.name.elements
+                function visit(exp: any) {
+                    const scopedState = new Map<string, any>()
+                    const iter: Iterator<any> | undefined = isIterable(exp) ? exp[Symbol.iterator]() : undefined
 
-            if (ts.isArrayBindingPattern(decl.name)) {
-                const scopedState = new Map<string, any>()
-                for (let i = 0; i < decl.name.elements.length; i++) {
-                    const n = decl.name.elements[i]
-                    if (ts.isBindingElement(n) && ts.isIdentifier(n.name)) {
-                        if (isUnknown(val)) {
-                            scopedState.set(n.name.text, unknown)
-                        } else {
-                            scopedState.set(n.name.text, createUnion(function* () {
-                                for (const x of val) {
-                                    if (isUnknown(x)) {
-                                        yield x
-                                    } else {
-                                        yield x[i]
-                                    }
+                    for (let i = 0; i < elements.length; i++) {
+                        const n = elements[i]
+                        if (ts.isBindingElement(n) && ts.isIdentifier(n.name)) {
+                            if (isUnknown(exp)) {
+                                scopedState.set(n.name.text, unknown)
+                            } else {
+                                const v = iter?.next()
+                                if (!v?.done) {
+                                    scopedState.set(n.name.text, v?.value)
                                 }
-                            }))
+                            }
                         }
+                    }
+    
+                    const solver = createSolver(scopedState, getSubstitute)
+                    solver.solve(node.statement)
+    
+                    // XXX: eval the entire body even if we don't reference anything directly
+                    for (const [k, v] of scopedState.entries()) {
+                        evaluate(v)
                     }
                 }
 
-                const solver = createSolver(scopedState, getSubstitute)
-                solver.solve(node.statement)
-
-                // XXX: eval the entire body even if we don't reference anything directly
-                for (const [k, v] of scopedState.entries()) {
-                    evaluate(v)
+                if (isUnion(val)) {
+                    for (const v of val) {
+                        visit(v)
+                    }
+                } else {
+                    visit(val)
                 }
             }
 
@@ -1351,6 +1412,8 @@ export function createStaticSolver(
                     return solveTypeofExpression(node)
                 } else if (ts.isPrefixUnaryExpression(node)) {
                     return solvePrefixUnaryExpression(node)
+                } else if (ts.isPostfixUnaryExpression(node)) {
+                    return solvePostfixUnaryExpression(node)
                 } else if (ts.isRegularExpressionLiteral(node)) {
                     return solveRegularExpressionLiteral(node)
                 } else if (ts.isTemplateExpression(node)) {

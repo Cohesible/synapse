@@ -39,9 +39,10 @@ export class Provider extends aws.AwsProvider {
 
     public get assetBucket() {
         // TODO: only create 1 asset bucket per-account (or possibly per-user)
-        return this._assetBucket ??= new aws.S3Bucket({
+        const assetBucket = core.singleton(aws.S3Bucket, {
             bucketPrefix: 'asset-bucket',
         })
+        return this._assetBucket = assetBucket
     }
 
     public static fromAccount(account: Account, partition = 'aws') {

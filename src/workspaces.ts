@@ -408,7 +408,7 @@ export async function findDeployment(programId: string, projectId: string, envir
     }
 
     const envName = environmentName ?? app.defaultEnvironment ?? 'local'
-    const environment = app.environments[envName]
+    const environment = app.environments[envName] ?? app.environments['local']
     if (!environment) {
         return program?.processId
     }

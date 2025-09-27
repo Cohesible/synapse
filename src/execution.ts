@@ -12,11 +12,6 @@ interface ExecutionContext {
     readonly abortSignal?: AbortSignal
 }
 
-// Looks interesting
-// https://github.com/nodejs/node/issues/46265
-// Removing most of the `async_hooks` code would be great
-// The most useful thing is by far `AsyncLocalStorage`
-
 const storage = new AsyncLocalStorage<ExecutionContext>()
 
 function getContextOrThrow() {

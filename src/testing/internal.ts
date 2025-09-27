@@ -339,6 +339,10 @@ export async function main(...patterns: string[]) {
         }
     }
 
+    console.log()
+    console.log('--------------------------------------------------')
+    console.log()
+
     if (failures.length === 0) {
         console.log(ui.colorize('green', 'All fixtures passed'))
         return

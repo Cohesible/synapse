@@ -6,7 +6,7 @@ import * as path from 'node:path'
 import * as stream from 'node:stream'
 import * as child_process from 'node:child_process'
 import type * as http from 'node:http'
-import { fetch, HttpError, HttpHandler, HttpRequest, HttpResponse, HttpRoute, PathArgs, RouteRegexp, buildRouteRegexp, compareRoutes, createPathBindings, matchRoutes, RequestHandler, RequestHandlerWithBody, PathArgsWithBody } from 'synapse:http'
+import { fetch, HttpError, runWithRequestCtx, HttpRequest, HttpResponse, HttpRoute, getSetCookieHeaders, RouteRegexp, buildRouteRegexp, compareRoutes, createPathBindings, matchRoutes, RequestHandler, RequestHandlerWithBody, PathArgsWithBody } from 'synapse:http'
 import { upgradeToWebsocket, WebSocket } from 'synapse:ws'
 import * as compute from 'synapse:srl/compute'
 import { randomUUID } from 'node:crypto'
@@ -94,17 +94,28 @@ async function startServer(props: LocalHttpServiceProps) {
         log('stopping server...')
 
         await new Promise<void>(async (resolve, reject) => {
-            setTimeout(() => reject(new Error('Failed to shutdown')), 5000).unref()
+            const timer = setTimeout(() => reject(new Error('Failed to shutdown')), 5000).unref()
 
-            await emitReloadEvent().catch(console.error)
-
+            await emitReloadEvent(250).catch(console.error)
+    
             await Promise.all([...sockets].map(ws => {
                 return ws.close().catch(console.error)
             }))
 
-            server.close(err => err ? reject(err) : resolve())
             server.closeAllConnections()
+
+            server.close(err => {
+                clearTimeout(timer)
+
+                if (err) {
+                    reject(err)
+                } else {
+                    resolve()
+                }
+            })
         })
+
+        log('server stopped')
     }
 
     server.on('request', async (req, res) => {
@@ -161,10 +172,10 @@ async function startServer(props: LocalHttpServiceProps) {
         }
     }
 
-    async function emitReloadEvent() {
+    async function emitReloadEvent(delay = 10) {
         const ev = JSON.stringify({
             type: 'reload',
-            delay: 10,
+            delay,
         })
 
         await broadcast(ev)
@@ -253,6 +264,13 @@ async function stopLocalHttpService(pid: number) {
     } else {
         child_process.execSync(`kill ${pid}`)
     }
+    
+    const start = Date.now()
+    while (Date.now() - start < 250) {
+        const cmd = getProcessCommand(pid)
+        if (!cmd) break
+        await new Promise<void>(r => setTimeout(r, 10))
+    }
 } 
 
 class LocalHttpService extends core.defineResource({
@@ -304,9 +322,11 @@ class LocalHttpServiceIntegration extends core.defineResource({
 
 function getProcessCommand(pid: number) {
     if (process.platform === 'win32') {
-        const resp = child_process.execSync(`wmic process where processId=${pid} get name`, { encoding: 'utf-8' })
+        const resp = child_process.execSync(`tasklist /FI "PID eq ${pid}" /FO LIST`, { encoding: 'utf-8' })
+        const lines = resp.trim().split('\n')
+        const imageName = lines[0]?.split(':')[1]
 
-        return resp.trim().split('\n').pop()?.replace(/\.exe$/, '')
+        return imageName?.trim().replace(/\.exe$/, '')
     }
 
     try {
@@ -387,6 +407,8 @@ export class Gateway implements compute.HttpService {
 async function runHandler<T>(response: http.ServerResponse, fn: () => Promise<T> | T): Promise<void> {
     try {
         const resp = await fn()
+        const setCookies = getSetCookieHeaders()
+
         if (resp instanceof Response) {
             const contentType = resp.headers.get('content-type')
             if (contentType?.startsWith('image/') || contentType === 'application/octet-stream' || contentType === 'application/zip') {
@@ -402,10 +424,20 @@ async function runHandler<T>(response: http.ServerResponse, fn: () => Promise<T>
             return await sendResponse(response, undefined, undefined, 204)
         }
 
+        if (setCookies && setCookies.length > 0) {
+            const h = new Headers()
+            for (const c of setCookies) {
+                h.append('set-cookie', c)
+            }
+            return await sendResponse(response, resp, h)
+        }
+
         return await sendResponse(response, resp)
     } catch (e) {
         if (e instanceof HttpError) {
-            return await sendResponse(response, { message: e.message }, undefined, e.fields.statusCode)
+            const body = { message: e.message }
+
+            return await sendResponse(response, body, undefined, e.fields.status ?? e.fields.statusCode)
         }
 
         throw e
@@ -425,25 +457,31 @@ function receiveData(message: http.IncomingMessage): Promise<string> {
 const TypedArray = Object.getPrototypeOf(Uint8Array)
 
 function sendResponse(response: http.ServerResponse, data?: any, headers?: Headers, status = 200): Promise<void> {
+    const finalHeaders: Record<string, string | number> = {}
+
+    if (headers) {
+        for (const [k, v] of headers) {
+            finalHeaders[k] = v
+        }
+    }
+    
     if (data === undefined) {
         return new Promise((resolve, reject) => {
             response.on('error', reject)
-            response.writeHead(status, {
-                ...Object.fromEntries(headers?.entries() ?? []),
-                // 'Location': headers?.get('location') ?? undefined,
-            })
+            response.writeHead(status, finalHeaders)
             response.end(resolve)
         })
     }
 
     async function sendStream(data: ReadableStream) {
+        if (headers?.get('content-type') === undefined) {
+            finalHeaders['content-type'] = 'application/octet-stream'
+        }
+
         return new Promise<void>((resolve, reject) => {
             response.on('error', reject)
             response.on('end', resolve)
-            response.writeHead(status, {
-                'content-type': 'application/octet-stream',
-                ...Object.fromEntries(headers?.entries() ?? []),
-            })
+            response.writeHead(status, finalHeaders)
 
             const piped = stream.Readable.fromWeb(data as any).pipe(response)
             piped.on('error', reject)
@@ -460,16 +498,19 @@ function sendResponse(response: http.ServerResponse, data?: any, headers?: Heade
     }
 
     const isTypedArray = typeof data === 'object' && !!data && data instanceof TypedArray
-    const contentType = headers?.get('content-type') ?? (!isTypedArray ? 'application/json' : 'application/octet-stream')
     const blob = !isTypedArray ? Buffer.from(JSON.stringify(data), 'utf-8') : Buffer.from(data)
+
+    if (headers?.get('content-type') === undefined) {
+        finalHeaders['content-type'] = !isTypedArray ? 'application/json' : 'application/octet-stream'
+    }
+
+    if (headers?.get('content-length') === undefined) {
+        finalHeaders['content-length'] = blob.length
+    }
 
     return new Promise((resolve, reject) => {
         response.on('error', reject)
-        response.writeHead(status, { 
-            'Content-Type': contentType,
-            'Content-Length': blob.length,
-            ...Object.fromEntries(headers?.entries() ?? []),
-        })
+        response.writeHead(status, finalHeaders)
         response.end(blob, resolve)
     })
 }
@@ -503,6 +544,13 @@ function wrapRequestHandler(
         } as RequestInit)
 
         ;(newReq as any).pathParameters = pathParameters
+        ;(newReq as any).context = {}
+        if (req.socket.remoteAddress) {
+            ;(newReq as any).context.identity = {
+                sourceIp: req.socket.remoteAddress,
+                userAgent: req.headers['user-agent'],
+            }
+        }
 
         const bodyWithFallback = body !== undefined ? body : newReq.body
         if (authHandler) {
@@ -580,7 +628,7 @@ function createRequestRouter() {
         return matched.length > 0
     }
 
-    function routeRequest(resp: http.ServerResponse) {
+    async function routeRequest(resp: http.ServerResponse) {
         const req = resp.req
         const method = req.method!
         const routes = [
@@ -589,13 +637,24 @@ function createRequestRouter() {
         ]
         const url = new URL(req.url!, `http://${req.headers.host}`)
 
-        return runHandler(resp, () => {
-            const selectedRoute = findRoute(url.pathname, routes)
-            const pathParameters = selectedRoute.match.groups ?? {}
-            const entry = selectedRoute.value
-            log('using route:', entry.route)
+        const reqCtx = { priorCookies: new Map<string, string>() }
+        const cookies = req.headersDistinct.cookie
+        if (cookies) {
+            for (const c of cookies) {
+                const [k, v] = c.split('=', 2)
+                reqCtx.priorCookies.set(k, v)
+            }
+        }
 
-            return entry.handler(url, req, pathParameters)
+        return runWithRequestCtx(reqCtx, () => {
+            return runHandler(resp, () => {
+                const selectedRoute = findRoute(url.pathname, routes)
+                const pathParameters = selectedRoute.match.groups ?? {}
+                const entry = selectedRoute.value
+                log('using route:', entry.route)
+    
+                return entry.handler(url, req, pathParameters)
+            })
         })
     }
 

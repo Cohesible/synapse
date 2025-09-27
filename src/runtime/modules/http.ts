@@ -5,7 +5,8 @@ import * as http from 'node:https'
 import * as zlib from 'node:zlib'
 import * as crypto from 'node:crypto'
 import * as stream from 'node:stream'
-import { addBrowserImplementation } from 'synapse:core'
+import { AsyncLocalStorage } from 'node:async_hooks'
+import { addBrowserImplementation, bindFunctionModel } from 'synapse:core'
 
 type TypedArray =
     | Uint8Array
@@ -1049,4 +1050,104 @@ function getMimeType(p: string) {
     const extension = dotIndex === -1 ? p : p.slice(dotIndex)
 
     return mimeTypes[extension] || 'application/octet-stream'
+}
+
+interface CookieOptions {
+    readonly expires?: Date                         // UTC string
+    readonly maxAge?: number
+    readonly secure?: boolean
+    readonly httpOnly?: boolean
+    readonly domain?: string
+    readonly path?: string                          // '/' matches subdirectories, it's not a prefix match
+    readonly sameSite?: 'Strict' | 'Lax' | 'None'   // default: Lax
+    // __Host- prefix asserts domain locked cookie
+    // __Secure- asserts secure cookie
+}
+
+interface Cookie extends CookieOptions {
+    readonly value: string
+}
+
+interface RequestContext {
+    setCookies?: Map<string, Cookie>
+    priorCookies?: Map<string, string>
+}
+
+const requestCtx = new AsyncLocalStorage<RequestContext>()
+
+export function runWithRequestCtx<T>(store: RequestContext, cb: () => T): T {
+    return requestCtx.run(store, cb)
+}
+
+bindFunctionModel(runWithRequestCtx, (_, cb) => cb())
+
+function getRequestCtx() {
+    const ctx = requestCtx.getStore()
+    if (!ctx) {
+        throw new Error('Not in a request handler')
+    }
+
+    return ctx
+}
+
+function setCookie(key: string, value: string, opt?: CookieOptions) {
+    const ctx = getRequestCtx()
+    const cookies = ctx.setCookies ??= new Map()
+    cookies.set(key, opt ? { ...opt, value } : { value })
+}
+
+function getCookie(key: string) {
+    const ctx = getRequestCtx()
+    if (ctx.setCookies?.has(key)) {
+        return ctx.setCookies.get(key)!.value
+    }
+
+    return ctx.priorCookies?.get(key)
+}
+
+// TODO: impl. this
+addBrowserImplementation(setCookie, () => {
+    throw new Error('Cannot set cookie in browser')
+})
+
+// TODO: impl. this
+addBrowserImplementation(getCookie, () => {
+    throw new Error('Cannot get cookie in browser')
+})
+
+export const cookies = { set: setCookie, get: getCookie }
+
+function formatCookie(key: string, cookie: Cookie) {
+    const segments: string[] = [`${key}=${cookie.value}`]
+    for (const [k, v] of Object.entries(cookie)) {
+        if (k === 'value' || v === undefined) continue
+
+        if (k === 'maxAge') {
+            segments.push(`Max-Age=${v}`)
+        } else if (typeof v === 'boolean') {
+            segments.push(k[0].toUpperCase().concat(k.slice(1)))
+        } else {
+            const val = v instanceof Date ? v.toUTCString() : v
+            segments.push(`${k[0].toUpperCase().concat(k.slice(1))}=${val}`)
+        }
+    }
+
+    return segments.join(';')
+}
+
+export function getSetCookieHeaders() {
+    const ctx = getRequestCtx()
+    if (!ctx.setCookies) {
+        return
+    }
+
+    const headers: string[] = []
+    for (const [k, v] of ctx.setCookies) {
+        const prior = ctx.priorCookies?.get(k)
+        if (v.value !== prior) {
+            headers.push(formatCookie(k, v))
+        }
+    }
+
+    return headers
 }

@@ -214,13 +214,21 @@ const intrinsics = [
     'Promise',
 ]
 
+// stringified.startsWith
+
 // TODO: primordials[fallback] -> globalThis[fallback]
 // IMPORTANT: `lib/buffer.js` suffers a perf regression without pre-binding `fill`
 // const Fill = Uint8Array.prototype.fill.call.bind(Uint8Array.prototype.fill)
 // TypedArrayGetToStringTag(value)
 // TODO: customize build system to only build the executable
+
+// const ToString = Object.prototype.toString.call.bind(Object.prototype.toString);
 // Object.prototype.toString.call(val2);
 // ReferenceError: StringPrototypePadStart is not defined -> String.prototype.padStart.call.bind(String.prototype.padStart)
+// ReferenceError: StringPrototypeSlice is not defined
+
+// const StringPrototypePadEnd = String.prototype.padEnd.call.bind(String.prototype.padEnd);
+
 // case kWebCryptoCipherDecrypt: {
 //     const slice = ArrayBuffer.isView(data) ?
 //         TypedArrayPrototypeSlice : ArrayBufferPrototypeSlice;
@@ -230,6 +238,17 @@ const intrinsics = [
 // `lib/internal/error_serdes.js:83`
 // const ObjectPrototypeToString = Object.prototype.toString.call.bind(Object.prototype.toString)
 
+// All `= Array(...)` should be called as constructors
+
+
+// const TypedArray = Object.getPrototypeOf(Uint8Array);
+// const _TypedArrayGetToStringTag = Object.getOwnPropertyDescriptor(TypedArray.prototype, Symbol.toStringTag).get;
+// const TypedArrayGetToStringTag = _TypedArrayGetToStringTag.call.bind(_TypedArrayGetToStringTag);
+
+// const ArrayBufferPrototypeTransfer = ArrayBuffer.prototype.transfer.call.bind(ArrayBuffer.prototype.transfer)
+
+// SharedArrayBuffer !== undefined
+// should be typeof SharedArrayBuffer !== 'undefined'
 
 // This is currently missed
 // (ctx.showHidden ?
@@ -917,6 +936,8 @@ function groupMatchers(matchers: Matcher[]) {
 
     return m
 }
+
+// TODO: MainContextError -> Error ?
 
 export async function transformNodePrimordials(targets?: string[]) {
     const cwd = process.cwd()

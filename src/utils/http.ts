@@ -92,7 +92,7 @@ export function createRequester(baseUrl: string, listener?: DownloadProgressList
             }
 
             if (opt?.acceptGzip) {
-                headers['accept-encoding'] = 'gzip'
+                headers['accept-encoding'] = 'gzip, zip'
             }
 
             const req = https.request(url, { method, headers, agent, signal: opt?.abortController?.signal }, resp => {
@@ -102,7 +102,9 @@ export function createRequester(baseUrl: string, listener?: DownloadProgressList
                     listener.onStart(path, Number(contentLength))
                 }
 
-                const unzipStream = (unzip || resp.headers['content-encoding'] === 'gzip') ? zlib.createGunzip() : undefined
+                const unzipStream = (unzip || resp.headers['content-encoding'] === 'gzip') 
+                    ? zlib.createGunzip() 
+                    : resp.headers['content-encoding'] === 'zip' ? zlib.createUnzip() : undefined
 
                 unzipStream?.on('data', d => buffer.push(d))
                 unzipStream?.on('end', () => {
@@ -137,6 +139,11 @@ export function createRequester(baseUrl: string, listener?: DownloadProgressList
                     }
 
                     if (resp.statusCode === 302) {
+                        if (opt?.headers?.authorization) {
+                            const headers = { ...opt.headers }
+                            delete headers['authorization']
+                            return request(`${method} ${resp.headers['location']}`, undefined, undefined, { ...opt, headers }).then(resolve, reject)
+                        }
                         return request(`${method} ${resp.headers['location']}`, undefined, undefined, opt).then(resolve, reject)
                     }
 

@@ -208,7 +208,9 @@ export async function extractFileFromZip(zip: Buffer, fileName: string) {
             await getFs().deleteFile(tmp)
         })
     
-        return getFs().readFile(fileName)
+        return getFs().readFile(fileName).finally(async () => {
+            await getFs().deleteFile(fileName)
+        })
     }
 
     // Only works with `bsdtar`

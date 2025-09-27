@@ -14,7 +14,7 @@ import { getAuth } from '../auth'
 import { tryUpgrade } from './updater'
 import { getLogger, runTask } from '../logging'
 import { passthroughZig, downloadNodeLib } from '../zig/compile'
-import { internalBundle } from './buildInternal'
+import { internalBundle, convertBundleToSea } from './buildInternal'
 import { installVsCodeZigExtension } from '../zig/installer'
 
 
@@ -182,6 +182,8 @@ export interface CommandDescriptor<
     readonly options?: U
 
     readonly isImportantCommand?: boolean
+
+    readonly hasPassthrough?: boolean
 }
 
 const registeredCommands = new Map<string, RegisteredCommand>()
@@ -204,6 +206,10 @@ export function registerCommand(name: string, fn: (...args: any[]) => Promise<vo
     // Inject common options
     const options = (descriptor as Mutable<typeof descriptor>).options ??= []
     options.push(helpFlag)
+
+    if (!descriptor.hasPassthrough && options?.find(x => x.passthrough)) {
+        ;(descriptor as Mutable<CommandDescriptor>).hasPassthrough = true
+    }
 
     validateDescriptor(descriptor)
     registeredCommands.set(name, { name, fn, descriptor })
@@ -538,7 +544,7 @@ registerTypedCommand(
         args: [{ name: 'dir', type: 'string' }],
     },
     async (...args) => {
-        await synapse.convertBundleToSea(args[0])
+        await convertBundleToSea(args[0])
     }
 )
 
@@ -766,7 +772,8 @@ registerTypedCommand(
     {
         hidden: true,
         options: [
-            { name: 'dry-run', type: 'boolean' }
+            { name: 'dry-run', type: 'boolean' },
+            { name: 'age', type: 'number', description: 'Delete objects older than this many seconds. Defaults to 1 day' }
         ],
     }, 
     async (opt) => {
@@ -897,7 +904,6 @@ registerTypedCommand(
             { name: 'skipValidation', type: 'boolean', hidden: true }, 
             { name: 'skipCompile', type: 'boolean', hidden: true }, 
             { name: 'runDir', type: 'string', hidden: true }, 
-
             { name: 'no-deploy', type: 'boolean', description: 'Skips any prompts to deploy the program' },
             ...buildTargetOptions
         ],
@@ -1066,11 +1072,12 @@ registerTypedCommand(
         description: 'Installs the latest CLI version.',
         category: 'tools',
         options: [
-            { name: 'force', type: 'boolean', description: 'Forcibly installs the CLI over the existing version' },
+            { name: 'force', type: 'boolean', description: 'Forcibly installs the CLI over the existing version.' },
             // TODO: add implications to provider better generated docs.
             // I think `--tag` should imply `--force` 
-            { name: 'tag', type: 'string', description: 'Download the build associated with a git tag' },
+            { name: 'tag', type: 'string', description: 'Download the build associated with a git tag.' },
             { name: 'hash', type: 'string', hidden: true, description: 'Artifact hash. Does not check compat.' },
+            { name: 'installDir', type: 'string', hidden: true, description: 'Overrides the current install dir.' },
         ],
         requirements: { program: false }
     },
@@ -1199,9 +1206,16 @@ registerTypedCommand(
         description: 'Enters an interactive REPL session, optionally using a target file.',
         // The target file\'s exports are placed in the global scope.
         args: [{ name: 'file', type: typescriptFileType, optional: true }],
-        options: buildTargetOptions,
+        options: [
+            ...buildTargetOptions,
+            { name: 'no-deploy', type: 'boolean' },
+            { name: 'eval', type: 'string', hidden: true }
+        ],
     },
-    (a, opt) => synapse.replCommand(a, opt),
+    (a, opt) => synapse.replCommand(a, {
+        ...opt,
+        noDeploy: opt['no-deploy'],
+    }),
 )
 
 registerTypedCommand(
@@ -1360,7 +1374,7 @@ registerTypedCommand(
     {
         hidden: true,
         args: [],
-        options: [{ name: 'all', type: 'boolean' }]
+        options: [{ name: 'all', type: 'boolean' }, { name: 'deployment', type: 'boolean'}],
     },
     (opt) => synapse.printFsStats(opt)
 )
@@ -1389,16 +1403,28 @@ registerTypedCommand(
     () => synapse.quote()
 )
 
+function coercedJsonParse(v: string) {
+    if (v === '') {
+        return v
+    } else if (v === 'null') {
+        return null
+    } else if (v[0] === '{' || v[0] === '[' || !Number.isNaN(Number(v))) {
+        return JSON.parse(v)
+    }
+
+    return v
+}
+
 registerTypedCommand(
     'config',  
     {
         hidden: true,
         description: 'Get or set a key in the user config file',
         // TODO: need to make get/set explicit. This is ok for now though
-        args: [{ name: 'key', type: 'string' }, { name: 'value', type: JSON.parse, optional: true }],
+        args: [{ name: 'key', type: 'string' }, { name: 'value', type: coercedJsonParse, optional: true }],
     },
     async (...args) => {
-        if ((args as any).length === 2) {
+        if (!args[1]) {
             const val = await readKey(args[0])
             printJson(val)
         } else {
@@ -1820,11 +1846,14 @@ async function parseArgs(args: string[], desc: CommandDescriptor) {
     const errors: [string, Error][] = []
     const unknownOptions: string[] = []
 
+    const allowMultipleArg = desc.args?.find(a => a.allowMultiple)
+    const minArgs = (desc.args?.filter(x => !x.allowMultiple && !x.optional).length ?? 0) + (allowMultipleArg?.minCount ?? 0)
+    const passthroughOpt = desc.hasPassthrough ? desc.options?.find(x => x.passthrough) : undefined
+
     for (let i = 0; i < args.length; i++) {
         const a = args[i]
         if (a === '--') {
             // If the command doesn't support passthrough args, it's possibly a typo
-            const passthroughOpt = desc.options?.find(x => x.passthrough)
             if (!passthroughOpt) {
                 errors.push([a, new Error(`Passthrough arguments not supported`)])
                 continue
@@ -1844,6 +1873,12 @@ async function parseArgs(args: string[], desc: CommandDescriptor) {
                 : desc.options?.find(x => x.shortName === n)
 
             if (!opt) {
+                if (passthroughOpt) {
+                    options[passthroughOpt.name] ??= []
+                    options[passthroughOpt.name].push(a)
+                    continue
+                }
+
                 unknownOptions.push(n)
                 continue
             }
@@ -1879,6 +1914,11 @@ async function parseArgs(args: string[], desc: CommandDescriptor) {
         } else {
             const currentArg = desc.args?.[argPosition]
             if (!currentArg) {
+                if (passthroughOpt) {
+                    options[passthroughOpt.name] ??= []
+                    options[passthroughOpt.name].push(a)
+                    continue
+                }
                 errors.push([a, new Error('Unknown argument')])
                 continue
             }
@@ -1897,8 +1937,6 @@ async function parseArgs(args: string[], desc: CommandDescriptor) {
         }
     }
 
-    const allowMultipleArg = desc.args?.find(a => a.allowMultiple)
-    const minArgs = (desc.args?.filter(x => !x.allowMultiple && !x.optional).length ?? 0) + (allowMultipleArg?.minCount ?? 0)
     const providedArgs = parsedArgs.length + invalidPositionalArgs
     if (providedArgs < minArgs) {
         for (let i = providedArgs; i < minArgs; i++) {

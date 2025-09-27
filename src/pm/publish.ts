@@ -339,9 +339,9 @@ async function _getLocalOverrides() {
     return Object.keys(overrides).length === 0 ? undefined : overrides
 }
 
-const getLocalOverrides = memoize(_getLocalOverrides)
+export const getLocalOverrides = memoize(_getLocalOverrides)
 
-export async function getProjectOverridesMapping(fs: Fs) {
+export async function getProjectOverridesMapping() {
     const overrides = await getLocalOverrides()
     if (!overrides) {
         return

@@ -9,7 +9,7 @@ import { AmbientDeclarationFileResult, Mutable, acquireFsLock, createHasher, cre
 import { MoveWithSymbols, SymbolGraph, SymbolNode, createMergedGraph, createSymbolGraph, createSymbolGraphFromTemplate, deleteSourceMapResource, detectRefactors, findAutomaticMoves, getKeyFromScopes, getMovesWithSymbols, getRenderedStatementFromScope, isOldSourceMapFormat, normalizeConfigs, renderSymbol, renderSymbolLocation } from './refactoring'
 import { SourceMapHost } from './static-solver/utils'
 import { getLogger } from './logging'
-import { BuildFsIndex, CompiledChunk, checkBlock, commitProgram, createArtifactFs, createBuildFsFragment, createMountedFs, getDataRepository, getFsFromHash, getInstallation, getMoved, getPreviousDeploymentProgramHash, getDeploymentFs, getProgramFs, getProgramHash, getResourceProgramHashes, listCommits, maybeRestoreTemplate, printBlockInfo, putState, readResourceState, readState, saveMoved, shutdownRepos, syncRemote, toFs, toFsFromHash, writeTemplate } from './artifacts'
+import { BuildFsIndex, CompiledChunk, checkBlock, commitProgram, createArtifactFs, createBuildFsFragment, createMountedFs, getDataRepository, getFsFromHash, getInstallation, getMoved, getPreviousDeploymentCommit, getDeploymentFs, getProgramFs, getProgramHash, getResourceProgramHashes, listCommits, maybeRestoreTemplate, printBlockInfo, putState, readResourceState, readState, saveMoved, shutdownRepos, syncRemote, toFs, toFsFromHash, writeTemplate } from './artifacts'
 import { PackageService, createPackageService, maybeDownloadPackages, showManifest, downloadAndUpdatePackage, verifyInstall, downloadAndInstall, listInstall, resolveDepsGreedy, printTree } from './pm/packages'
 import { clearCachedTestResults, createTestRunner, listTestSuites, listTests } from './testing'
 import { enterRepl } from './repl'
@@ -212,8 +212,8 @@ export async function collectGarbageResources(target: string, opt?: CombinedOpti
     }
 }
 
-export async function collectGarbage(target: string, opt?: CombinedOptions & { dryRun?: boolean }) {
-    await cleanDataRepo(undefined, opt?.dryRun)
+export async function collectGarbage(target: string, opt?: CombinedOptions & { dryRun?: boolean; age?: number }) {
+    await cleanDataRepo(undefined, opt?.dryRun, undefined, opt?.age)
 }
 
 async function getMergedGraph(templateFile: TfJson) {
@@ -232,13 +232,18 @@ async function getDeployView(templateFile: TfJson, isDestroy?: boolean) {
 // If detected, we'll immediately abort and suggest that the previous deployment should be destroyed
 // before deploying to a new cloud provider
 async function assertSameCloudTarget(template: TfJson) {
-    // Template was stripped of metadata
+    // Template was stripped of metadata 
     const currentTarget = template['//']?.deployTarget
     if (!currentTarget) {
         return
     }
 
-    const previousTemplate = await maybeRestoreTemplate()
+    const c = await getPreviousDeploymentCommit()
+    if (!c) {
+        return
+    }
+
+    const previousTemplate = await maybeRestoreTemplate(c)
     const previousTarget = previousTemplate?.['//']?.deployTarget
     if (!previousTarget) {
         return
@@ -588,7 +593,8 @@ export async function destroy(targets: string[], opt?: CombinedOptions & { dryRu
         }
     }
 
-    const programHash = await getPreviousDeploymentProgramHash()
+    const commit = await getPreviousDeploymentCommit()
+    const programHash = commit?.programHash
     const sessionCtx = await createSessionContext(programHash)
 
     const session = await getSession(deploymentId, sessionCtx, { parallelism: 50 })
@@ -2148,7 +2154,8 @@ export async function emitBfs(target?: string, opt?: CombinedOptions & { isEmit?
         const objects = await repo.serializeBuildFs(bfs)
         await getFs().writeFile(path.resolve('dist', hash), createBlock(Object.entries(objects)))
 
-        const pHash = await getPreviousDeploymentProgramHash()
+        const commit = await getPreviousDeploymentCommit()
+        const pHash = commit?.programHash
         if (pHash) {
             const bfs = await repo.getBuildFs(pHash)
             const objects = await repo.serializeBuildFs(bfs)
@@ -2585,7 +2592,7 @@ async function loadMovedIntoTemplate(fileName: string, merge = true) {
     const resourceSet = new Set(state?.resources.map(r => `${r.type}.${r.name}`))
     const [checked = [], autoMoved] = await Promise.all([
         merge ? getMoved() : undefined,
-        tryFindAutomaticMoves(state),
+        [] as any[] // tryFindAutomaticMoves(state),
     ])
 
     function addMove(from: string, to: string) {
@@ -2957,7 +2964,7 @@ export async function processProf(t?: string, opt?: CombinedOptions) {
         return files[0]
     })()
 
-    const r = await loadCpuProfile(fs, target, buildTarget.workingDirectory, await getProjectOverridesMapping(getFs()))
+    const r = await loadCpuProfile(fs, target, buildTarget.workingDirectory, await getProjectOverridesMapping())
     for (const l of r) {
         printLine(l)
     }
@@ -3283,9 +3290,9 @@ function normalizeToRelative(fileName: string, workingDir = getWorkingDir()) {
     return path.relative(workingDir, path.resolve(workingDir, fileName))
 }
 
-export async function replCommand(target?: string, opt?: {}) {
+export async function replCommand(target?: string, opt?: { noDeploy?: boolean; eval?: string }) {
     const repl = await runTask('', 'repl', async () => {
-        if (!target) {              
+        if (!target) {
             return enterRepl(undefined, { loadModule: (id) => import(id) }, {})
         }
     
@@ -3295,7 +3302,7 @@ export async function replCommand(target?: string, opt?: {}) {
         const files = await getEntrypointsFile()
         const typesFile = await getTypesFile()
         const deployables = files?.deployables ?? {}
-        const status = await validateTargetsForExecution(target, deployables)
+        const status = await validateTargetsForExecution(target, deployables, !opt?.noDeploy)
         const outfile = status.sources?.[target]?.outfile 
         if (!status.isTargetDeployable && !outfile) {
             throw new RenderableError('No such file', () => {
@@ -3307,10 +3314,11 @@ export async function replCommand(target?: string, opt?: {}) {
             ? await resolveReplTarget(target)
             : path.resolve(getWorkingDir(), outfile!)
     
-        const moduleLoader = await runTask('init', 'loader', () => getModuleLoader(false), 1) // 8ms on simple hello world no infra
+        const moduleLoader = await runTask('init', 'loader', () => getModuleLoader(false, true), 1) // 8ms on simple hello world no infra
     
         return enterRepl(resolved, moduleLoader, {
             types: typesFile?.[target.replace(/\.tsx?$/, '.d.ts')],
+            eval: opt?.eval,
         })
     }, 1)
 
@@ -3318,7 +3326,8 @@ export async function replCommand(target?: string, opt?: {}) {
 }
 
 async function getPreviousDeploymentProgramFs() {
-    const hash = await getPreviousDeploymentProgramHash()
+    const commit = await getPreviousDeploymentCommit()
+    const hash = commit?.programHash
     if (!hash) {
         return
     }
@@ -3326,13 +3335,14 @@ async function getPreviousDeploymentProgramFs() {
     return toFsFromHash(hash)
 }
 
-// FIXME: this is wrong, we need to track the program hash per-file
+// FIXME: this is wrong, we need to track the program hash per-file 
 async function getPreviousDeployInfo() {
     if (!getBuildTargetOrThrow().deploymentId) {
         return
     }
 
-    const hash = await getPreviousDeploymentProgramHash()
+    const commit = await getPreviousDeploymentCommit()
+    const hash = commit?.programHash
     if (!hash) {
         return
     }
@@ -3633,7 +3643,16 @@ export async function loadBlock(target: string, dest?: string, opt?: any) {
 }
 
 export async function inspectBlock(target: string, opt?: any) {
-    const data = await getFs().readFile(target)
+    const data = await getFs().readFile(target).catch(err => {
+        throwIfNotFileNotFoundError(err)
+
+        if (target.length !== 64) {
+            throw err
+        }
+
+        return getFs().readFile(path.resolve(getDataRepository().getBlocksDir(), target))
+    })
+
     const block = openBlock(Buffer.from(data))
     const objects = block.listObjects().map(h => [h, block.readObject(h).byteLength] as const)
         .sort((a, b) => b[1] - a[1])
@@ -3647,11 +3666,19 @@ export async function inspectBlock(target: string, opt?: any) {
     printLine(colorize('green', 'No issues found'))
 }
 
-export async function printFsStats(opt?: { all?: boolean }) {
+export async function printFsStats(opt?: { all?: boolean; deployment?: boolean }) {
     if (opt?.all) {
-        const repoStats = await collectAllStats(getDataRepository())
+        const repoStats = await collectAllStats(getDataRepository(), 10)
         const stats = { ...mergeRepoStats(repoStats), type: 'unknown' as const }
         await printStats('ALL', stats)
+        await printTopNLargestObjects(stats)
+        return
+    }
+
+    if (opt?.deployment) {
+        const head = getTargetDeploymentIdOrThrow()
+        const stats = await collectStats(getDataRepository(), head)
+        await printStats(head, stats)
         await printTopNLargestObjects(stats)
         return
     }
@@ -3752,7 +3779,7 @@ export async function buildExecutables(targets: string[], opt: BuildExecutableOp
 
     const getBasePath = memoize(_getBasePath)
 
-    // XXX: this is hard-coded to `synapse`
+    // XXX: this is hard-coded to `synapse` 
     const bundleOpt: InternalBundleOptions = pkg.data.name === 'synapse' ? {
         ...opt,
         external: ['esbuild', 'typescript', 'postject'], 
@@ -3799,36 +3826,4 @@ export async function buildExecutables(targets: string[], opt: BuildExecutableOp
             // TODO: write out assets
         }
     }
-}
-
-export async function convertBundleToSea(dir: string) {
-    const nodePath = path.resolve(dir, 'bin', process.platform === 'win32' ? 'node.exe' : 'node')
-    await makeExecutable(nodePath)
-
-    const bundledCliPath = path.resolve(dir, 'dist', 'cli.js')
-    const assets: Record<string, string> = {}
-    const assetsDir = path.resolve(dir, 'assets')
-    const hasAssets = await getFs().fileExists(assetsDir)
-    if (hasAssets) {
-        for (const f of await getFs().readDirectory(assetsDir)) {
-            if (f.type === 'file') {
-                assets[`${seaAssetPrefix}${f.name}`] = path.resolve(assetsDir, f.name)
-            }
-        }
-    }
-
-    const seaDest = path.resolve(dir, 'bin', process.platform === 'win32' ? 'synapse.exe' : 'synapse')
-    await makeSea(bundledCliPath, nodePath, seaDest, {
-        assets,
-        sign: true,
-    })
-
-    await getFs().deleteFile(nodePath)
-    await getFs().deleteFile(path.resolve(dir, 'dist', 'cli.js'))
-    await getFs().deleteFile(path.resolve(dir, 'node_modules')).catch(throwIfNotFileNotFoundError)
-    if (hasAssets) {
-        await getFs().deleteFile(path.resolve(dir, 'assets'))
-    }
-
-    await createArchive(dir, `${dir}${process.platform === 'linux' ? `.tgz` : '.zip'}`, false)
 }

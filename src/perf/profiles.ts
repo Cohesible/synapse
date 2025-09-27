@@ -198,7 +198,7 @@ export async function loadCpuProfile(fs: Fs & SyncFs, fileName: string, workingD
     }
 
     const filesOnly = true
-    const ignoreNodeModules = true
+    const ignoreNodeModules = false
 
     // Groups all nodes by their callsite
     const groupedNodes = new Map<string, ParsedNode[]>()

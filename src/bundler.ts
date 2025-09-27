@@ -3,7 +3,7 @@ import * as path from 'node:path'
 import * as esbuild from 'esbuild'
 import { Fs, SyncFs } from './system'
 import type { ReflectionOperation, ExternalValue } from './runtime/modules/serdes'
-import { createArrayLiteral, createLiteral, createObjectLiteral, createSymbolPropertyName, createVariableStatement, memoize, printNodes, throwIfNotFileNotFoundError } from './utils'
+import { createArrayLiteral, createLiteral, createObjectLiteral, createSymbolPropertyName, createVariableStatement, isWindows, memoize, printNodes, throwIfNotFileNotFoundError } from './utils'
 import { topoSort } from './static-solver/scopes'
 import { getLogger } from './logging'
 import { Artifact } from './artifacts'
@@ -367,6 +367,7 @@ export function createSerializerHost(fs: { writeDataSync: (data: Uint8Array) => 
 function createFsPlugin(fs: Fs & SyncFs, resolver: ModuleResolver, opt: BundleOptions): esbuild.Plugin {
     const serializerHost = opt?.serializerHost
     const lazyImporters = new Map<string, string>()
+    const isWin = isWindows()
 
     async function resolveJsFile(args: esbuild.OnResolveArgs) {
         const resolved = resolver.getFilePath(args.path)
@@ -391,7 +392,7 @@ function createFsPlugin(fs: Fs & SyncFs, resolver: ModuleResolver, opt: BundleOp
         }
 
         return {
-            path: args.path,
+            path: isWin && args.path[0] === '\\' ? args.path.slice(1) : args.path,
             // TODO: this is needed for tree-shaking ESM
             // sideEffects: false,
         }
@@ -403,11 +404,12 @@ function createFsPlugin(fs: Fs & SyncFs, resolver: ModuleResolver, opt: BundleOp
             build.onResolve({ filter: /^pointer:.*/ }, async args => {
                 const importer = args.pluginData?.virtualId ?? args.importer
                 const mapped = serializerHost?.getMappedPointer?.(args.path) ?? args.path
+                const virtualId = resolver.resolveVirtual(serializerHost?.getUnmappedPointer?.(args.path) ?? args.path, importer)
 
                 return {
                     namespace: 'pointer',
                     path: mapped.slice(pointerPrefix.length),
-                    pluginData: { virtualId: resolver.resolveVirtual(serializerHost?.getUnmappedPointer?.(args.path) ?? args.path, importer) }
+                    pluginData: { virtualId },
                 }
             })
 

@@ -18,6 +18,7 @@ export class ContainerService {
     private readonly ec2 = new EC2.EC2({})
     public readonly cluster: aws.EcsCluster
     public readonly service: aws.EcsService
+    public readonly principal: Role
 
     public static fromEntrypoint(network: Vpc, entryPoint: () => any) {
         return new this(network, entryPoint as any)
@@ -27,14 +28,23 @@ export class ContainerService {
         return new this(network, entryPoint as any) // BROKEN
     }
 
-    public constructor(public readonly network: Vpc, target: () => Promise<void> | void, imageBuilder?: (bundle: lib.Bundle) => aws.EcrRepository | aws.EcrpublicRepository) {
-        const id = core.getCurrentId().split('--').slice(0, -1).join('-').slice(0, 62)
+    public constructor(public readonly network: Vpc, target: () => Promise<void> | void, imageBuilder?: (bundle: lib.Bundle) => any, opt?: any) {
+        const id = core.getCurrentId().split('--').slice(0, -1).join('-').slice(0, 62).replaceAll('.', '-')
         this.cluster = new aws.EcsCluster({
             name: lib.generateIdentifier(aws.EcsCluster, 'name', 62),
         })
         const bundle = new lib.Bundle(target)
         const region = new aws.RegionData()
-        const repo = imageBuilder?.(bundle) ?? createDefaultImage(id, bundle, region.name)
+        
+        let repoUrl: string
+
+        if (imageBuilder) {
+            const repo = imageBuilder(bundle)
+            repoUrl = repo.repositoryUrl
+        } else {
+            const repoAndDeployment = createDefaultImage(id, bundle, region.name, opt?.baseImage)
+            repoUrl = `${repoAndDeployment.repo.repositoryUrl}:${repoAndDeployment.deployment.tagName}`
+        }
     
         const role = new aws.IamRole({
             assumeRolePolicy: JSON.stringify(spPolicy("ecs-tasks.amazonaws.com")),
@@ -62,6 +72,8 @@ export class ContainerService {
             }] : undefined,
         })
 
+        this.principal = taskRole
+
         const logs = new aws.CloudwatchLogGroup({
             name: `${id}Logs`
         })
@@ -70,30 +82,36 @@ export class ContainerService {
         // When using a private subnet, the subnet can have a NAT gateway attached.
         // When using container images that are hosted in Amazon ECR, you can configure Amazon ECR to use an interface VPC endpoint and the image pull occurs over the task's private IPv4 address. For more information, see Amazon ECR interface VPC endpoints (AWS PrivateLink) in the Amazon Elastic Container Registry User Guide.
 
-        const repoUrl = repo instanceof aws.EcrRepository ? repo.repositoryUrl : repo.repositoryUri
+        const runtimePlatform = opt?.arch === 'aarch64' ? {
+            operatingSystemFamily: "LINUX",
+            cpuArchitecture: "ARM64"
+        } : undefined
+        
         const taskDefinition = new aws.EcsTaskDefinition({
             family:`${id}Task`,
             networkMode: 'awsvpc',
-            cpu: '256',
-            memory: '512',
+            cpu: opt?.cpu ? String(opt.cpu) : '256',
+            memory: opt?.memory ? String(opt.memory) : '512',
             requiresCompatibilities: ["FARGATE"],
             taskRoleArn: taskRole.resource.arn,
             executionRoleArn: role.arn,
+            runtimePlatform,
             containerDefinitions: JSON.stringify([{
                 // command: string[]
-                // cpu: string ?
+                command: opt?.command,
+                workingDirectory: opt?.workingDirectory,
                 name: `${id}`,
-                image: `${repoUrl}:latest`,
-                cpu: 256,
-                memory: 512,
-                portMappings: [{
+                image: repoUrl,
+                cpu: opt?.cpu ?? 256,
+                memory: opt?.memory ?? 512,
+                portMappings: opt?.portMappings ?? [{
                     // protocol: 'tcp' | 'udp'
                     // appProtocol: 'http' | 'http2' | 'grpc' //
                     protocol: 'tcp',        // TODO: determine this from `target`
                     appProtocol: 'http',    // TODO: determine this from `target`
                     containerPort: 80,      // TODO: determine this from `target`
-                    //  workingDirectory 
                 }],
+                environment: opt?.environment,
                 logConfiguration: {
                     logDriver: 'awslogs',
                     options: {
@@ -135,7 +153,7 @@ export class ContainerService {
         // })
 
         this.service = new aws.EcsService({
-            desiredCount: 0,
+            desiredCount: opt?.desiredCount ?? 0,
             launchType: 'FARGATE',
             name: `${id}Service`,
             cluster: this.cluster.arn,
@@ -148,7 +166,7 @@ export class ContainerService {
             //     }
             // ],
             networkConfiguration: {
-                assignPublicIp: true,
+                assignPublicIp: opt?.public ?? false,
                 subnets: network.subnets.map(s => s.id),
                 securityGroups: [network.resource.defaultSecurityGroupId]
             },
@@ -202,9 +220,8 @@ export class ContainerService {
 
                 instances.push({
                     name: container.name!,
-                    // ip: container.networkInterfaces![0].privateIpv4Address!,
-                    // port: container.networkBindings![0].hostPort!,
-                    ip: desc.NetworkInterfaces[0].Association.PublicIp,
+                    publicIp: desc.NetworkInterfaces[0].Association.PublicIp,
+                    privateIp: desc.NetworkInterfaces[0].PrivateIpAddress,
                     port: 80,
                 })
             }
@@ -214,14 +231,14 @@ export class ContainerService {
     }
 }
 
-function createDefaultImage(id: string, bundle: lib.Bundle, regionName: string) {
+function createDefaultImage(id: string, bundle: lib.Bundle, regionName: string, baseImage?: string) {
     const repoName = id.toLowerCase()
     const repo = new aws.EcrRepository({
         name: repoName,
         forceDelete: true,
     })
 
-    const dockerfile = new GeneratedDockerfile(bundle)
+    const dockerfile = new GeneratedDockerfile(bundle, { baseImage })
 
     const deployment = new DockerfileDeployment({
         type: 'ecr',
@@ -233,7 +250,7 @@ function createDefaultImage(id: string, bundle: lib.Bundle, regionName: string) 
 
     core.updateLifecycle(deployment, { replace_triggered_by: [bundle] })
 
-    return repo
+    return { repo, deployment }
 }
 
 // Permissions reference: 

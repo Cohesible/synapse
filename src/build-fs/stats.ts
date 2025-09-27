@@ -127,7 +127,7 @@ function _parseRef(ref: Ref) {
             return { type, index: firstPart, hash } as const
 
         case 'head':
-            return { type, id: firstPart } as const
+            return { type, id: parts.length ? [firstPart, ...parts].join(':') : firstPart } as const
 
         default:
             return { type, hash: firstPart } as const
@@ -224,13 +224,14 @@ function createRepoWalker(repo: DataRepository, maxCommits?: number, skipIndexDe
             // Fallsthrough
             case 'commit':
             case 'index':
-            case 'store': 
+            case 'store': {
                 const hashStats = await getStats(parsed.hash)
                 if (hashStats.missing) {
                     return { status: 'missing' }
                 }
 
                 return { status: hashStats.corrupted ? 'corrupted' : 'ok', ownSize: hashStats.size }
+            }
 
             default:
                 throw new Error(`Not implemented: ${parsed.type}`)
@@ -483,10 +484,12 @@ export async function collectAllStats(repo: DataRepository, maxCommits?: number)
     const walker = createRepoWalker(repo, maxCommits)
 
     for (const h of await repo.listHeads()) {
-        if (!(h.id in results)) {
-            const r = await visitHead(walker, h.id)
-            results[h.id] = { ...r, type: 'unknown' }
-        }
+        if (h.id in results) continue
+
+        const r = await visitHead(walker, h.id)
+        results[h.id] = { ...r, type: 'unknown' }
+
+        throwIfCancelled()
     }
 
     return results

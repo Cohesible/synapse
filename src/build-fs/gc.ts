@@ -55,7 +55,7 @@ function createGcView() {
 
 const settings = {
     maxCommits: 10,
-    pruneAge: 24 * 60 * 60 * 1000, // 1 day
+    pruneAge: 24 * 60 * 60, // 1 day
     useLock: false,
 }
 
@@ -195,16 +195,18 @@ async function collectGarbage(repo: DataRepository, exclude: Set<string>, pruneA
             return false
         }
 
-        if (pruneAge === undefined) {
+        if (!pruneAge) {
             return true
         }
 
         return repo.statData(hash).then(stats => {
-            if (stats.missing || stats.corrupted) {
+            if (stats.missing) {
+                return false
+            } else if (stats.corrupted) {
                 return true
             }
 
-            return (Date.now() - stats.mtimeMs) >= pruneAge
+            return (Date.now() - stats.mtimeMs)/1000 >= pruneAge
         })
     }
 
@@ -250,15 +252,17 @@ async function collectGarbage(repo: DataRepository, exclude: Set<string>, pruneA
 
     // Cleans up unused blocks
     const blocksDir = repo.getBlocksDir()
+    const blocks = new Set<string>()
     for (const f of await fs.readDirectory(blocksDir)) {
-        if (!exclude.has(f.name) && f.type === 'file' && f.name.length === 64) {
-            toDelete.add(f.name)
+        if (f.type === 'file' && f.name.length === 64 && !exclude.has(f.name)) {
+            blocks.add(f.name)
         }
     }
 
     return {
         toDelete,
         emptyDirs,
+        blocks,
     }
 }
 
@@ -324,12 +328,14 @@ export async function cleanDataRepo(repo = getDataRepository(getFs()), dryRun = 
         ...merged.commits,
     ])
 
-    getLogger().log(`Total objects found`, allObjects.size)
+    printLine(`Total objects found`, allObjects.size)
 
     const garbage = await collectGarbage(repo, allObjects, pruneAge)
+    const numObjects = garbage.toDelete.size + garbage.blocks.size
+
     if (dryRun) {
         getEventLogger().emitGcSummaryEvent({
-            numObjects: garbage.toDelete.size,
+            numObjects,
             numDirs: garbage.emptyDirs.size,
             dryrun: true,
         })
@@ -337,16 +343,24 @@ export async function cleanDataRepo(repo = getDataRepository(getFs()), dryRun = 
         return
     }
 
-    if (garbage.toDelete.size > 0) {
-        getLogger().log(`Deleting ${garbage.toDelete.size} objects`)
+    if (numObjects > 0) {
+        printLine(`Deleting ${numObjects} objects`)
     } else {
-        getLogger().log(`Nothing to delete`)
+        printLine(`Nothing to delete`)
     }
 
     for (const h of garbage.toDelete) {
         throwIfCancelled()
 
         await repo.deleteData(h)
+        getEventLogger().emitGcEvent({ deleted: 1 })
+    }
+
+    for (const h of garbage.blocks) {
+        throwIfCancelled()
+
+        const pathname = path.resolve(repo.getBlocksDir(), h)
+        await getFs().deleteFile(pathname).catch(throwIfNotFileNotFoundError)
         getEventLogger().emitGcEvent({ deleted: 1 })
     }
 
@@ -364,7 +378,7 @@ export async function cleanDataRepo(repo = getDataRepository(getFs()), dryRun = 
     }
 
     getEventLogger().emitGcSummaryEvent({
-        numObjects: garbage.toDelete.size,
+        numObjects,
         numDirs: garbage.emptyDirs.size,
     })
 }

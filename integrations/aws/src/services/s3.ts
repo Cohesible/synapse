@@ -57,7 +57,7 @@ export class Bucket implements storage.Bucket {
         }
     }
 
-    public async put(key: string, blob: string | Uint8Array | Blob | ReadableStream<Uint8Array>): Promise<void> {
+    public async put(key: string, blob: string | Uint8Array | Blob | AsyncIterable<Uint8Array>): Promise<void> {
         // Currently run into:
         // "Are you using a Stream of unknown length as the Body of a PutObject request? Consider using Upload instead from @aws-sdk/lib-storage."
         if (typeof blob === 'object' && Symbol.asyncIterator in blob) {
@@ -113,6 +113,10 @@ export class Bucket implements storage.Bucket {
 
     public getUrl(key: string, expiresIn = 3600) {
         return _getSignedUrl(this.client, this.resource.bucket, key, expiresIn)
+    }
+
+    public getPutUrl(key: string, expiresIn = 3600) {
+        return _getPutSignedUrl(this.client, this.resource.bucket, key, expiresIn)
     }
 
     public async startMultipartUpload(key: string) {
@@ -190,6 +194,12 @@ function _getUploadPartSignedUrl(client: S3.S3, req: UploadPartRequest, expiresI
     return getSignedUrl(client, command, { expiresIn })
 }
 
+function _getPutSignedUrl(client: S3.S3, bucket: string, key: string, expiresIn: number) {
+    const command = new S3.PutObjectCommand({ Bucket: bucket, Key: key })
+
+    return getSignedUrl(client, command, { expiresIn })
+}
+
 core.addTarget(storage.Bucket, Bucket, 'aws')
 
 function addS3Statement(recv: any, action: string | string[], resource: string) {
@@ -210,6 +220,12 @@ core.bindFunctionModel(_getSignedUrl, function (client, bucket, key) {
 
 core.bindFunctionModel(_getUploadPartSignedUrl, function (client, req) {
     addS3Statement(this, 'PutObject', `${req.bucket}/${req.key}`)
+
+    return ''
+})
+
+core.bindFunctionModel(_getPutSignedUrl, function (client, bucket, key) {
+    addS3Statement(this, 'PutObject', `${bucket}/${key}`)
 
     return ''
 })

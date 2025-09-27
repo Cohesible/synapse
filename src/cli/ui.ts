@@ -1185,7 +1185,7 @@ export function createDisplay() {
                 return
             }
 
-            if (opt?.hideCursor) {
+            if (opt?.hideCursor && !disposed) {
                 writer.hideCursor()
             }
 

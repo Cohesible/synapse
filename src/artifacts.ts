@@ -691,7 +691,7 @@ async function dump(repo: DataRepository, index: BuildFsIndex & { id?: string },
 
     async function worker(k: string, v: BuildFsFile) { 
         const oldHash = oldIndex?.files[k]?.hash
-    if (!shouldIgnoreOld && oldHash === v.hash) {
+        if (!shouldIgnoreOld && oldHash === v.hash) {
             return
         }
 
@@ -3466,11 +3466,12 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
         const stats = await getStatsFile(p)
         delete stats[hash]
         await fs.deleteFile(p)
-        pendingDeletes.delete(hash)
     }
 
     function deleteData(hash: string) {
-        const p = _deleteData(hash)
+        const p = _deleteData(hash).catch(throwIfNotFileNotFoundError).finally(() => {
+            pendingDeletes.delete(hash)
+        })
         pendingDeletes.set(hash, p)
         return p
     }
@@ -3488,7 +3489,18 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
         const entries = [...openedStatFiles.entries()]
         openedStatFiles.clear()
 
-        await Promise.all(entries.map(async ([k, v]) => fs.writeFile(k, JSON.stringify(await v))))
+        const now = Date.now()
+
+        await Promise.all(entries.map(async ([k, v]) => {
+            const d = await v
+            for (const [k2, v2] of Object.entries(d)) {
+                if (!v2.lastStatTime || (now - v2.lastStatTime) > 300_000) {
+                    delete d[k2]
+                }
+            }
+
+            return fs.writeFile(k, JSON.stringify(d))
+        }))
     }
 
     function getStatsFile(dataPath: string): Promise<StatsFile> | StatsFile {
@@ -3497,12 +3509,19 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
             return openedStatFiles.get(fileName)!
         }
 
-        const data = tryReadJson<StatsFile>(fs, fileName).then(val => {
-            const f = val ?? {}
-            openedStatFiles.set(fileName, f)
+        const data = tryReadJson<StatsFile>(fs, fileName)
+            .catch(err => {
+                if (!isEOFJsonParseError(err)) {
+                    throw err
+                }
+            })
+            .then(val => {
+                const f = val ?? {}
+                openedStatFiles.set(fileName, f)
 
-            return f
-        })
+                return f
+            })
+
         openedStatFiles.set(fileName, data)
 
         return data
@@ -4213,6 +4232,8 @@ function getRepository(fs: Fs & SyncFs, buildDir: string) {
             for (const [k] of buildFileSystems) {
                 await flushFs(k)
             }
+
+            await Promise.all(pendingHeadWrites.values())
         }, 10)
 
         if (printCountsOnFlush) {
@@ -5130,7 +5151,7 @@ export async function dumpFs(id?: string, dest = path.resolve('.vfs-dump'), repo
     await dump(getDataRepository(), { id: resolved, ...vfs.index }, dest, opt)
 }
 
-// Only used for publishing
+// Only used for publishing 
 export async function getOverlayedFs(workingDirectory: string, index: BuildFsIndex) {
     const readOnlyFs = createBuildFsFragment(getDataRepository(), index).root
 
@@ -5366,7 +5387,7 @@ export async function saveMoved(moved: { from: string; to: string }[]) {
     await fs.writeJson('[#synth]moved.json', { moved })
 }
 
-export async function getPreviousDeploymentProgramHash() {
+export async function getPreviousDeploymentCommit() {
     const repo = getDataRepository(getFs())
     const deploymentId = getBuildTargetOrThrow().deploymentId
     if (!deploymentId) {
@@ -5379,7 +5400,7 @@ export async function getPreviousDeploymentProgramHash() {
     }
 
     if (h.commitHash && h.programHash) {
-        return h.programHash
+        return h as Head & { programHash: string }
     }
 
     const c = h.previousCommit
@@ -5393,7 +5414,7 @@ export async function getPreviousDeploymentProgramHash() {
         throw new Error(`No program found for deployment commit: ${c}`)
     }
 
-    return programHash
+    return previousCommit as Head & { programHash: string }
 }
 
 export async function getMoved(programHash?: string): Promise<{ from: string; to: string }[] | undefined> {
@@ -5430,12 +5451,12 @@ export async function maybeRestoreTemplate(head?: Head) {
         return getTemplate(bfs.root)
     }
 
-    const programHash = await getPreviousDeploymentProgramHash()
-    if (!programHash) {
+    const c = await getPreviousDeploymentCommit()
+    if (!c) {
         return
     }
     
-    const fs = await getFsFromHash(programHash, repo)
+    const fs = await getFsFromHash(c.programHash, repo)
 
     return getTemplate(fs)
 }

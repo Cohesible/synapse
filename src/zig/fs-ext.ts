@@ -11,6 +11,9 @@ export function fastCopyDir(src: string, dst: string) {
         throw new Error(`"fastCopyDir" is not available in the current runtime`)
     }
 
+    src = path.resolve(src)
+    dst = path.resolve(dst)
+
     const srcDir = path.dirname(src)
     const dstDir = path.dirname(dst)
     const srcBase = path.basename(src)

@@ -85,6 +85,23 @@ export class Table<K, V> {
         })
     }
 
+    // XXX
+    public async _updateItem(key: K, params: any) {
+        const resp = await this.client.updateItem({
+            TableName: this.resource.name,
+            Key: this.makeKey(key),
+            ExpressionAttributeNames: { '#v': 'value' },
+            ReturnValues: 'ALL_NEW',
+            ...params,
+        })
+
+        if (params.ReturnValues === 'NONE') {
+            return
+        }
+
+        return deserializeTableItem(resp.Attributes)
+    }
+
     public async delete(key: K): Promise<void> {
         await this.client.deleteItem({
             TableName: this.resource.name,
@@ -131,7 +148,7 @@ export class Table<K, V> {
     }
 
     public async getBatch(keys: K[]): Promise<{ key: K, value: V }[]> {
-        const batches = chunk(keys, 100)
+        const batches = chunk([...keys], 100)
         const items: Record<string, DynamoDB.AttributeValue>[] = []
         for (const batch of batches) {
             const resp = await this.client.batchGetItem({
@@ -139,7 +156,7 @@ export class Table<K, V> {
                     [this.resource.name]: {
                         Keys: batch.map(k => this.makeKey(k)),
                     }
-                }
+                },
             })
     
             if (resp.UnprocessedKeys && Object.keys(resp.UnprocessedKeys).length > 0) {
@@ -149,13 +166,14 @@ export class Table<K, V> {
             items.push(...resp.Responses![this.resource.name])
         }
 
+        const _keys = typeof keys[0] === 'string' ? keys as string[] : keys.map(x => String(x))
         const result: { key: K, value: V }[] = []
         for (const item of items) {
             const itemKey = this.getCompositeKey(item)
-            const key = keys.find(k => k === itemKey)
-            if (!key) continue // Item wasn't in response
+            const keyIndex = _keys.indexOf(itemKey)
+            if (keyIndex === -1) continue // Item wasn't in response
 
-            result.push({ key, value: deserializeTableItem(item) })
+            result.push({ key: keys[keyIndex], value: deserializeTableItem(item) })
         }
 
         return result
@@ -174,6 +192,27 @@ export class Table<K, V> {
                                     ...this.makeKey(i.key),
                                     value: serialize(i.value),
                                 }
+                            }
+                        }
+                    })
+                }
+            })
+
+            if (resp.UnprocessedItems && Object.keys(resp.UnprocessedItems).length > 0) {
+                throw new Error('Handling unprocessed keys is not implemented')
+            }
+        }
+    }
+
+    public async _deleteBatch(keys: K[]): Promise<void> {
+        const batches = chunk([...keys], 25)
+        for (const batch of batches) {
+            const resp = await this.client.batchWriteItem({
+                RequestItems: {
+                    [this.resource.name]: batch.map(i => {
+                        return {
+                            DeleteRequest: {
+                                Key: this.makeKey(i),
                             }
                         }
                     })
@@ -437,6 +476,12 @@ export class Cache<K extends string = string, V = any> {
         })
 
         if (!resp.Item) {
+            return
+        }
+
+        // Discard stale entries
+        const expirationTime = Number(resp.Item.expirationTime.N || 0)
+        if (expirationTime === 0 || expirationTime < ((Date.now() / 1000))) {
             return
         }
 
@@ -717,6 +762,77 @@ export class KeyedCounter {
 
     public async dec(key: string, amount = -1) {
         return this.inc(key, amount)
+    }
+
+    // XXX
+    public async _decNZ(key: string, amount = 1) {
+        const resp = await this.client.updateItem({
+            TableName: this.table.name,
+            Key: { key: { S: key } },
+            ExpressionAttributeNames: { '#v': 'value' },
+            ExpressionAttributeValues: { 
+                ":inc": { N: `${-amount}` },
+                ":l": { N: '0' },
+            },
+            UpdateExpression: "ADD #v :inc",
+            ReturnValues: 'ALL_NEW',
+            ConditionExpression: '#v > :l',
+        })
+        
+        const val = resp.Attributes?.['value']?.['N']
+        
+        return Number(val!)
+    }
+
+    // XXX
+    public async compareAndExchange(key: string, expected: number, replacement: number) {
+        try {
+            const ConditionExpression = expected === this.init
+                ? 'attribute_not_exists(#v) OR #v = :l'
+                : '#v = :l'
+
+            const resp = await this.client.updateItem({
+                TableName: this.table.name,
+                Key: { key: { S: key } },
+                ExpressionAttributeNames: { '#v': 'value' },
+                ExpressionAttributeValues: { 
+                    ":z": { N: String(replacement) },
+                    ":l": { N: String(expected) },
+                },
+                UpdateExpression: "SET #v = :z",
+                ConditionExpression,
+                ReturnValues: 'ALL_OLD',
+                ReturnValuesOnConditionCheckFailure: 'ALL_OLD',
+            })
+            
+            const val = resp.Attributes?.['value']?.['N']
+            if (val === undefined) {
+                return this.init
+            }
+            
+            return Number(val)
+        } catch (e) {
+            console.log('compareAndExchange failed', e)
+            throw e
+        }
+    }
+
+    // XXX
+    public async take(key: string) {
+        const resp = await this.client.updateItem({
+            TableName: this.table.name,
+            Key: { key: { S: key } },
+            ExpressionAttributeNames: { '#v': 'value' },
+            ExpressionAttributeValues: { 
+                ":z": { N: '0' },
+            },
+            UpdateExpression: "SET #v = :z",
+            ReturnValues: 'ALL_OLD',
+        })
+        
+        const val = resp.Attributes?.['value']?.['N']
+
+        return val ? Number(val) : 0
     }
 }
 

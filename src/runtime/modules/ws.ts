@@ -13,7 +13,7 @@ import { HttpError, HttpRequest, HttpResponse } from 'synapse:http'
 
 const WebSocketGUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 function getWsKey(key: string) {
-    return crypto.createHash('sha1').update(key + WebSocketGUID).digest().toString('base64')
+    return crypto.createHash('sha1').update(key).update(WebSocketGUID).digest('base64')
 }
 
 const slice = (buf: Buffer, start: number, end?: number) => Uint8Array.prototype.slice.call(buf, start, end)
@@ -34,6 +34,8 @@ interface WebSocketServerOptions {
     secureContext?: MinimalSecureContext
     beforeUpgrade?: (request: HttpRequest) => Promise<HttpResponse | void> | HttpResponse | void
     httpRequestHandler?: (request: HttpRequest, body: any) => Promise<HttpResponse> | HttpResponse
+    onCustomProto?: (req: MinimalIncomingMessage, protos: string[], ctx: any) => Promise<HttpResponse | void> | HttpResponse | void
+    http?: any
 }
 
 interface MinimalIncomingMessage {
@@ -47,10 +49,40 @@ interface SimpleDuplex {
     once(event: string, listener: (...args: any[]) => void): this
     write(chunk: string | ArrayBufferView, cb?: (err?: Error | null) => void): boolean
     end(cb?: () => void): this
+    end(data: string, cb?: () => void): this
     destroy(err?: Error): this
+    cork(): void
+    uncork(): void   
 }
 
-export async function upgradeToWebsocket(req: MinimalIncomingMessage, socket: SimpleDuplex, isSecureContext = true): Promise<WebSocket | undefined> {
+
+const upgradeHeaderBuffers = new Map<String, Buffer>()
+function getUpgradeHeaderBuffer(proto = '') {
+    const cached = upgradeHeaderBuffers.get(proto)
+    if (cached) return cached
+    
+    const headers = new Headers({
+        Upgrade: 'websocket',
+        Connection: 'Upgrade',
+    })
+
+    if (proto) {
+        headers.append('Sec-WebSocket-Protocol', proto)
+    }
+
+    const str = [
+        'HTTP/1.1 101 Switching Protocols',
+        ...Array.from(headers.entries()).map(([k, v]) => `${k}: ${v}`),
+        'Sec-WebSocket-Accept: ',
+    ].join('\r\n')
+
+    const b = Buffer.from(str, 'utf-8')
+    upgradeHeaderBuffers.set(proto, b)
+
+    return b
+}
+
+export async function upgradeToWebsocket(req: MinimalIncomingMessage, socket: SimpleDuplex, isSecureContext = true, maxPayloadLength: number, onCustomProto?: WebSocketServerOptions['onCustomProto'], allocator?: any): Promise<WebSocket | undefined> {
     const key = req.headers['sec-websocket-key']
     const protocol = req.headers['sec-websocket-protocol']
     if (!key) {
@@ -59,48 +91,299 @@ export async function upgradeToWebsocket(req: MinimalIncomingMessage, socket: Si
         return
     }
 
-    const headers = new Headers({
-        Upgrade: 'websocket',
-        Connection: 'Upgrade',
-        'Sec-WebSocket-Accept': getWsKey(key),
-        // 'Sec-WebSocket-Protocol': protocol ? protocol.split(',')[0] : '',
-    })
+    const protos = protocol?.split(', ')
+
+    // const headers = new Headers({
+    //     Upgrade: 'websocket',
+    //     Connection: 'Upgrade',
+    //     'Sec-WebSocket-Accept': getWsKey(key),
+    // })
+
+    const ctx: any = {}
+    if (protos) {
+        //headers.append('Sec-WebSocket-Protocol', protos[0])
+        if (onCustomProto) {
+            const resp = await onCustomProto(req, protos, ctx)
+
+            if (resp) {
+                const code = resp.statusCode ?? 400
+                const msg = http.STATUS_CODES[code] ?? 'Unknown'
+                const headers = new Headers(resp.headers ?? {})
+
+                const _resp = [
+                    `HTTP/1.1 ${code} ${msg}`,
+                    ...Array.from(headers.entries()).map(([k, v]) => `${k}: ${v}`),
+                    '',
+                ].join('\r\n')
+
+                socket.end(_resp + '\r\n')
+                return
+            }
+        }
+    }
 
     function getBaseUrl() {
         const scheme = isSecureContext ? 'wss' : 'ws'
-        
+
         return scheme + '://' + req.headers['host']!
     }
 
     // TODO: clean this up
     const url = new URL(req.url!, getBaseUrl())
 
-    const resp = [
-        'HTTP/1.1 101 Switching Protocols',
-        ...Array.from(headers.entries()).map(([k, v]) => `${k}: ${v}`),
-        '',
-    ].join('\r\n')
+    // const resp = [
+    //     'HTTP/1.1 101 Switching Protocols',
+    //     ...Array.from(headers.entries()).map(([k, v]) => `${k}: ${v}`),
+    //     '',
+    // ].join('\r\n')
 
+    const b = getUpgradeHeaderBuffer(protos?.[0])
 
+    const addr = req.headers['fly-client-ip'] || (req as any).socket?.remoteAddress
+    
     return new Promise<WebSocket>((resolve, reject) => {
-        socket.write(resp + '\r\n', err => {
+        socket.cork()
+        socket.write(b)
+        socket.write(getWsKey(key))
+        socket.write('\r\n\r\n', err => {
             if (!err) {
-                resolve(upgradeSocket(socket, url))
+                resolve(upgradeSocket(socket, url, 'server', maxPayloadLength, addr, ctx, allocator))
             } else {
                 reject(err)
             }
         })
+        socket.uncork()
     })
+}
+
+function maybeGetuWS() {
+    if (process.env['NO_UWS']) return
+
+    try {
+        return require('uWebSockets.js')
+    } catch {}
 }
 
 /** @internal */
 export async function createWebsocketServer(opt: WebSocketServerOptions = {}): Promise<WebSocketServer> {
-    const server = opt?.secureContext 
-        ? https.createServer(opt.secureContext as tls.SecureContextOptions) // Types are too strict, it doesn't need `Buffer`
-        : http.createServer()
-
     const emitter = new EventEmitter()
     const connectEvent: Event<[ws: WebSocket]> = createEvent(emitter, 'connect')
+    const port = opt.port ?? (opt.secureContext ? 443 : 80)
+
+    const uWS = maybeGetuWS()
+    if (uWS) {
+        const idleTimeout = opt.idleTimeout ?? 0
+        const _logFailedUpgrades = true // !!process.env['LOG_FAILED_UPGRADES']
+        const _maxPayloadLength = process.env['MAX_PAYLOAD_LENGTH']
+        const maxPayloadLength = opt.maxPayloadLength ?? (_maxPayloadLength ? Number(_maxPayloadLength) : 1024)
+        console.log('using uws', 'maxPayloadLength', maxPayloadLength, 'idleTimeout', idleTimeout, '_logFailedUpgrades', _logFailedUpgrades)
+        const App = opt?.secureContext ? uWS.SSLApp : uWS.App
+
+        const appOpt = {}
+        if (opt?.secureContext) {
+            const threadId = require('node:worker_threads').threadId
+            const fs = require('node:fs') as typeof import('node:fs')
+            fs.writeFileSync(`cert-${threadId}.pem`, opt.secureContext.cert)
+            fs.writeFileSync(`key-${threadId}.pem`, opt.secureContext.key)
+            appOpt.key_file_name = `key-${threadId}.pem`
+            appOpt.cert_file_name = `cert-${threadId}.pem`
+        }
+
+        function initWs(url, addr, ctx) {
+            const emitter = new EventEmitter()
+            const errorEvent: Event<[error: unknown]> = createEvent(emitter, 'error')
+            const closeEvent: Event<[code?: StatusCode, reason?: string]> = createEvent(emitter, 'close')
+            const messageEvent: Event<[message: string | Buffer]> = createEvent(emitter, 'message')
+            const messageBuffer: any[] = []
+
+            function ping() {
+                return ws.ping()
+            }
+
+            let ws
+            function send(msg: any) {
+                if (_closed) return 3
+                if (_logFailedUpgrades) {
+                    const code = ws.send(msg, true)
+                    if (code === 2) {
+                        console.log('backpressure limit!',  ws.getBufferedAmount())                        
+                    }
+                    return code
+                }
+
+                return ws.send(msg, true)
+            }
+
+            function setWs(_ws) {
+                ws = _ws
+            }
+
+            function sendMany(msgs: any[]) {
+                if (_closed) return 3
+                ws.cork(() => {
+                    for (const m of msgs) {
+                        const code = ws.send(m, true)
+                        if (code === 2) break
+                    }
+                })
+            }
+
+            async function close(msg?: string, code = 1001) {
+                if (_closed) return
+                ws.end(code, msg)
+                _closed = true
+            }
+
+            let messageHandler: any
+            function getMessageHandler() {
+                return messageHandler
+            }
+
+            function onMessage(handler: any) {
+                messageHandler = handler
+                while (messageBuffer.length) {
+                    messageHandler(messageBuffer.shift())
+                }
+            }
+
+            function handleMessage(msg: ArrayBuffer) {
+                if (!messageHandler) {
+                    const b = Buffer.allocUnsafe(msg.byteLength)
+                    b.set(new Uint8Array(msg))
+                    messageBuffer.push(b)
+                    if (messageBuffer.length > 1000) {
+                        throw new Error('no handler')
+                    }
+                    return
+                }
+                messageHandler(msg)
+            }
+
+            let _closed = false
+            function closed() {
+                _closed = true
+            }
+
+            return {
+                url,
+                addr, // XXX
+                ctx, // XXX
+                ping,
+                send,
+                close,
+                onClose: closeEvent.on,
+                onError: errorEvent.on,
+                onMessage: onMessage, // messageEvent.on,
+                messageEvent,
+                errorEvent,
+                closeEvent,
+                setWs,
+                handleMessage,
+                getMessageHandler,
+                closed,
+                sendMany,
+            }
+        }
+
+        return new Promise((resolve, reject) => {
+            const app = App(appOpt).ws('/*', {
+                closeOnBackpressureLimit: true,
+                maxBackpressure: 8 * 1024 * 1024,
+                maxPayloadLength,
+                maxLifetime: 0,
+                sendPingsAutomatically: false,
+                idleTimeout,
+                upgrade: async (res, req, context) => {
+                    const url = req.getUrl()
+                    const ctx = {}
+                    const addr = req.getHeader('fly-client-ip') || Buffer.from(res.getRemoteAddressAsText()).toString('utf-8')
+
+                    const key = req.getHeader('sec-websocket-key')
+                    const ext = req.getHeader('sec-websocket-extensions')
+                    const protocol = req.getHeader('sec-websocket-protocol')
+
+
+                    const protos = protocol?.split(', ')
+                    const onCustomProto = opt?.onCustomProto
+
+                    if (protos) {
+                        if (onCustomProto) {
+                            let aborted = false
+                            res.onAborted(() => {
+                                aborted = true
+                                if (_logFailedUpgrades) {
+                                    console.log('ws upgrade aborted!')
+                                }
+                            })
+
+                            const resp = await onCustomProto(req, protos, ctx)
+                            if (aborted) return
+
+                            if (resp) {
+                                res.cork(() => {
+                                    res.writeStatus(`${resp.statusCode ?? 400} Forbidden`)
+                                    res.end(undefined, true)
+                                })
+
+                                return
+                            }
+                        }
+                    }
+
+                    const wrapper = initWs(url, addr, ctx)
+
+                    res.cork(() => {
+                        res.upgrade(
+                            { wrapper },
+                            key,
+                            protos?.[0] ?? '',
+                            ext,
+                            context
+                        )
+                    })
+                },
+                open: (ws) => {
+                    const wrapper = ws.getUserData().wrapper
+                    wrapper.setWs(ws)
+                    process.nextTick(() => {
+                        connectEvent.fire(wrapper)
+                    })
+                },
+                message: (ws, message, isBinary) => {
+                    const wrapper = ws.getUserData().wrapper
+                    if (!isBinary) return
+
+                    return wrapper.handleMessage(message)
+                },
+                //drain: (ws) => {
+                    // console.log('WebSocket backpressure: ' + ws.getBufferedAmount());
+                //},
+                // dropped?: ((ws, message, isBinary) => void | Promise<void>); 
+                close: (ws, code, message) => {
+                    const wrapper = ws.getUserData().wrapper
+                    wrapper.closed()
+                    return wrapper.closeEvent.fire(code, message)
+                },
+            }).listen(port, (token) => {
+                if (!token) return reject('Failed to listen on port')
+
+                async function close() {
+                    return app.close()
+                }
+                resolve({
+                    close,
+                    onConnect: connectEvent.on,
+                })
+            })
+        })
+    }
+
+    const server = opt?.secureContext
+        ? https.createServer({
+            ...opt.secureContext as tls.SecureContextOptions,
+            ...opt?.http,
+        }) // Types are too strict, it doesn't need `Buffer`
+        : http.createServer(opt?.http)
 
     server.on('request', async (req, res) => {
         if (!opt.httpRequestHandler) {
@@ -148,31 +431,63 @@ export async function createWebsocketServer(opt: WebSocketServerOptions = {}): P
         }
     })
 
+    const _maxPayloadLength = process.env['MAX_PAYLOAD_LENGTH']
+    const maxPayloadLength = opt.maxPayloadLength ?? (_maxPayloadLength ? Number(_maxPayloadLength) : 1024)
+
+    let overflow = 0
+    let bufCount = 0
+    const bufs: Buffer[] = new Array(10)
+    function free(b: Buffer) {
+        if (bufCount === 10) {
+            overflow = (overflow + 1) % 10
+            bufs[overflow] = b
+        } else {
+            bufs[bufCount++] = b
+        }
+    }
+
+    function allocate() {
+        if (bufCount) {
+            return bufs[bufCount--]
+        }
+        return Buffer.allocUnsafe(maxPayloadLength)
+    }
+
+    const shared = Buffer.allocUnsafe(maxPayloadLength)
+
+    const allocator = {
+        shared,
+        allocate,
+        free,
+    }
+
     const sockets = new Set<WebSocket>()
-    server.on('upgrade', async (req, socket, head)  => {
-        const beforeUpgradeResp = await opt.beforeUpgrade?.({
-            // body: undefined,
-            path: req.url!,
-            method: req.method!,
-            pathParameters: {},
-            headers: new Headers(Object.entries(req.headers).filter(([_, v]) => typeof v === 'string') as any),
-        })
+    server.on('upgrade', async (req, socket, head) => {
+        if (opt.beforeUpgrade) {
+            const beforeUpgradeResp = await opt.beforeUpgrade({
+                // body: undefined,
+                path: req.url!,
+                method: req.method!,
+                pathParameters: {},
+                headers: new Headers(Object.entries(req.headers).filter(([_, v]) => typeof v === 'string') as any),
+            })
 
-        if (beforeUpgradeResp) {
-            const code = beforeUpgradeResp.statusCode ?? 400
-            const msg = http.STATUS_CODES[code] ?? 'Unknown'
-            const headers = new Headers(beforeUpgradeResp.headers ?? {})
-    
-            const resp = [
-                `HTTP/1.1 ${code} ${msg}`,
-                ...Array.from(headers.entries()).map(([k, v]) => `${k}: ${v}`),
-                '',
-            ].join('\r\n')
+            if (beforeUpgradeResp) {
+                const code = beforeUpgradeResp.statusCode ?? 400
+                const msg = http.STATUS_CODES[code] ?? 'Unknown'
+                const headers = new Headers(beforeUpgradeResp.headers ?? {})
 
-            return socket.end(resp + '\r\n')
+                const resp = [
+                    `HTTP/1.1 ${code} ${msg}`,
+                    ...Array.from(headers.entries()).map(([k, v]) => `${k}: ${v}`),
+                    '',
+                ].join('\r\n')
+
+                return socket.end(resp + '\r\n')
+            }
         }
 
-        const ws = await upgradeToWebsocket(req as MinimalIncomingMessage, socket, !!opt.secureContext)
+        const ws = await upgradeToWebsocket(req as MinimalIncomingMessage, socket, !!opt.secureContext, maxPayloadLength, opt.onCustomProto, allocator)
         if (!ws) {
             return
         }
@@ -185,7 +500,7 @@ export async function createWebsocketServer(opt: WebSocketServerOptions = {}): P
     async function close() {
         await Promise.all(Array.from(sockets).map(ws => ws.close()))
 
-        return new Promise<void>((resolve, reject) => 
+        return new Promise<void>((resolve, reject) =>
             server.close(err => err ? reject(err) : resolve())
         )
     }
@@ -200,7 +515,6 @@ export async function createWebsocketServer(opt: WebSocketServerOptions = {}): P
         })
     }
 
-    const port = opt.port ?? (opt.secureContext ? 443 : 80)
     if (opt.address === '*') {
         await Promise.all([listen('::'), listen('0.0.0.0')])
     } else {
@@ -217,11 +531,14 @@ export async function createWebsocketServer(opt: WebSocketServerOptions = {}): P
 export interface WebSocket {
     readonly url: URL
     ping: (message?: string) => Promise<number>
-    send: (data: string | Uint8Array) => Promise<void>
+    send: (data: string | Uint8Array) => 0 | 1
+    sendRaw: (data: Uint8Array) => 0 | 1
     close: (message?: string) => Promise<void>
     onClose: (listener: (code?: StatusCode, reason?: string) => void) => { dispose: () => void }
     onMessage: (listener: (message: string | Uint8Array) => void) => { dispose: () => void }
     onError: (listener: (error: unknown) => void) => { dispose: () => void }
+
+    getBufferedAmount(): number
 }
 
 interface Event<T extends any[]> {
@@ -246,7 +563,15 @@ function createEvent<T extends any[], U extends string>(emitter: EventEmitter, t
     }
 }
 
-function upgradeSocket(socket: SimpleDuplex, url: URL, mode: 'client' | 'server' = 'server'): WebSocket {
+function upgradeSocket(
+    socket: SimpleDuplex, 
+    url: URL, 
+    mode: 'client' | 'server', 
+    maxPayloadLength: number, 
+    addr?: string, 
+    ctx?: any,
+    allocator?: any
+): WebSocket {
     const emitter = new EventEmitter()
     const pongEvent: Event<[message: string]> = createEvent(emitter, 'pong')
     const errorEvent: Event<[error: unknown]> = createEvent(emitter, 'error')
@@ -254,12 +579,14 @@ function upgradeSocket(socket: SimpleDuplex, url: URL, mode: 'client' | 'server'
     const messageEvent: Event<[message: string | Buffer]> = createEvent(emitter, 'message')
 
     function ping(msg: string = '') {
+        if (!(socket as any).writable) return Promise.resolve()
+
         const now = Date.now()
 
         return new Promise<number>((resolve, reject) => {
             const l = pongEvent.once(() => resolve(Date.now() - now))
             socket.write(
-                createFrame(Opcode.Ping, Buffer.from(msg)), 
+                createFrame(Opcode.Ping, Buffer.from(msg)),
                 err => err ? (l.dispose(), reject(err)) : void 0,
             )
         })
@@ -277,36 +604,37 @@ function upgradeSocket(socket: SimpleDuplex, url: URL, mode: 'client' | 'server'
         })
     }
 
-    async function send(msg: string | Uint8Array) {
-        const maskingKey = mode === 'client' ? await randomInt32() : undefined
+    function send(msg: string | Uint8Array) {
+        const op = typeof msg === 'string' ? Opcode.Text : Opcode.Binary
 
-        return new Promise<void>((resolve, reject) => {
-            socket.write(
-                createFrame(Opcode.Text, Buffer.from(msg), maskingKey),
-                err => err ? reject(err) : resolve()
-            )
-        })
+        return sendRaw(createFrame(op, msg instanceof Buffer ? msg : Buffer.from(msg)))
     }
 
     async function close(reason?: string) {
+        if (state === SocketState.Closing || state === SocketState.Closed) return
+
         state = SocketState.Closing
 
         try {
-            const closePromise = new Promise<void>((resolve, reject) => {
+            const closePromise = new Promise<void>(async (resolve, reject) => {
+                if (!(socket as any).writable) return resolve()
+
                 socket.once('end', () => resolve())
+                await sendClose(StatusCode.Success, reason)
             })
 
-            await sendClose(StatusCode.Success, reason)
             await closePromise
         } finally {
             state = SocketState.Closed
         }
     }
 
-    async function sendClose(code?: StatusCode, reason?: string | Uint8Array) {
+    function sendClose(code?: StatusCode, reason?: string | Uint8Array) {
+        if (!(socket as any).writable) return Promise.resolve()
+
         return new Promise<void>((resolve, reject) => {
             socket.write(
-                createCloseFrame(code, reason), 
+                createCloseFrame(code, reason),
                 err => err ? reject(err) : resolve()
             )
         })
@@ -316,45 +644,60 @@ function upgradeSocket(socket: SimpleDuplex, url: URL, mode: 'client' | 'server'
     let lastFrame: Frame | undefined
     let messageBuffer: Buffer[] = []
 
-    async function handleFrame(frame: Frame) {
+    function handleFrame(frame: Frame) {
         switch (frame.op) {
             case Opcode.Pong:
                 return pongEvent.fire(frame.payload.toString('utf-8'))
             case Opcode.Ping:
+                if (!(socket as any).writable) return
+
                 return socket.write(createFrame(Opcode.Pong, frame.payload))
             case Opcode.Close: {
+                if (state === SocketState.Closed) return
+
                 let code: StatusCode | undefined
                 let reason: Buffer | undefined
 
                 if (frame.payload.length >= 2) {
                     code = frame.payload.readUint16BE()
-                    reason = Buffer.from(slice(frame.payload, 2))
+                    reason = frame.payload.length > 2 ? frame.payload.subarray(2) : undefined
                 }
 
+                
                 closeEvent.fire(code, reason?.toString('utf-8'))
 
-                if (state !== SocketState.Closing && state !== SocketState.Closed) {
+                if (state !== SocketState.Closing) {
                     // console.log('closing', code, reason)
                     state = SocketState.Closing
-    
-                    try {
-                        await sendClose(code, reason)
-                    } finally {
+
+                    return sendClose(code, reason).finally(() => {
+                        if (!(socket as any).writable) return
+
                         socket.end(() => state = SocketState.Closed)
-                    }
+                    })
+                }
+
+                if (state === SocketState.Closing) {
+                    if (!(socket as any).writable) return
+
+                    socket.end(() => state = SocketState.Closed)
                 }
 
                 return
             }
             case Opcode.Text:
             case Opcode.Binary: {
+                if (state === SocketState.Closing || state === SocketState.Closed) {
+                    return
+                }
+
                 if (state !== SocketState.Ready) {
                     throw new Error(`Unexpected socket state: ${state}`)
                 }
 
                 if (frame.fin) {
                     const res = frame.op === Opcode.Text ? frame.payload.toString('utf-8') : frame.payload
-                    messageEvent.fire(res)
+                    onMessageHandler(res as any)
                 } else {
                     messageBuffer.push(frame.payload)
                     state = frame.op === Opcode.Text ? SocketState.ReadingText : SocketState.ReadingBinary
@@ -363,15 +706,19 @@ function upgradeSocket(socket: SimpleDuplex, url: URL, mode: 'client' | 'server'
                 return
             }
             case Opcode.Continue: {
+                if (state === SocketState.Closing || state === SocketState.Closed) {
+                    return
+                }
+
                 if (state !== SocketState.ReadingText && state !== SocketState.ReadingBinary) {
                     throw new Error(`Unexpected continuation state: ${state}`)
                 }
 
                 if (frame.fin) {
-                    const res = state === SocketState.ReadingText 
-                        ? messageBuffer.join('') 
+                    const res = state === SocketState.ReadingText
+                        ? messageBuffer.join('')
                         : Buffer.concat(messageBuffer)
-                    messageEvent.fire(res)
+                    onMessageHandler(res as any)
                     messageBuffer = []
                     state = SocketState.Ready
                 } else {
@@ -380,7 +727,7 @@ function upgradeSocket(socket: SimpleDuplex, url: URL, mode: 'client' | 'server'
 
                 return
             }
-            default:                
+            default:
                 return sendClose(StatusCode.ProtocolError, `unknown opcode: ${frame.op}`)
         }
     }
@@ -399,47 +746,275 @@ function upgradeSocket(socket: SimpleDuplex, url: URL, mode: 'client' | 'server'
 
         emitter.removeAllListeners()
     })
-    socket.on('data', async (buf: Buffer) => {
-        let frame: Frame
+
+    socket.once('close', () => {
+        if (state !== SocketState.Closed) {
+            closeEvent.fire(StatusCode.UnexpectedCloseState)
+            state = SocketState.Closed
+        }
+        emitter.removeAllListeners()
+        ;(socket as any).removeAllListeners()
+    })
+
+    function onFrame(frame: Frame) {
+        try {
+            handleFrame(frame)
+        } catch (e) {
+            errorEvent.fire(e)
+        }
+
+        while (frame.carry) {
+            if (!canReadClientFrame(frame.carry)) {
+                if (fragmentSize !== 0) {
+                    throw new Error(`expected no fragments: ${fragmentSize} [carry: ${frame.carry.byteLength}]`)
+                }
+                //fragementBuffer = Buffer.allocUnsafe(16)
+                fragementBuffer.set(frame.carry, 0)
+                fragmentSize += frame.carry.byteLength
+                break
+            }
+
+            frame = readFrame(frame.carry, allocator.shared)
+            if (frame.remainingLength) {
+                allocator.shared = Buffer.allocUnsafe(maxPayloadLength)
+                lastFrame = frame
+                return
+            }
+
+            try {
+                handleFrame(frame)
+            } catch (e) {
+                errorEvent.fire(e)
+            }
+        }
+    }
+
+    function onData(buf: Buffer) {
         if (lastFrame) {
-            const [_, remainingLength] = readFrameIntoPayload(buf, lastFrame.remainingLength!, 0, lastFrame.maskingKey, lastFrame.payload, lastFrame.payload.length - lastFrame.remainingLength!)
+            const r = lastFrame.remainingLength!
+            const [_, remainingLength] = readFrameIntoPayload(buf, r, 0, lastFrame.maskingKey, lastFrame.payload, lastFrame.payload.length - lastFrame.remainingLength!)
 
             lastFrame.remainingLength = remainingLength
             if (lastFrame.remainingLength) {
                 return
             }
 
-            frame = lastFrame
+            if (r < buf.byteLength) {
+                lastFrame.carry = buf.subarray(r)
+            }
+
+            const frame = lastFrame
             lastFrame = undefined
-        } else {
-            frame = readFrame(buf)
+            return onFrame(frame)
         }
 
+        const frame = readFrame(buf, allocator.shared)
         if (frame.remainingLength) {
+            allocator.shared = Buffer.allocUnsafe(maxPayloadLength)
             lastFrame = frame
             return
         }
 
+        return onFrame(frame)
+    }
+
+    function _onData(buf: Buffer) {
+        if (lastFrame) {
+            try {
+                return onData(buf)
+            } catch (e) {
+                return errorEvent.fire(e)
+            }
+        }
+
+        if (fragmentSize === 0) {
+            if (!canReadClientFrame(buf)) {
+                //fragementBuffer = Buffer.allocUnsafe(16)
+                fragementBuffer.set(buf, fragmentSize)
+                fragmentSize += buf.byteLength
+                return
+            }
+        } else {
+            if (!canReadClientFrame2(fragementBuffer, fragmentSize, buf)) {
+                fragementBuffer.set(buf, fragmentSize)
+                fragmentSize += buf.byteLength
+                return
+            } else {
+                const end = setupPartialFrame(fragementBuffer, fragmentSize, buf)
+                const f1 = fragementBuffer.subarray(0, end)
+                const f2 = buf.subarray(end-fragmentSize)
+
+                fragmentSize = 0
+                //fragementBuffer = undefined
+
+                try {
+                    onData(f1)
+                    return onData(f2)
+                } catch (e) {
+                    return errorEvent.fire(e)
+                }
+            }
+        }
+
         try {
-            await handleFrame(frame)
+            return onData(buf)
         } catch (e) {
             errorEvent.fire(e)
         }
+    }
+
+    const fragementBuffer = Buffer.allocUnsafe(maxPayloadLength < 65_000 ? 8 : 16)
+    let fragmentSize = 0
+
+    socket.on('data', _onData)
+
+    const maxBufferedAmount = 8*1024*1024
+    const buffers: (Uint8Array | Buffer)[] = []
+
+    let bufferedAmount = 0
+    let needsDrain = false
+    let hasCorkTick = false
+    let corkedAmount = 0
+    socket.on('drain', () => {
+        if (!needsDrain) return
+
+        needsDrain = false
+
+        const len = buffers.length
+        if (len > 1) {
+            while (!needsDrain && buffers.length) {
+                let c = 0
+                socket.cork()
+                while (buffers.length && c < corkBufferSize) {
+                    const b = buffers.shift()!
+                    socket.write(b)
+                    c += b.byteLength
+                    bufferedAmount -= b.byteLength
+                }
+                socket.uncork()
+                needsDrain = (socket as any).writableNeedDrain
+            }
+        } else if (len === 1) {
+            const buf = buffers[0]
+            if (buf.byteLength < corkBufferSize) {
+                socket.cork()
+                hasCorkTick = true
+                process.nextTick(() => {
+                    hasCorkTick = false
+                    if (!corkedAmount) return
+                    socket.uncork()
+                    corkedAmount = 0
+                })
+
+                socket.write(buf)
+                corkedAmount += buf.byteLength
+            } else {
+                needsDrain = !socket.write(buf)
+            }
+            buffers.length = 0
+            bufferedAmount = 0
+        }
     })
+
+    function sendRaw(buf: Uint8Array | Buffer) {
+        if (!(socket as any).writable) {
+            return 2
+        }
+
+        if (needsDrain) {
+            buffers.push(buf)
+            bufferedAmount += buf.byteLength
+
+            const buffered = (socket as any).writableLength + bufferedAmount
+            if (buffered > maxBufferedAmount) {
+                socket.destroy(new Error(`too much backpressure: ${buffered}`))
+                return 2
+            }
+
+            return 1
+        }
+
+        if (buf.byteLength < corkBufferSize || corkedAmount) {
+            if (!corkedAmount) {
+                socket.cork()
+                if (!hasCorkTick) {
+                    hasCorkTick = true
+                    process.nextTick(() => {
+                        hasCorkTick = false
+                        if (!corkedAmount) return
+                        socket.uncork()
+                        corkedAmount = 0
+                    })
+                }
+            }
+
+            socket.write(buf)
+            corkedAmount += buf.byteLength
+
+            if (corkedAmount >= corkBufferSize) {
+                socket.uncork()
+                corkedAmount = 0
+                needsDrain = (socket as any).writableNeedDrain
+                return needsDrain ? 1 : 0
+            }
+
+            return 0
+        }
+
+        if (socket.write(buf)) {
+            return 0
+        }
+
+        const buffered = (socket as any).writableLength
+        if (buffered > maxBufferedAmount) {
+            socket.destroy(new Error(`too much backpressure: ${buffered}`))
+            return 2
+        }
+
+        needsDrain = true
+
+        return 1
+    }
+
+    function getBufferedAmount() {
+        return (socket as any).writableLength
+    }
+
+    let onMessageHandler: (b: Buffer) => void
+    function _onMessage(handler: typeof onMessageHandler) {
+        onMessageHandler = handler
+    }
+
+    function sendMany(msgs: any[]) {
+        if (!(socket as any).writable) {
+            return 2
+        }
+
+        for (const m of msgs) {
+            if (send(m) === 2) break
+        }
+    }
 
     return {
         url,
+        addr, // XXX
+        ctx, // XXX
         ping,
         send,
         close,
         onClose: closeEvent.on,
         onError: errorEvent.on,
-        onMessage: messageEvent.on,
-    }
+        onMessage: _onMessage as any,
+        sendRaw,
+        sendMany,
+        getBufferedAmount,
+    } as WebSocket
 }
 
+const corkBufferSize = 16 * 1024
+
 /** @internal */
-export async function createWebsocket(url: string | URL, authorization?: string): Promise<WebSocket> {
+export async function createWebsocket(url: string | URL, authorization?: string, protos?: string[]): Promise<WebSocket> {
     const parsedUrl = new URL(url)
     if (parsedUrl.protocol !== 'ws:' && parsedUrl.protocol !== 'wss:') {
         throw new Error(`Invalid protocol "${parsedUrl.protocol}". Must be one of: ws:, wss:`)
@@ -484,6 +1059,10 @@ export async function createWebsocket(url: string | URL, authorization?: string)
         'Sec-WebSocket-Version': '13',
         // 'Sec-WebSocket-Protocol': protocol ? protocol.split(',')[0] : '',
     })
+
+    if (protos) {
+        headers.set('Sec-WebSocket-Protocol', protos.join(', '))
+    }
 
     if (authorization) {
         headers.set('Authorization', authorization)
@@ -542,13 +1121,13 @@ export async function createWebsocket(url: string | URL, authorization?: string)
                 }
 
                 // TODO: subprotocols
-                if (headers['sec-websocket-protocol']) {
-                    return complete(new Error(`Invalid subprotocol: ${headers['sec-websocket-protocol']}`))
-                }
+                // if (headers['sec-websocket-protocol']) {
+                //     return complete(new Error(`Invalid subprotocol: ${headers['sec-websocket-protocol']}`))
+                // }
 
                 complete()
             }
-        }   
+        }
 
         socket.on('error', complete)
         socket.write(req + '\r\n', err => {
@@ -565,7 +1144,6 @@ export async function createWebsocket(url: string | URL, authorization?: string)
     })
 }
 
-// https://stackoverflow.com/a/23329386
 function byteLength(str: string | Uint8Array) {
     if (typeof str !== 'string') {
         return str.length
@@ -582,7 +1160,7 @@ function byteLength(str: string | Uint8Array) {
 
     return len
 }
-  
+
 
 enum SocketState {
     Ready = 0,
@@ -614,7 +1192,7 @@ enum SocketState {
 
 const maxFrameSize = 65536
 
-function *chunk(buf: Buffer, amount: number) {
+function* chunk(buf: Buffer, amount: number) {
     let pos = 0
     while (true) {
         const start = pos === 0
@@ -648,7 +1226,35 @@ function createCloseFrame(code?: StatusCode, reason?: string | Uint8Array) {
     return createFrame(Opcode.Close, payload)
 }
 
-function createFrame(op: Opcode, payload?: Buffer, maskingKey?: number, fin = true) {
+export function getFrameSize(payloadSize: number, mask = false) {
+    const p = payloadSize <= 125 ? payloadSize : payloadSize <= 65536 ? 126 : 127
+    
+    return 2 + payloadSize + (mask ? 4 : 0) + (p === 126 ? 2 : p === 127 ? 8 : 0)
+}
+
+export function getFramePayloadStart(payloadSize: number) {
+    const p = payloadSize <= 125 ? payloadSize : payloadSize <= 65536 ? 126 : 127
+    
+    return 2 + (p === 126 ? 2 : p === 127 ? 8 : 0)
+}
+
+export function writeFramePreAllocated(frame: Buffer, len: number, fin = true) {
+    const mask = false
+    const p = len <= 125 ? len : len <= 65536 ? 126 : 127
+
+    frame[0] = ((fin ? 1 : 0) << 7) | Opcode.Binary
+    frame[1] = ((mask ? 1 : 0) << 7) | p
+
+    if (p === 126) {
+        frame.writeUint16BE(len, 2)
+    } else if (p === 127) {
+        frame.writeBigUint64BE(BigInt(len), 2)
+    }
+
+    return frame
+}
+
+export function createFrame(op: Opcode, payload?: Buffer, maskingKey?: number, fin = true) {
     if (payload === undefined) {
         return Buffer.of(((fin ? 1 : 0) << 7) | op)
     }
@@ -664,8 +1270,7 @@ function createFrame(op: Opcode, payload?: Buffer, maskingKey?: number, fin = tr
     pos = frame.writeUint8((mask ? 1 : 0) << 7 | p, pos)
     if (p === 126) {
         pos = frame.writeUint16BE(payload.length, pos)
-    }
-    if (p === 127) {
+    } else if (p === 127) {
         pos = frame.writeBigUint64BE(BigInt(payload.length), pos)
     }
     if (mask) {
@@ -681,7 +1286,6 @@ function createFrame(op: Opcode, payload?: Buffer, maskingKey?: number, fin = tr
         }
     } else {
         frame.set(payload, pos)
-        pos += payload.length
     }
 
     return frame
@@ -695,13 +1299,104 @@ interface Frame {
     // Only relevant for partial frames
     maskingKey?: number
     remainingLength?: number
+
+    carry?: Buffer
 }
 
-function readFrame(buf: Buffer): Frame {
+function readFrameSize(buf: Buffer) {
+    const h = buf.readUint8(1) & 0x7F
+    switch (h) {
+        case 126:
+            return buf.readUint16BE(2)
+        case 127: {
+            const len = buf.readBigUint64BE(2)
+            if (len > Number.MAX_SAFE_INTEGER) {
+                throw new Error('Payload too big')
+            }
+            return Number(len)
+        }
+    }
+    return h
+}
+
+function canReadClientFrame(buf: Buffer) {
+    if (buf.byteLength < 2) return false
+
+    const h = buf[1]
+    const mask = (h & 0x80) === 0x80
+    const base = mask ? 6 : 2
+
+    switch (h & 0x7F) {
+        case 126:
+            return buf.byteLength >= base+2
+        case 127:
+            return buf.byteLength >= base+8
+    }
+
+    return buf.byteLength >= base
+}
+
+function willNeedMoreData(buf: Buffer) {
+    const h = buf[1]
+    const mask = (h & 0x80) === 0x80
+    const base = mask ? 6 : 2
+    const l = h & 0x7F
+
+    switch (l) {
+        case 126: {
+            const len = buf.readUint16BE(2)
+            return buf.byteLength - (base+2) > len
+        }
+        case 127:
+            return buf.byteLength >= base+8
+    }
+    return buf.byteLength - base > l
+}
+
+function canReadClientFrame2(buf: Buffer, bufLen: number, buf2: Buffer) {
+    const size = bufLen + buf2.byteLength
+    if (size < 2) return false
+
+    const h = bufLen <= 1 ? buf2[1-bufLen] : buf[1]
+    const mask = (h & 0x80) === 0x80
+    const base = mask ? 6 : 2
+
+    switch (h & 0x7F) {
+        case 126:
+            return size >= base+2
+        case 127:
+            return size >= base+8
+    }
+
+    return size >= base
+}
+
+function setupPartialFrame(buf: Buffer, bufLen: number, buf2: Buffer) {
+    const h = bufLen <= 1 ? buf2[1-bufLen] : buf[1]
+    const mask = (h & 0x80) === 0x80
+    const base = mask ? 6 : 2
+
+    let end = base
+    switch (h & 0x7F) {
+        case 126:
+            end = base+2
+            break
+        case 127:
+            end = base+8
+            break
+    }
+
+    buf.set(buf2.subarray(0, end-bufLen), bufLen)
+
+    return end
+}
+
+
+function readFrame(buf: Buffer, payloadBuf: Buffer): Frame {
     let pos = 0
-    const h1 = buf.readUint8(pos)
+    const h1 = buf[pos]
     pos += 1
-    const h2 = buf.readUint8(pos)
+    const h2 = buf[pos]
     pos += 1
 
     const fin = (h1 & 0x80) === 0x80
@@ -709,7 +1404,7 @@ function readFrame(buf: Buffer): Frame {
     const op = h1 & 0x0F
     const mask = (h2 & 0x80) === 0x80
     const p1 = h2 & 0x7F
-    
+
     let len: bigint | number = p1
     if (len === 126) {
         len = buf.readUInt16BE(pos)
@@ -729,7 +1424,15 @@ function readFrame(buf: Buffer): Frame {
         pos += 4
     }
 
-    const [payload, remainingLength] = readFrameIntoPayload(buf, len, pos, maskingKey)
+    const [payload, remainingLength] = readFrameIntoPayload(buf, len, pos, maskingKey, payloadBuf.subarray(0, len))
+
+    let carry: Buffer | undefined
+    if ((len + pos) < buf.byteLength) {
+        if (remainingLength) {
+            throw new Error(`??? buf: ${buf.byteLength} len: ${len} pos: ${pos} reminaing: ${remainingLength}`)
+        }
+        carry = buf.subarray(len + pos)
+    }
 
     return {
         fin,
@@ -737,6 +1440,7 @@ function readFrame(buf: Buffer): Frame {
         maskingKey,
         remainingLength,
         op: op as Opcode,
+        carry,
     }
 }
 
@@ -778,7 +1482,7 @@ function readFrameIntoPayload(buf: Buffer, len: number, pos: number, maskingKey?
             payload.writeUint8(buf.readUint8(pos + i) ^ k, offset + i)
         }
     } else {
-        payload.set(Uint8Array.prototype.slice.call(buf, pos, pos + len), offset)
+        payload.set(buf.subarray(pos, pos + len), offset)
     }
 
     return [payload, remainingLength] as const

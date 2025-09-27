@@ -14,14 +14,15 @@ import { QualifiedBuildTarget, resolveBuildTarget } from '../build/builder'
 import { runCommand } from '../utils/process'
 import { toAbsolute, toDataPointer } from '../build-fs/pointers'
 import { glob } from '../utils/glob'
-import { getCiType, gzip, makeExecutable, memoize, throwIfNotFileNotFoundError, tryReadJson } from '../utils'
+import { getCiType, gunzip, gzip, makeExecutable, memoize, throwIfNotFileNotFoundError, tryReadJson } from '../utils'
 import { getLogger } from '../logging'
 import { createZipFromDir } from '../deploy/deployment'
 import { tmpdir } from 'node:os'
 import { bundleExecutable, bundlePkg } from '../closures'
-import { buildWindowsShim } from '../zig/compile'
+import { buildWindowsShim, downloadNodeLib } from '../zig/compile'
 import { makeSea, resolveAssets } from '../build/sea'
 import { logToStderr } from './logger'
+import { ensureDir } from '../system'
 
 const integrations = {
     'synapse-aws': 'integrations/aws',
@@ -47,7 +48,40 @@ export async function downloadIntegrations(dest: string, included?: string[]) {
     const include = included ? new Set(included) : undefined
     const deps = Object.keys(integrations).filter(k => !include || include.has(k))
 
-    await downloadSynapsePackages(packagesDir, deps)
+    if (!process.env.SYNAPSE_USE_PIPELINE_FS) {
+        return await downloadSynapsePackages(packagesDir, deps)
+    }
+
+    const getPipelineDeps = () => {
+        const data = process.env.SYNAPSE_PIPELINE_DEPS
+        if (!data) {
+            throw new Error('missing pipeline deps')
+        }
+
+        return JSON.parse(data) as Record<string, string | { stepKeyHash: string; gitRef?: string; repoUrl?: string }>
+    }
+
+    const pipelineDeps = getPipelineDeps()
+
+    for (const d of deps) {
+        const key = pipelineDeps[d]
+        if (!key) {
+            throw new Error(`missing pipeline dep hash: ${d}`)
+        }
+
+        console.log('downloading', d, '-->', key)
+        const tmpDest = path.resolve(packagesDir, `tmp`)
+        await ensureDir(tmpDest)
+        const args = ['download', `runs/${key}/package`, dest]
+        await runCommand('pipeline-fs', args, { stdio: 'inherit', shell: '/usr/bin/bash' })
+        const tarball = await getFs().readFile(tmpDest)
+        await getFs().deleteFile(tmpDest)
+        const files = extractTarball(await gunzip(tarball))
+        await Promise.all(files.map(async f => {
+            const absPath = path.resolve(dest, f.path)
+            await getFs().writeFile(absPath, f.contents, { mode: f.mode })
+        }))
+    }
 }
 
 const baseUrl = 'https://nodejs.org/download/release'
@@ -166,7 +200,7 @@ async function maybeUseGithubArtifact(ref: string, target: QualifiedBuildTarget,
     }
 
     async function downloadAndExtract(url: string) {
-        const archive = await github.fetchData(url)
+        const archive = await github.fetchData(url, undefined, true)
 
         const files = await listFilesInZip(archive)
         if (files.length === 0) {
@@ -222,6 +256,7 @@ async function findLibtoolFromClang(clangPath: string) {
     return res
 }
 
+// opt/homebrew/opt/llvm/bin/clang  
 const homebrewClangPath = '/opt/homebrew/bin/clang'
 
 // Needs python + ninja installed
@@ -1036,6 +1071,8 @@ export async function internalBundle(target?: string, opt: any = {}) {
             path.resolve(outdir, 'dist', 'shim.exe'),
             await getFs().readFile(shimPath)
         )
+
+        await downloadNodeLib('Cohesible', 'synapse-node-private', outdir)
     }
 
     const jsLibRelPath = path.join('zig', 'lib', 'js.zig')
@@ -1082,16 +1119,55 @@ export async function internalBundle(target?: string, opt: any = {}) {
         const tarballPath = `${outdir}.tgz`
         await createArchive(outdir, tarballPath, shouldSign && !opt.seaPrep)
 
-        return publishToRemote({
-            ref: opt.pipelined,
-            tarballPath,
-            visibility: opt.visibility === 'public' ? 'public' : opt.visibility === 'private' ? 'private' : undefined,
-        })
+        if (!process.env.SYNAPSE_USE_PIPELINE_FS) {
+            return publishToRemote({
+                ref: opt.pipelined,
+                tarballPath,
+                visibility: opt.visibility === 'public' ? 'public' : opt.visibility === 'private' ? 'private' : undefined,
+            })
+        }
+
+        const args = ['upload', `runs/${opt.pipelined}/package`, tarballPath]
+        await runCommand('pipeline-fs', args, { stdio: 'inherit', shell: '/usr/bin/bash' })
+
+        return
     }
 
     // darwin we use `.zip` for signing
     const extname = opt.seaPrep || os === 'linux' ? '.tgz' : '.zip'
     await createArchive(outdir, `${outdir}${extname}`, shouldSign && !opt.seaPrep)
+}
+
+export async function convertBundleToSea(dir: string) {
+    const nodePath = path.resolve(dir, 'bin', process.platform === 'win32' ? 'node.exe' : 'node')
+    await makeExecutable(nodePath)
+
+    const bundledCliPath = path.resolve(dir, 'dist', 'cli.js')
+    const assets: Record<string, string> = {}
+    const assetsDir = path.resolve(dir, 'assets')
+    const hasAssets = await getFs().fileExists(assetsDir)
+    if (hasAssets) {
+        for (const f of await getFs().readDirectory(assetsDir)) {
+            if (f.type === 'file') {
+                assets[`sea-asset:${f.name}`] = path.resolve(assetsDir, f.name)
+            }
+        }
+    }
+
+    const seaDest = path.resolve(dir, 'bin', process.platform === 'win32' ? 'synapse.exe' : 'synapse')
+    await makeSea(bundledCliPath, nodePath, seaDest, {
+        assets,
+        sign: true,
+    })
+
+    await getFs().deleteFile(nodePath)
+    await getFs().deleteFile(bundledCliPath)
+    await getFs().deleteFile(path.resolve(dir, 'node_modules')).catch(throwIfNotFileNotFoundError)
+    if (hasAssets) {
+        await getFs().deleteFile(path.resolve(dir, 'assets'))
+    }
+
+    await createArchive(dir, `${dir}${process.platform === 'linux' ? `.tgz` : '.zip'}`, false)
 }
 
 export async function main(...args: string[]) {

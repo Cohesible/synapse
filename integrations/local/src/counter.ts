@@ -6,9 +6,7 @@ import { randomUUID } from 'node:crypto'
 export class Counter implements storage.Counter {
     private readonly bucket = new storage.Bucket()
 
-    constructor(private readonly init: number = 0) {
-        
-    }
+    constructor(private readonly init: number = 0) {}
 
     async get(): Promise<number> {
         const data = await this.bucket.get('counter', 'utf-8')
@@ -26,7 +24,7 @@ export class Counter implements storage.Counter {
     async inc(amount = 1): Promise<number> {
         const currentVal = await this.get()
         const newVal = currentVal + amount
-        await this.set(newVal)
+        await this.bucket.put('counter', JSON.stringify(newVal))
 
         return newVal
     }

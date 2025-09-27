@@ -232,11 +232,22 @@ export function resolveBareSpecifier(spec: string, pkg: PackageJson, mode: 'cjs'
     const pkgType = pkg.type === 'module' ? 'esm' : 'cjs'
     const defaultModuleType = mode === 'synapse' ? pkgType : mode
 
+    // Apparently both `node` and `default` can be ESM or CJS, which is confusing.
     if (pkg.exports) {
         const conditions = getConditions(mode)
         const resolved = resolveExport(target, pkg.exports, conditions, defaultEntrypoint)
 
         if (typeof resolved === 'string') {
+            // TODO: how deep do we want to go w/ node compat?
+            // Synapse renders tons of existing tech obsolete. Time may be better spent moving forward.
+            //
+            // if (resolved.endsWith('.cjs')) {
+            //     return {
+            //         fileName: resolved,
+            //         moduleType: 'cjs',
+            //     }
+            // }
+
             return {
                 fileName: resolved,
                 moduleType: mode === 'synapse' ? (resolved === pkg.main ? 'cjs' : resolved === pkg.module ? 'esm' : pkgType) : pkgType,
@@ -859,24 +870,30 @@ function createSprRepoWrapper(
         return npmRepo.getPackageJson(name, version)
     }
 
+    async function maybeExtractTarballPackage(spec: string, pattern: string) {
+        if (!pattern.endsWith('.tgz')) {
+            return pattern
+        }
+
+        const location = path.resolve(workingDirectory, pattern.slice(5))
+        const data = Buffer.from(await fs.readFile(location))
+        const dest = path.resolve(getPackageCacheDirectory(), 'extracted', getHash(data))   
+
+        if (!(await fs.fileExists(dest))) {
+            getLogger().log(`Extracting specifier "${spec}" to:`, dest)
+            await extractPackage(await gunzip(data), dest, false)
+        }
+
+        return `file:${dest}`
+    }
+
     async function resolvePattern(spec: string, pattern: string) {
         if (spec.startsWith(toolPrefix)) {
             return toolRepo.resolvePattern(spec, pattern)
         }
 
         if (pattern.startsWith('file:')) {
-            if (pattern.endsWith('.tgz')) {
-                const location = path.resolve(workingDirectory, pattern.slice(5))
-                const data = Buffer.from(await fs.readFile(location))
-                const dest = path.resolve(getPackageCacheDirectory(), 'extracted', getHash(data))   
-
-                if (!(await fs.fileExists(dest))) {
-                    getLogger().log(`Extracting specifier "${spec}" to:`, dest)
-                    await extractPackage(await gunzip(data), dest, false)
-                }
-
-                pattern = `file:${dest}`
-            }
+            pattern = await maybeExtractTarballPackage(spec, pattern)
 
             const resolved = await fileRepo.resolvePattern(spec, pattern.slice(5))
             workspacePackages.set(resolved.name, { version: resolved.version, location: pattern.slice(5) })
@@ -894,7 +911,10 @@ function createSprRepoWrapper(
             if (!pipelineDeps?.[name]) {
                 const override = await getPackageOverride(name)
                 if (override) {
-                    return { name: `file:${override}`, version: parseVersionConstraint('*') }
+                    pattern = `file:${override}`
+                    pattern = await maybeExtractTarballPackage(spec, pattern)
+
+                    return { name: pattern, version: parseVersionConstraint('*') }
                 }
             }
 
@@ -3871,7 +3891,7 @@ export function createPackageInstaller(params?: PackageInstallerParams) {
         const deps: Record<string, string> = {}
         if (mappings) {
             for (const [k, v] of Object.entries(mappings)) {
-                if (v.locationType === 'package') {
+                if (v.locationType === 'package' || v.source?.type === 'package') {
                     if (v.source?.type === 'package' && v.source.data.packageHash) {
                         deps[k] = v.source.data.packageHash
                     }

@@ -47,9 +47,9 @@ export async function fetchJson<T>(url: string): Promise<T> {
     })
 }
 
-export async function fetchData(url: string, accept?: string) {
+export async function fetchData(url: string, accept?: string, bearer?: boolean) {
     const token = getToken()
-    const authHeaders = token ? { authorization: `token ${token}` } : undefined
+    const authHeaders = token ? { authorization: `${bearer ? 'Bearer' : 'token'} ${token}` } : undefined
     const base = {
         ...authHeaders,
         'user-agent': 'synapse',

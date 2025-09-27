@@ -325,6 +325,21 @@ function renderAssets(assets: AssetsMap) {
 // /** @jsxFrag Fragment */
 // import { h, Fragment } from 'preact'
 
+const useSynapseJsx = false
+
+// These are only for computed nodes
+
+const enum JsxIntrinsicType {
+    _ = 0,
+
+    // Expressions
+    Child,
+    SpreadChild,
+
+    Attribute = 20,
+    SpreadAttribute,
+}
+
 function transformJsx(
     node: ts.Node, 
     jsxImport: ts.Identifier,
@@ -337,11 +352,24 @@ function transformJsx(
     const staticChildren = new WeakMap<ts.Expression, boolean>()
 
     const tagStack: (ts.StringLiteral | ts.Identifier)[] = []
+    const componentsStack: ComponentScope[] = [{
+        ids: 0,
+        expressions: [],
+    }]
+
+    interface ComponentScope {
+        ids: number
+        expressions: ts.Expression[]
+    }
 
     function isInImgTag() {
         return tagStack[tagStack.length - 1]?.text === 'img'
     }
     
+    function nextId() {
+        return componentsStack[componentsStack.length - 1].ids += 1
+    }
+
     function getType(node: ts.JsxTagNameExpression) {
         if (ts.isIdentifier(node)) {
             if (node.text.charAt(0).toUpperCase() === node.text.charAt(0)) {
@@ -386,6 +414,15 @@ function transformJsx(
             if (node.initializer.expression && ts.isObjectLiteralExpression(node.initializer.expression)) {
                 return [node.name.text, transformInlineStyle(node.initializer.expression)]
             }
+        }
+
+        if (useSynapseJsx && ts.isJsxExpression(node.initializer)) {
+            return [
+                node.name.text, 
+                createVNode(factory.createNumericLiteral(JsxIntrinsicType.Attribute), {
+                    children: visitAttributeValue(node.initializer),
+                })
+            ]
         }
 
         return [node.name.text, visitAttributeValue(node.initializer)]
@@ -461,11 +498,65 @@ function transformJsx(
         attributes?: ts.ObjectLiteralElementLike[]
     }
 
+    function maybeExtractFns() {
+        if (tagStack.length !== 0) {
+            return
+        }
+
+        const fns = componentsStack[componentsStack.length - 1].expressions.map(x => {
+            return factory.createArrowFunction(undefined, undefined, [], undefined, undefined, x)
+        })
+
+        componentsStack[componentsStack.length - 1].expressions.length = 0
+
+        return fns
+    }
+
     function createVNode(type: ts.Expression, props?: VNodeProps) {
+        if (useSynapseJsx && ts.isNumericLiteral(type)) {
+            const arr = componentsStack[componentsStack.length - 1].expressions
+            const id = arr.length
+            arr.push(props!.children!)
+
+            return factory.createCallExpression(
+                jsxExp,
+                undefined,
+                [type, factory.createNumericLiteral(id)]
+            )
+        }
+
         const key = props?.key
         const elements = props?.attributes ?? []
         if (props?.children) {
             elements.push(createPropertyAssignment(factory, 'children', props.children))
+        }
+
+        if (useSynapseJsx && (!ts.isStringLiteral(type) || tagStack.length === 0)) {
+            // Relative to the component, not assigned for global tags
+            const id = nextId()
+            if (id !== undefined) {
+                const fns = maybeExtractFns()
+                const props: ts.PropertyAssignment[] = [
+                    createPropertyAssignment(factory, '#id', factory.createNumericLiteral(id)),
+                    createPropertyAssignment(
+                        factory, 
+                        'structure', 
+                        factory.createArrowFunction(undefined, undefined, [], undefined, undefined, factory.createObjectLiteralExpression(elements, true))
+                    )
+                ]
+
+                if (fns) {
+                    props.push(createPropertyAssignment(factory, 'fns', fns))
+                }
+
+                const attrExp = factory.createObjectLiteralExpression(props, true)
+
+                return factory.createCallExpression(
+                    jsxExp,
+                    undefined,
+                    !key ? [type, attrExp] : [type, attrExp, key]
+                )
+            }
         }
 
         const attrExp = factory.createObjectLiteralExpression(elements, true)
@@ -485,6 +576,21 @@ function transformJsx(
             .map(c => {
                 if (ts.isJsxText(c)) {
                     return factory.createStringLiteral(c.text)
+                }
+
+                if (useSynapseJsx && ts.isJsxExpression(c)) {
+                    const v = visitAttributeValue(c)
+                    if (ts.isSpreadElement(v)) {
+                        return createVNode(
+                            factory.createNumericLiteral(JsxIntrinsicType.SpreadChild),
+                            { children: v.expression }
+                        )
+                    }
+
+                    return createVNode(
+                        factory.createNumericLiteral(JsxIntrinsicType.Child),
+                        { children: v }
+                    )
                 }
 
                 return visitAttributeValue(c)
@@ -575,6 +681,14 @@ function transformJsx(
             }
 
             return visit(node.expression)
+        }
+
+        if (useSynapseJsx && (ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) || ts.isArrowFunction(node))) {
+            componentsStack.push({ ids: 0, expressions: [] })
+            const ret = ts.visitEachChild(node, visit, context)
+            componentsStack.pop()
+
+            return ret
         }
 
         return ts.visitEachChild(node, visit, context)
@@ -1833,6 +1947,7 @@ export function createRuntimeTransformer(
     resourceTypeChecker?: ResourceTypeChecker
 ): (node: ts.Node) => ts.Node {
     const context = getNullTransformationContext()
+    let jsxRuntime: ReturnType<typeof compiler.getJsxRuntime> | undefined
 
     function visitCallExpression(node: ts.CallExpression) {
         const sym = node.expression.getSourceFile() ? compiler.getSymbol(node.expression) : undefined
@@ -1868,6 +1983,28 @@ export function createRuntimeTransformer(
                     ts.factory.createStringLiteral(spec.replace(/\.zig$/, '.zig.js')),
                     undefined,
                 )
+            }
+        }
+
+        if (jsxRuntime && ts.isFunctionDeclaration(node)) {
+            // Not optimal. Makes redundant passes for nested function decls.
+            return transformJsx(
+                ts.visitEachChild(node, visit, context),
+                jsxRuntime.ident,
+                new Map()
+            )
+        }
+
+        if (ts.isSourceFile(node)) {
+            if (node.fileName.endsWith('.tsx')) {
+                jsxRuntime = compiler.getJsxRuntime()
+                const r = ts.visitEachChild(node, visit, context)
+                const sf =ts.factory.updateSourceFile(r, [
+                    jsxRuntime.decl,
+                    ...r.statements,
+                ])
+                jsxRuntime = undefined
+                return sf
             }
         }
 
