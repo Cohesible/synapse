@@ -16,6 +16,7 @@ import { getLogger, runTask } from '../logging'
 import { passthroughZig, downloadNodeLib } from '../zig/compile'
 import { internalBundle, convertBundleToSea } from './buildInternal'
 import { installVsCodeZigExtension } from '../zig/installer'
+import { getAst } from '../zig/ast'
 
 
 interface TypeMap {
@@ -1051,6 +1052,18 @@ registerTypedCommand(
 )
 
 registerTypedCommand(
+    'parse-zig',
+    {
+        internal: true,
+        args: [{ name: 'file', type: 'string' }],
+    },
+    async (...args) => {
+        const [[f], opt] = unpackArgs(args)
+        console.log(await getAst(f))
+    },
+)
+
+registerTypedCommand(
     'login',  
     {
         internal: true,
@@ -1209,7 +1222,7 @@ registerTypedCommand(
         options: [
             ...buildTargetOptions,
             { name: 'no-deploy', type: 'boolean' },
-            { name: 'eval', type: 'string', hidden: true }
+            { name: 'eval', type: 'string', hidden: true, aliases: ['e'] }
         ],
     },
     (a, opt) => synapse.replCommand(a, {
@@ -1454,9 +1467,10 @@ registerTypedCommand(
 )
 
 registerTypedCommand(
-    'taint', 
+    'replace', 
     {
         hidden: true,
+        aliases: ['taint'],
         args: [{ name: 'resourceId', type: 'string' }],
     }, 
     (a, opt) => synapse.taint(a, opt)

@@ -135,25 +135,35 @@ async function _getZigCompilationGraph(roots: string[], workingDir: string) {
     const hasher = getFileHasher()
     const cache = await getCache()
 
+    const stack: string[] = []
+
     async function _visit(f: string) {
         const absPath = path.resolve(workingDir, f)
         const relPath = makeRelative(workingDir, absPath)
+
+        stack.push(absPath)
 
         const hash = await hasher.getHash(absPath)
         if (cache.files[relPath]?.hash === hash) {
             let didChange = false
             for (const d of cache.files[relPath].deps ?? []) {    
-                if (await visit(d)) {
+                if (!stack.includes(d) && await visit(d)) {
                     didChange = true
                 }
             }    
+
+            stack.pop()
 
             return didChange
         }
 
         const { ast, deps } = await getImportedModulesFromFile(absPath)
+        asts.set(absPath, ast)
+
         for (const d of deps) {
-            await visit(d)
+            if (!stack.includes(d)) {
+                await visit(d)
+            }
         }
 
         if (!cache.files[relPath]) {
@@ -174,8 +184,7 @@ async function _getZigCompilationGraph(roots: string[], workingDir: string) {
             cache.files[relPath].needsRegistration = undefined
         }
 
-        asts.set(absPath, ast)
-
+        stack.pop()
         return true
     }
 
@@ -227,14 +236,14 @@ function getInst() {
     }
 
     if (!isSea) {
-        return inst = { exports: require('./${relPath}') };
+        return inst = { exports: require('./${relPath}') }
     }
     
-    const source = require('raw-sea-asset:./${relPath}');
-    const typedArray = new Uint8Array(source.buffer);
-    const wasmModule = new WebAssembly.Module(typedArray);
+    const source = require('raw-sea-asset:./${relPath}')
+    const typedArray = new Uint8Array(source.buffer)
+    const wasmModule = new WebAssembly.Module(typedArray)
 
-    return inst = new WebAssembly.Instance(wasmModule, { env: {} });
+    return inst = new WebAssembly.Instance(wasmModule, { env: {} })
 }
 
 function allocCString(str) {
@@ -251,10 +260,13 @@ function allocCString(str) {
 function readCString(p) {
     let i = p
     const mem = new Uint8Array(inst.exports.memory.buffer)
-    while (mem[i] !== 0 && i < mem.byteLength) i++;
+    while (i < mem.byteLength && mem[i] !== 0) i++
 
     const arr = mem.subarray(p, i)
-    return Buffer.from(arr).toString('utf-8')
+    const result = Buffer.from(arr).toString('utf-8')
+    inst.exports.free_ptr(p, i - p)
+
+    return result
 }
 
 ${bindings.map(b => {
@@ -302,37 +314,37 @@ function init() {
         return
     }
 
-    const path = require('node:path');
+    const path = require('node:path')
     if (!isSea) {
-        const p = path.resolve(__dirname, '${relPath}');
-        process.dlopen(module, p);
-        didInit = true;
+        const p = path.resolve(__dirname, '${relPath}')
+        process.dlopen(module, p)
+        didInit = true
 
-        return;
+        return
     }
 
-    const source = require('raw-sea-asset:./${relPath}');
-    const synapseInstall = process.env.SYNAPSE_INSTALL ?? path.resolve(require('node:os').homedir(), '.synapse');
+    const source = require('raw-sea-asset:./${relPath}')
+    const synapseInstall = process.env.SYNAPSE_INSTALL ?? path.resolve(require('node:os').homedir(), '.synapse')
     const name = process.platform === 'win32' ? source.hash + '.synapse' : source.hash
-    const dest = path.resolve(synapseInstall, 'cache', 'dlls', name);
-    const fs = require('node:fs');
+    const dest = path.resolve(synapseInstall, 'cache', 'dlls', name)
+    const fs = require('node:fs')
     if (!fs.existsSync(dest)) {
-        fs.mkdirSync(path.dirname(dest), { recursive: true });
-        fs.writeFileSync(dest, new Uint8Array(source.buffer));
+        fs.mkdirSync(path.dirname(dest), { recursive: true })
+        fs.writeFileSync(dest, new Uint8Array(source.buffer))
     }
 
-    process.dlopen(module, dest);
-    didInit = true;
+    process.dlopen(module, dest)
+    didInit = true
 }
 
-module.exports['__esModule'] = true;
+module.exports['__esModule'] = true
 
 ${bindings.map(b => {
     return `
 module.exports['${b.name}'] = function (${b.params.filter(x => x.name !== 'this').map(x => x.name).join(', ')}) {
-    if (didInit) throw new Error('${b.name} did not initialize');
+    if (didInit) throw new Error('${b.name} did not initialize')
 
-    init();
+    init()
 
     return module.exports['${b.name}'](${b.params.filter(x => x.name !== 'this').map(x => x.name).join(', ')})
 }
@@ -354,15 +366,15 @@ function init() {
     const path = require('node:path');
     let dir = typeof __dirname !== 'undefined' ? __dirname : undefined
     if (!dir) {
-        const { fileURLToPath } = require('node:url');
+        const { fileURLToPath } = require('node:url')
         const __filename = fileURLToPath(import.meta.url)
         dir = path.dirname(__filename)
     }
 
-    const p = path.resolve(dir, '${relPath}');
-    process.dlopen(module, p);
-    didInit = true;
-    bind();
+    const p = path.resolve(dir, '${relPath}')
+    process.dlopen(module, p)
+    didInit = true
+    bind()
 }
 
 function bind() {
@@ -372,7 +384,7 @@ function bind() {
 ${bindings.map(b => {
     return `
 export function ${b.name}(${b.params.map(mapParamName).join(', ')}) {
-    init();
+    init()
 
     return module.exports['${b.name}'](${b.params.map(mapParamName).join(', ')})
 }
@@ -821,7 +833,7 @@ async function maybeGetProcessedFilePath(file: string) {
     return file
 }
 
-async function compileZig(file: string, opt: ResolvedProgramConfig, target: CompileTarget = 'wasm') {    
+async function compileZig(file: string, opt: ResolvedProgramConfig, target: CompileTarget = 'wasm', sourceHash?: string) {    
     const bindings = await generateTsZigBindings(file)
 
     const exportedModuleFunctions = bindings.exportedFunctions.filter(x => x.isModuleExport)
@@ -937,6 +949,7 @@ async function compileZig(file: string, opt: ResolvedProgramConfig, target: Comp
                 binding: Buffer.from(stubText).toString('base64'),
                 bindingLocation: outfile,
                 sourceName: source,
+                sourceHash,
             }
 
             async function writeStub() {
@@ -973,10 +986,12 @@ async function compileZig(file: string, opt: ResolvedProgramConfig, target: Comp
     }
 }
 
-export async function compileAllZig(files: string[], config: ResolvedProgramConfig) {
+export async function compileAllZig(graph: NonNullable<Awaited<ReturnType<typeof getZigCompilationGraph>>>, config: ResolvedProgramConfig) {
     // TODO: see if Zig plays nice with parallel execution
-    for (const f of files) {
-        const res = await compileZig(f, config).catch(async err => {
+    const workingDir = getWorkingDir()
+    for (const f of graph.changed) {
+        const hash = graph.files[makeRelative(workingDir, f)].hash
+        const res = await compileZig(f, config, undefined, hash).catch(async err => {
             await clearCacheEntry(f)
 
             throw err

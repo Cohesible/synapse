@@ -130,7 +130,7 @@ export function createProgramBuilder(
             if (!config.tsc.cmd.options.allowArbitraryExtensions) {
                 throw new Error('Compiling with Zig modules requires adding "allowArbitraryExtensions" to your tsconfig.json "compilerOptions" section')
             }
-            await runTask('zig', 'compile', () => compileAllZig([...zigGraph.changed], config), 100)
+            await runTask('zig', 'compile', () => compileAllZig(zigGraph, config), 100)
         }
 
         const changed = compilation.changed

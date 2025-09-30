@@ -32,7 +32,6 @@ function getClassDecl(sf: ts.SourceFile) {
 // It's safe to do this when a complete closure graph contains class prototypes 
 // that are strictly referenced in terms of instances _and_ nothing attempts to
 // call the class constructor indirectly via `<instance>.constructor` (very unlikely)
-//
 function pruneClassInitializers(sf: ts.SourceFile) {
     // TODO: support ESM export declarations
     const decl = sf.statements.find(ts.isFunctionDeclaration) ?? sf.statements.find(isModuleExport)?.expression.right

@@ -2018,6 +2018,9 @@ export function createSerializer(
     compiler: ReturnType<typeof createGraphCompiler>,
     resourceTypeChecker?: ResourceTypeChecker
 ) {
+    const moduleType = compiler.moduleType
+    const patchedDefaultExports = new Set<Symbol>()
+
     const names = new Set<string>()
     const nameMap = new Map<ts.Node, string>()
     function getUniqueName(node: ts.Node, name: string) {
@@ -2065,6 +2068,8 @@ export function createSerializer(
         jsxRuntime?: ts.Identifier,
         depth = 0
     ) {
+        const factory = context.factory
+
         // Only set for jsx currently
         let markedForUseServer: Set<ts.Node> | undefined
 
@@ -2079,21 +2084,21 @@ export function createSerializer(
 
         // Why is this prefixed `hoist` when it doesn't hoist anything?
         function hoistSerializationData(node: ts.FunctionDeclaration, name: string, captured: ts.Expression[]) {
-            const serializationData = createSerializationData(name, captured, context.factory, compiler.moduleType)
+            const serializationData = createSerializationData(name, captured, factory, moduleType)
             addStatementUpdate(ts.getOriginalNode(node) as ts.Statement, {
-                after: [addModuleSymbolToFunction(node, serializationData, context.factory)]
+                after: [addModuleSymbolToFunction(node, serializationData, factory)]
             })
         }
 
         function addClassMethodSerialization(node: ts.MethodDeclaration, name: string, captured: ts.Expression[]) {
-            const serializationData = createSerializationData(name, captured, context.factory, compiler.moduleType)
-            const instrumentation = addModuleSymbolToMethod(node, serializationData, context.factory)
+            const serializationData = createSerializationData(name, captured, factory, moduleType)
+            const instrumentation = addModuleSymbolToMethod(node, serializationData, factory)
             staticStack[staticStack.length-1].push(instrumentation)
         }
 
         // TODO: methods in object literals
         function addObjectMethodSerialization(node: ts.MethodDeclaration, name: string, captured: ts.Expression[]) {
-            const serializationData = createSerializationData(name, captured, context.factory, compiler.moduleType)
+            const serializationData = createSerializationData(name, captured, factory, moduleType)
             const statement = ts.findAncestor(ts.getOriginalNode(node), ts.isStatement)
    
             // const parent = ts.getOriginalNode(node).parent
@@ -2101,7 +2106,7 @@ export function createSerializer(
             //     return
             // }
 
-            const instrumentation = addModuleSymbolToMethod(node, serializationData, context.factory)
+            const instrumentation = addModuleSymbolToMethod(node, serializationData, factory)
             // if (instrumentation) {
             //     addStatementUpdate(parent, { after: [instrumentation] })
             // }
@@ -2109,13 +2114,13 @@ export function createSerializer(
         }
 
         function addUseServerSymbol(node: ts.FunctionDeclaration | ts.VariableDeclaration) {
-            const sym = createSymbolPropertyName('synapse.useServer', context.factory)
+            const sym = createSymbolPropertyName('synapse.useServer', factory)
 
             function createAssignment(ident: ts.Identifier) {
-                return context.factory.createExpressionStatement(
-                    context.factory.createAssignment(
-                        context.factory.createElementAccessExpression(ident, sym),
-                        context.factory.createTrue(),
+                return factory.createExpressionStatement(
+                    factory.createAssignment(
+                        factory.createElementAccessExpression(ident, sym),
+                        factory.createTrue(),
                     )
                 )
             }
@@ -2136,6 +2141,30 @@ export function createSerializer(
         const boundSymbolExpressions = new Map<Symbol, ts.Expression>()
         function renderSymbol(symbol: Symbol, mapping: SymbolMapping, depth: number) {
             if (!mapping.bound) {
+                if (depth === 0 && moduleType === 'cjs' && mapping.isDefault && !patchedDefaultExports.has(symbol)) {
+                    patchedDefaultExports.add(symbol)
+                    const node = symbol.importClause!.parent
+                    const moveSymbolExp = factory.createElementAccessExpression(factory.createIdentifier(symbol.name), createSymbolPropertyName('__moveable__2', factory))
+                    const b = factory.createExpressionStatement(
+                        factory.createAssignment(
+                            factory.createPropertyAccessExpression(
+                                factory.createElementAccessExpression(
+                                    factory.createPropertyAccessExpression(
+                                        factory.createCallExpression(moveSymbolExp, undefined, undefined),
+                                        'operations'
+                                    ),
+                                    0
+                                ),
+                                '_d'
+                            ),
+                            factory.createTrue()
+                        )
+                    )
+                    addStatementUpdate(node as ts.Statement, {
+                        after: [b],
+                    })
+                }
+
                 return renderConstSymbol(symbol, mapping, depth)
             }
 
@@ -2201,7 +2230,7 @@ export function createSerializer(
             const excluded = clauseReplacement ? [clauseReplacement[0]] : undefined
 
             return {
-                ...compiler.compileNode(name, node, context.factory, runtimeTransformer, createInfraTransformer(name, innerTransformer), clauseReplacement, jsxRuntime, excluded, depth),
+                ...compiler.compileNode(name, node, factory, runtimeTransformer, createInfraTransformer(name, innerTransformer), clauseReplacement, jsxRuntime, excluded, depth),
                 clauseReplacement,
             }
         }
@@ -2304,7 +2333,7 @@ export function createSerializer(
                     getRelativeName(name),
                     renderCapturedSymbols(r.captured, r.assets),
                     factory,
-                    compiler.moduleType,
+                    moduleType,
                 ),
                 r.clauseReplacement,
                 staticStatements,
@@ -2340,7 +2369,7 @@ export function createSerializer(
             }
 
             const name = getName(node)
-            const r = compiler.compileNode(name, node, context.factory, runtimeTransformer, createInfraTransformer(name, innerTransformer), undefined, jsxRuntime, undefined, depth)
+            const r = compiler.compileNode(name, node, factory, runtimeTransformer, createInfraTransformer(name, innerTransformer), undefined, jsxRuntime, undefined, depth)
             addClassMethodSerialization(node, getRelativeName(name), renderCapturedSymbols(r.captured, r.assets))
 
             nameStack.push(name)
@@ -2356,7 +2385,7 @@ export function createSerializer(
             // }
 
             const name = getName(node)
-            const r = compiler.compileNode(name, node, context.factory, runtimeTransformer, createInfraTransformer(name, innerTransformer), undefined, jsxRuntime, undefined, depth)
+            const r = compiler.compileNode(name, node, factory, runtimeTransformer, createInfraTransformer(name, innerTransformer), undefined, jsxRuntime, undefined, depth)
 
             nameStack.push(name)
             const visitedFn = ts.visitEachChild(node, visit, context)
@@ -2368,9 +2397,9 @@ export function createSerializer(
                     getRelativeName(name),
                     renderCapturedSymbols(r.captured, r.assets),
                     factory,
-                    compiler.moduleType,
+                    moduleType,
                 ),
-                context.factory,
+                factory,
             )
         }
 
@@ -2385,7 +2414,7 @@ export function createSerializer(
             }
 
             const name = getName(node)
-            const r = compiler.compileNode(name, node, context.factory, runtimeTransformer, createInfraTransformer(name, innerTransformer), undefined, jsxRuntime, undefined, depth)
+            const r = compiler.compileNode(name, node, factory, runtimeTransformer, createInfraTransformer(name, innerTransformer), undefined, jsxRuntime, undefined, depth)
             hoistSerializationData(node, getRelativeName(name), renderCapturedSymbols(r.captured, r.assets))
 
             nameStack.push(name)
@@ -2398,7 +2427,7 @@ export function createSerializer(
         function visitBlock(node: ts.Block) {
             node = ts.visitEachChild(node, visit, context)
 
-            return context.factory.updateBlock(
+            return factory.updateBlock(
                 node,
                 Array.from(updateStatements(node.statements, updates)),
             )
@@ -2455,7 +2484,7 @@ export function createSerializer(
             node = ts.visitEachChild(node, visit, context)
             const statements = Array.from(updateStatements(node.statements, updates))
 
-            return context.factory.updateSourceFile(
+            return factory.updateSourceFile(
                 node,
                 statements,
                 node.isDeclarationFile,

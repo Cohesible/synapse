@@ -549,6 +549,11 @@ export function createrLoader(
             const globals = vm.runInContext('this', ctx)
             patchBind(globals.Function, globals.Object)
 
+            // XXX: this patches our own `freeze`
+            // Needed to make this work:
+            // module.exports = Object.freeze(o)
+            globals.Object.freeze = (o: any) => o 
+
             return {
                 globals: _globalThis,
                 vm: ctx,
@@ -844,6 +849,9 @@ export function createrLoader(
 
         const coreProvider = new (runtime.getCore()).Provider(providerParams as any)
         const targetProvider = new (runtime.getSrl()).Provider()
+
+        runtime.getContext().providerContext.registerTargetProvider(deployTarget!, targetProvider)
+
         const req = runtime.createRequire2(bootstrapPath)
 
         runTask('run', 'bootstrap', () => {
@@ -1301,17 +1309,20 @@ function createSerializationProxy(
             }
         }
 
-        const { module } = resolver.reverseLookup(op.module, op.location, op.virtualId)
+        // This is only for default imports in cjs
+        if (!op._patched) {
+            Object.defineProperty(op, '_patched', { value: true, enumerable: false })
+
+            const { module } = resolver.reverseLookup(op.module, op.location, op.virtualId)
+
+            delete op.location
+            delete op.virtualId
+            op.module = module
+        }
 
         return {
             valueType: 'reflection',
-            operations: [
-                {
-                    type: 'import', 
-                    module,
-                },
-                ...operations.slice(1)
-            ],
+            operations,
         }
     }
 
@@ -2118,6 +2129,16 @@ function createProviderContextStorage() {
         ctx.didCopy = true
     }
 
+    function registerTargetProvider(type: string, provider: any) {
+        const ctx = storage.getStore()
+        if (!ctx) {
+            return false
+        }
+
+        ctx.defaultProviders.set(type, provider)
+        return true
+    }
+
     function registerProvider(ctor: new () => any) {
         const ctx = storage.getStore()
         if (!ctx) {
@@ -2196,6 +2217,7 @@ function createProviderContextStorage() {
         registerProvider,
         registerLazyProvider,
         getDefaultProvider,
+        registerTargetProvider,
     }
 }
 

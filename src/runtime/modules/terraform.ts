@@ -106,35 +106,49 @@ function unwrapProxy(o: any): any {
 }
 
 function isJsonSerializeable(o: any, visited = new Set<any>()): boolean {
-    if (visited.has(o)) {
-        return false
-    }
-    visited.add(o)
-
-    if (typeof o === 'symbol' || typeof o === 'bigint') {
-        return false
-    }
-    if (typeof o === 'function') { 
-        return isCustomSerializeable(o)
-    }
-    if (typeof o !== 'object' || o === null || isCustomSerializeable(o)) {  // `undefined` is only implicitly serializeable
-        return true
-    }
-    if (Array.isArray(o)) {
-        return true
-    }
-    if (!isObjectOrNullPrototype(Object.getPrototypeOf(o))) {
-        return false
-    }
-
-    // This is somewhat lossy as we should only attempt to serialize 'simple' descriptors (value + writable + enumerable + configurable)
-    for (const desc of Object.values(Object.getOwnPropertyDescriptors(o))) {
-        if (desc.get || desc.set || !isJsonSerializeable(desc.value, visited)) {
+    switch (typeof o) {
+        case 'symbol':
+        case 'bigint':
             return false
-        }
-    }
 
-    return true
+        case 'boolean':
+        case 'string':
+        case 'number':
+        case 'undefined':
+            return true
+
+        case 'object':
+            if (o === null) {
+                return true
+            }
+            // falls thru
+        case 'function':
+            if (visited.has(o)) {
+                return false
+            }
+            visited.add(o)
+
+            if (typeof o === 'function') {
+                return isCustomSerializeable(o)
+            }
+
+            if (Array.isArray(o) || isCustomSerializeable(o)) {
+                return true
+            }
+
+            if (!isObjectOrNullPrototype(Object.getPrototypeOf(o))) {
+                return false
+            }
+
+            // This is somewhat lossy as we should only attempt to serialize 'simple' descriptors (value + writable + enumerable + configurable)
+            for (const desc of Object.values(Object.getOwnPropertyDescriptors(o))) {
+                if (desc.get || desc.set || !isJsonSerializeable(desc.value, visited)) {
+                    return false
+                }
+            }
+
+            return true
+    }
 }
 
 const TypedArray = Object.getPrototypeOf(Uint8Array)
@@ -596,67 +610,6 @@ export function createSerializer(
                     return serializeFullObject(id, obj)
                 }
     
-                if (obj instanceof Uint8Array) {
-                    return {
-                        id,
-                        valueType: 'reflection',
-                        operations: [
-                            { type: 'global' },
-                            { type: 'get', property: 'Uint8Array' },
-                            { type: 'construct', args: [Array.from(obj.values())] },
-                        ]
-                    }
-                }
-    
-                if (obj instanceof Map) {
-                    return {
-                        id,
-                        valueType: 'reflection',
-                        operations: [
-                            { type: 'global' },
-                            { type: 'get', property: 'Map' },
-                            { type: 'construct', args: [Array.from(obj.entries()).map(serialize)] },
-                        ]
-                    }
-                }
-
-                // Serialized WeakMaps and WeakSets will drop all entries
-                if (obj instanceof WeakMap) {
-                    return {
-                        id,
-                        valueType: 'reflection',
-                        operations: [
-                            { type: 'global' },
-                            { type: 'get', property: 'WeakMap' },
-                            { type: 'construct', args: [] },
-                        ]
-                    }
-                }
-
-                if (obj instanceof WeakSet) {
-                    return {
-                        id,
-                        valueType: 'reflection',
-                        operations: [
-                            { type: 'global' },
-                            { type: 'get', property: 'WeakSet' },
-                            { type: 'construct', args: [] },
-                        ]
-                    }
-                }
-    
-                if (obj instanceof Set) {
-                    return {
-                        id,
-                        valueType: 'reflection',
-                        operations: [
-                            { type: 'global' },
-                            { type: 'get', property: 'Set' },
-                            { type: 'construct', args: [Array.from(obj.values())] },
-                        ]
-                    }
-                }
-    
                 if (typeof obj === 'function') {
                     if (obj === Object) {
                         return {
@@ -692,10 +645,71 @@ export function createSerializer(
                             ]
                         }
                     }
-    
+
                     throw new SerializationError(`Failed to serialize function: ${obj.toString()}`)
                 }
     
+                if (obj instanceof Map) {
+                    return {
+                        id,
+                        valueType: 'reflection',
+                        operations: [
+                            { type: 'global' },
+                            { type: 'get', property: 'Map' },
+                            { type: 'construct', args: [Array.from(obj.entries()).map(serialize)] },
+                        ]
+                    }
+                }
+    
+                if (obj instanceof Set) {
+                    return {
+                        id,
+                        valueType: 'reflection',
+                        operations: [
+                            { type: 'global' },
+                            { type: 'get', property: 'Set' },
+                            { type: 'construct', args: [Array.from(obj.values())] },
+                        ]
+                    }
+                }
+    
+                if (obj instanceof Uint8Array) {
+                    return {
+                        id,
+                        valueType: 'reflection',
+                        operations: [
+                            { type: 'global' },
+                            { type: 'get', property: 'Uint8Array' },
+                            { type: 'construct', args: [Array.from(obj.values())] },
+                        ]
+                    }
+                }
+
+                // Serialized WeakMaps and WeakSets will drop all entries
+                if (obj instanceof WeakMap) {
+                    return {
+                        id,
+                        valueType: 'reflection',
+                        operations: [
+                            { type: 'global' },
+                            { type: 'get', property: 'WeakMap' },
+                            { type: 'construct', args: [] },
+                        ]
+                    }
+                }
+
+                if (obj instanceof WeakSet) {
+                    return {
+                        id,
+                        valueType: 'reflection',
+                        operations: [
+                            { type: 'global' },
+                            { type: 'get', property: 'WeakSet' },
+                            { type: 'construct', args: [] },
+                        ]
+                    }
+                }
+
                 return serializeFullObject(id, obj)
             }
         }
@@ -816,15 +830,13 @@ export function createSerializer(
         }
     
         function serialize(obj: any): any {
-            if (obj === null) {
-                return obj
-            }
-
             switch (typeof obj) {
                 case 'object':
-                    if (isDataPointer(obj)) {
+                    if (obj === null || isDataPointer(obj)) {
                         return obj
                     }
+
+                    // falls thru
                 case 'function':
                     return serializeObject(obj)
     

@@ -3290,7 +3290,7 @@ function normalizeToRelative(fileName: string, workingDir = getWorkingDir()) {
     return path.relative(workingDir, path.resolve(workingDir, fileName))
 }
 
-export async function replCommand(target?: string, opt?: { noDeploy?: boolean; eval?: string }) {
+export async function replCommand(target?: string, opt?: { noDeploy?: boolean; eval?: string; forceLoad?: boolean }) {
     const repl = await runTask('', 'repl', async () => {
         if (!target) {
             return enterRepl(undefined, { loadModule: (id) => import(id) }, {})
@@ -3302,7 +3302,10 @@ export async function replCommand(target?: string, opt?: { noDeploy?: boolean; e
         const files = await getEntrypointsFile()
         const typesFile = await getTypesFile()
         const deployables = files?.deployables ?? {}
-        const status = await validateTargetsForExecution(target, deployables, !opt?.noDeploy)
+        const status = opt?.forceLoad 
+            ? {} as Awaited<ReturnType<typeof validateTargetsForExecution>> 
+            : await validateTargetsForExecution(target, deployables, !opt?.noDeploy)
+
         const outfile = status.sources?.[target]?.outfile 
         if (!status.isTargetDeployable && !outfile) {
             throw new RenderableError('No such file', () => {
@@ -3310,10 +3313,10 @@ export async function replCommand(target?: string, opt?: { noDeploy?: boolean; e
             })
         }
 
-        const resolved = status.isTargetDeployable
+        const resolved = opt?.forceLoad || status.isTargetDeployable
             ? await resolveReplTarget(target)
             : path.resolve(getWorkingDir(), outfile!)
-    
+
         const moduleLoader = await runTask('init', 'loader', () => getModuleLoader(false, true), 1) // 8ms on simple hello world no infra
     
         return enterRepl(resolved, moduleLoader, {

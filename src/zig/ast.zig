@@ -162,7 +162,7 @@ pub const UnparsedNode = struct {
 };
 
 pub const TestDeclNode = struct {
-    name: ?*Node, // string literal or identifier
+    name: ?[]const u8, // string literal or identifier
     body: *Node, // block
 };
 
@@ -227,8 +227,9 @@ const NodeConverter = struct {
         return try self.convertNode(index) orelse {
             if (index == 0) return error.NullMember;
 
-            var buf: [256]u8 = undefined;
             const n: zig.Ast.Node = self.tree.nodes.get(index);
+
+            var buf: [256]u8 = undefined;
             const msg = try std.fmt.bufPrint(&buf, "Failed to parse node with tag: {s}", .{@tagName(n.tag)});
             @panic(msg);
         };
@@ -497,6 +498,15 @@ const NodeConverter = struct {
         }
 
         const n: zig.Ast.Node = self.tree.nodes.get(index);
+
+        // {
+        //     const buf = try mem.allocator.alloc(u8, 64);
+        //     defer mem.allocator.free(buf);
+        //     const msg = try std.fmt.bufPrint(buf, "tag: {s}", .{@tagName(n.tag)});
+        //     msg[msg.len] = 0;
+        //     debug_log(msg.ptr);
+        // }
+
         const p = try self.gpa.create(Node);
         p.* = switch (n.tag) {
             .identifier => .{ .ident = .{
@@ -543,7 +553,7 @@ const NodeConverter = struct {
                 .block = try self.convertBlock(index) 
             },
             .test_decl => .{ .test_decl = .{
-                .name = try self.convertNode(n.data.lhs),
+                .name = if (n.data.lhs != 0) self.tree.tokenSlice(n.data.lhs) else null,
                 .body = try self.convertNodeStrict(n.data.rhs),
             } },
             .@"comptime" => .{ .comptime_node = .{
@@ -644,8 +654,13 @@ const WasmStreamWriter = struct {
 
 fn parse_ast(source: [:0]const u8) ![:0]const u8 {
     const gpa = mem.allocator;
-    const tree = try zig.Ast.parse(gpa, source, .zig);
-    const root = try NodeConverter.convert(gpa, tree);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    const allocator = arena.allocator();
+
+    const tree = try zig.Ast.parse(allocator, source, .zig);
+    const root = try NodeConverter.convert(allocator, tree);
 
     var writer = try WasmStreamWriter.init(gpa, 1024);
 
@@ -786,3 +801,8 @@ export fn alloc(size: usize) [*]u8 {
     return b.ptr;
 }
 
+export fn free_ptr(ptr: [*]u8, size: usize) void {
+    mem.allocator.free(ptr[0..size]);
+}
+
+// extern fn debug_log(ptr: [*]u8) void;

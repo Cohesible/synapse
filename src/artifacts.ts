@@ -79,6 +79,7 @@ export interface NativeModule {
     readonly binding: string // base64
     readonly bindingLocation: string
     readonly sourceName: string
+    readonly sourceHash?: string
     // TODO: replace `sourceName` with a "source bundle"
 }
 

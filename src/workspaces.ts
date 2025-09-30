@@ -995,6 +995,11 @@ async function getProjectByUrl(url: string) {
         if ((e as any).statusCode !== 404) {
             throw e
         }
+        if ((e as any).message.includes('has not been deployed')) {
+            throw new Error('Failed to get project. Synapse was likely built without linking to remote services', {
+                cause: e,
+            })
+        }
     }
 }
 

@@ -906,6 +906,10 @@ export function addDependencies<T extends object>(obj: T, ...deps: any[]) {
     })
 }
 
+export function addIndirectRefs<T extends Record<PropertyKey, any> | Function>(dst: T, src: any, exclude?: Iterable<any>) {
+    return terraform.addIndirectRefs(dst, src, exclude)
+}
+
 interface ApiRegistrationProps {
     readonly kind: string
     readonly config: string // pointer

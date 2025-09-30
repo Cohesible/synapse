@@ -1446,9 +1446,27 @@ function renderSerializedData(
     }
 
     const importIdents = new Map<string, ts.Identifier>()
-    function createImport(spec: string, isNamespaceImport?: boolean, member?: string) {
+    function createImport(spec: string, isNamespaceImport?: boolean, member?: string, isDefault?: boolean) {
         if (spec.startsWith(pointerPrefix) && getMappedPointer) {
             spec = getMappedPointer(spec)
+        }
+
+        if (isDefault) {
+            const key = `${spec}#default`
+            if (importIdents.has(key)) {
+                return importIdents.get(key)!
+            }
+
+            const ident = ts.factory.createIdentifier(`import_${importIdents.size}`)
+            importIdents.set(key, ident)
+
+            imports.push(ts.factory.createImportDeclaration(
+                undefined,
+                ts.factory.createImportClause(false, ident, undefined),
+                ts.factory.createStringLiteral(spec)
+            ))
+
+            return ident
         }
 
         const key = member ? `${spec}#${member}` : spec
@@ -1514,7 +1532,7 @@ function renderSerializedData(
                     //     currentNode = createImport(op.module, undefined, nextOp.property)
                     //     break
                     // }
-                    currentNode = createImport(op.module, true)
+                    currentNode = createImport(op.module, true, undefined, (op as any)._d)
                     break
                 }
                 case 'global': {
