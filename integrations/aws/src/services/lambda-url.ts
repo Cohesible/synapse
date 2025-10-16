@@ -1,5 +1,5 @@
 
-import * as aws from 'synapse-provider:aws'
+import * as aws from 'terraform-provider:aws'
 import * as crypto from 'node:crypto'
 import * as core from 'synapse:core'
 import { fetch } from 'synapse:http'

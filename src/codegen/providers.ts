@@ -404,7 +404,7 @@ function generateConstruct(name: string, schema: Schema, mapper = createNameMapp
     return result
 }
 
-// Exclude `Wafv2` ???
+// Exclude `Wafv2` from `aws` ???
 // It's massive...
 
 async function installTypes(fs: Fs, workingDirectory: string, packages: Record<string, string>) {
@@ -421,7 +421,7 @@ async function installTypes(fs: Fs, workingDirectory: string, packages: Record<s
             }
             
             return {
-                name: '@types/synapse-providers',
+                name: '@types/terraform-providers',
                 types: indexFileName,
                 installed: {},
             }
@@ -614,6 +614,31 @@ async function getProviderVersions(terraformPath: string, cwd: string) {
     }
 
     return result
+}
+
+// TODO: `ephemeral-resource` are the same as `data` for our fork
+
+function getRegistryDocsLink(name: string, type: 'resource' | 'data' | 'provider' | 'function', source: string, version = 'latest') {
+    const baseUrl = `https://registry.terraform.io/providers/${source}/${version}/docs`
+    if (type === 'provider') {
+        return baseUrl
+    }
+
+    let subpath: string
+    switch (type) {
+        case 'data':
+            subpath = 'data-sources'
+            break
+        case 'resource':
+            subpath = 'resources'
+            break
+        // are functions even worth adding? for future compat, probably, as some providers won't add corresponding data sources
+        case 'function':
+            subpath = 'functions'
+            break
+    }
+
+    return `${baseUrl}/${subpath}/${name}` // #reference_name-1
 }
 
 function removeNestedTypes(block: Block) {

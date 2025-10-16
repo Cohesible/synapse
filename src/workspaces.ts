@@ -86,7 +86,7 @@ export function getV8CacheDirectory() {
 }
 
 export function getProviderTypesDirectory(workingDirectory: string) {
-    return path.resolve(workingDirectory, 'node_modules', '@types', 'synapse-providers')
+    return path.resolve(workingDirectory, 'node_modules', '@types', 'terraform-providers')
 }
 
 export function getProviderCacheDir() {

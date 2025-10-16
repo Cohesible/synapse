@@ -295,6 +295,8 @@ async function nextState(dirname: string, opt: Settings, state?: Record<string, 
         const files = await fs.readDirectory(absPath)
         const promises: Promise<void>[] = []
         for (const f of files) {
+            if (f.type === 'unknown') continue
+
             const p = visitFileFromDir(
                 absPath,
                 f.name,

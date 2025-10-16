@@ -135,7 +135,7 @@ Before doing _anything_ with a resource, we need to know how to create, read, up
 Now we get to create/configure resources. This is where most IaC tools live today. Synapse uses a lightweight mechanism to generate bindings directly from Terraform providers.
 
 ```ts
-import * as aws from 'synapse-provider:aws'
+import * as aws from 'terraform-provider:aws'
 
 const bucket = new aws.S3Bucket({ forceDestroy: false })
 ```
@@ -145,7 +145,7 @@ const bucket = new aws.S3Bucket({ forceDestroy: false })
 Here's where it gets interesting: we get to _use_ what we create! We don't necessarily abstract away cloud provider specific peculiarities here. The goal is to plumb through API calls as well as model permissions/networking. This layer is still very unpolished and often hides too much for the sake of simplicity:
 
 ```ts
-import * as aws from 'synapse-provider:aws'
+import * as aws from 'terraform-provider:aws'
 import * as S3 from '@aws-sdk/client-s3'
 
 type Encoding = 'utf-8' | 'base64' | 'base64url' | 'hex'

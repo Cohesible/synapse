@@ -1,4 +1,4 @@
-import * as aws from 'synapse-provider:aws'
+import * as aws from 'terraform-provider:aws'
 
 const bucket = new aws.S3Bucket()
 

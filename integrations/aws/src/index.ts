@@ -1,4 +1,4 @@
-import * as aws from 'synapse-provider:aws'
+import * as aws from 'terraform-provider:aws'
 import * as core from 'synapse:core'
 import { Account } from './services/organizations'
 import { Role } from './services/iam'

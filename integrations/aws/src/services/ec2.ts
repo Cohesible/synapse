@@ -1,6 +1,6 @@
 import * as core from 'synapse:core'
 import * as lib from 'synapse:lib'
-import * as aws from 'synapse-provider:aws'
+import * as aws from 'terraform-provider:aws'
 import { LambdaFunction } from './lambda'
 import { ContainerService } from './ecs'
 import { Bucket, BucketDeployment } from './s3'

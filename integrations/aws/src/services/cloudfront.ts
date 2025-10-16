@@ -1,5 +1,5 @@
 import * as core from 'synapse:core'
-import * as aws from 'synapse-provider:aws'
+import * as aws from 'terraform-provider:aws'
 import { Bucket, BucketDeployment } from './s3'
 import { HostedZone } from './route53'
 import * as certs from './certificate-manager'

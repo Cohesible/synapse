@@ -1,7 +1,7 @@
 import * as core from 'synapse:core'
 import * as lib from 'synapse:lib'
 import * as DynamoDB from '@aws-sdk/client-dynamodb'
-import * as aws from 'synapse-provider:aws'
+import * as aws from 'terraform-provider:aws'
 import { createClient } from './clients'
 import { addReplacementHook, generateIdentifier } from 'synapse:lib'
 import * as net from 'synapse:srl/net'

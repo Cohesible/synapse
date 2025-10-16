@@ -1,6 +1,6 @@
 import * as core from 'synapse:core'
 import * as lib from 'synapse:lib'
-import * as aws from 'synapse-provider:aws'
+import * as aws from 'terraform-provider:aws'
 import * as fs from 'fs/promises'
 import * as path from 'node:path'
 import * as child_process from 'node:child_process'

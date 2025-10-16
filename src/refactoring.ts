@@ -1961,8 +1961,45 @@ export function getMovesWithSymbols(moves: Move[], oldGraph: SymbolGraph, newGra
     return result
 }
 
-// Segments are delimited by `/` and describe named scopes
-// `@` is used for ambiguous instance selection e.g. `foo@1` specifies the 2nd occurrence of `foo`
+// A "symbol ref" describes one or more symbols in source code in relation to all possible
+// paths for reaching them. The simplest ref is just the name of a symbol.
+//
+// ----- Goals -----
+//  1. shell-friendly (avoid requiring quotes!!)
+//  2. faster to write than to read
+//  3. can reference all possible symbols instantiations without line/column numbers, even if clunky at times
+//  4. starts simple and the tool asks you to clarify if it's ever ambiguous
+//  5. not focused on any particular use-case beyond "querying" symbols in code
+//
+// ----- Special characters -----
+//  / - delimits segments i.e. scopes in symbol call path
+//  : - spatial/structural separator (pkg:file:symbols)
+//  @ - selects the Nth instance of a match within a segment. `foo@1` would select the 1st `foo` 
+//  . - property/element accessor. Has precedence over `@`, `foo.bar@2` is the 2nd `foo.bar`
+//    * This can be used with arrays, e.g. `foo.2` is the 3rd element of an array
+//  # - temporal separator e.g. foo#~1 looks at `foo` in the prior deployment
+//
+// All characters are used to clarify intent and offer incremental precision 
+// rather than a requirement for expression. The majority of apps won't need
+// much precision, especially if they are not working abstractly and use 
+// generally descriptive (and thus more unique) names.
+//
+// ----- Simple Example -----
+// const bar = () => new Bucket()
+// const foo = () => bar()
+//
+// const b1 = bar()
+// const b2 = foo()
+// foo()
+// foo()
+//
+// * foo - references 3 instantiations of `bar`
+// * foo@2 - 1 instantiation, the 2nd call of `foo()`
+// * Bucket - 4 instantiations, there are 4 paths to `new Bucket()`
+// * bar/Bucket - 4 instantiations
+// * foo/Bucket - 3 instantiations
+// * b1/Bucket - 1 instance
+// * b2 - 1 instance
 
 function parseSymbolRefSegment(segment: string) {
     // TODO: figure out escaping rules to work well with shells

@@ -1240,8 +1240,10 @@ export async function show(targets: string[], opt?: DeployOptions & { 'names-onl
         }
     
         const graph = createSymbolGraphFromTemplate(template)
+        const targetSym = targets.length ? getSymbolNodeFromRef(graph, targets[0]) : undefined
+        const resources = targetSym ? targetSym.resources : state.resources
 
-        const keys = state.resources.map(r => `${r.type}.${r.name}`)
+        const keys = resources.map(r => `${r.type}.${r.name}`)
         for (const k of keys) {
             const sym = graph.hasResource(k) ? getSymbolNodeFromRef(graph, k) : undefined
             const rendered = sym ? ` [${renderSymbol(sym, true, true)}]` : ''
@@ -3307,7 +3309,7 @@ export async function replCommand(target?: string, opt?: { noDeploy?: boolean; e
             : await validateTargetsForExecution(target, deployables, !opt?.noDeploy)
 
         const outfile = status.sources?.[target]?.outfile 
-        if (!status.isTargetDeployable && !outfile) {
+        if (!opt?.forceLoad && !status.isTargetDeployable && !outfile) {
             throw new RenderableError('No such file', () => {
                 printLine(colorize('brightRed', 'No such file exists'))
             })

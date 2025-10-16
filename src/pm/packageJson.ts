@@ -58,11 +58,17 @@ export async function getPackageJson(fs: Fs, dir: string, recursive = true, stop
         return packageJsonCache.get(key)!
     }
 
+    const filename = path.resolve(dir, 'package.json')
+
     let result: { directory: string; data: PackageJson } | undefined
     try {
-        const data = JSON.parse(await fs.readFile(path.resolve(dir, 'package.json'), 'utf-8')) as PackageJson
+        const data = JSON.parse(await fs.readFile(filename, 'utf-8')) as PackageJson
         result = { directory: dir, data }
     } catch (e) {
+        if ((e as any).name === 'SyntaxError') {
+            throw new Error(`Failed to parse file: ${filename}`, { cause: e })
+        }
+
         throwIfNotFileNotFoundError(e)
 
         if (!recursive || path.dirname(dir) === (dir ?? stopAt)) {
@@ -400,7 +406,7 @@ function detectIndent(jsonText: string) {
 //     }
 // })
 
-export function createSynapseProviderRequirement(name: string, constraint: string) {
+export function createTerraformProviderRequirement(name: string, constraint: string) {
     const base = name.split('/').pop()!
 
     return [`${providerPrefix}${base}`, `spr:_provider-${name}:${constraint}`] as const
@@ -436,7 +442,7 @@ export function getRequired(pkg: Partial<PackageJson>, includeOptional = true, i
 
     if (pkg.synapse?.providers && includeSynapse) {
         for (const [k, v] of Object.entries(pkg.synapse.providers)) {
-            const [name, pattern] = createSynapseProviderRequirement(k, v)
+            const [name, pattern] = createTerraformProviderRequirement(k, v)
             required[name] = pattern
             isEmpty = false
         }

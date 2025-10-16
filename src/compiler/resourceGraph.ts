@@ -249,7 +249,7 @@ export function createResourceGraph(
 
     function getExternalNodeType(name: string, components: SymbolNameComponents) {
         const module = components.specifier
-        if (module && (module.startsWith('synapse-provider:') || module === 'synapse:lib')) {
+        if (module && (module.startsWith('synapse-provider:') || module.startsWith('terraform-provider:') || module === 'synapse:lib')) {
             return { intrinsic: true }
         }
 

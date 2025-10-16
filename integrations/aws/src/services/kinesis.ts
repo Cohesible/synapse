@@ -1,7 +1,7 @@
 import * as core from 'synapse:core'
 import * as lib from 'synapse:lib'
 import * as Kinesis from '@aws-sdk/client-kinesis'
-import * as aws from 'synapse-provider:aws'
+import * as aws from 'terraform-provider:aws'
 import { randomBytes } from 'node:crypto'
 import { Role, createSerializedPolicy, spPolicy } from './iam'
 import * as compute from 'synapse:srl/compute'

@@ -1,4 +1,4 @@
-import { createSynapseProviderRequirement, PackageJson } from './packageJson'
+import { createTerraformProviderRequirement, PackageJson } from './packageJson'
 import { addImplicitPackages } from './publish'
 import { SynapseConfiguration } from '../workspaces'
 import { closeNpmRepo, getLatestVersion, getSpecifierComponents } from './packages'
@@ -46,12 +46,12 @@ export async function getNeededDependencies(deps: Set<string>, pkg: PackageJson,
             continue
         }
 
-        if (components.scheme === 'synapse' || components.scheme === 'synapse-provider') {
+        if (components.scheme === 'synapse' || components.scheme === 'synapse-provider' || components.scheme === 'terraform-provider') {
             shouldAddSynapse = true
             installed.add(nameWithScope)
 
-            if (components.scheme === 'synapse-provider') {
-                const [_, constraint] = createSynapseProviderRequirement(components.name, '*')
+            if (components.scheme !== 'synapse') {
+                const [_, constraint] = createTerraformProviderRequirement(components.name, '*')
                 devDependencies[nameWithScope] = constraint
             }
         } else if (spec.startsWith('@cohesible/synapse-')) {

@@ -1,6 +1,6 @@
 import * as core from 'synapse:core'
 import { addIndirectRefs } from 'synapse:terraform'
-import * as aws from 'synapse-provider:aws'
+import * as aws from 'terraform-provider:aws'
 import * as smithyHttp from '@smithy/protocol-http'
 import { URL } from 'node:url'
 import { LambdaFunction } from './lambda'

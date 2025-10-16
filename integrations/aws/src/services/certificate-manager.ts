@@ -1,5 +1,5 @@
 import * as core from 'synapse:core'
-import * as aws from 'synapse-provider:aws'
+import * as aws from 'terraform-provider:aws'
 import { HostedZone } from './route53'
 import { addResourceStatement } from '../permissions'
 

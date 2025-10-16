@@ -1,6 +1,6 @@
 import * as assert from 'assert'
 import * as core from 'synapse:core'
-import * as aws from 'synapse-provider:aws'
+import * as aws from 'terraform-provider:aws'
 import * as net from 'synapse:srl/net'
 
 export class HostedZone implements net.HostedZone {

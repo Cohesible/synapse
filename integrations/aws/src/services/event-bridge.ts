@@ -1,6 +1,6 @@
 import * as core from 'synapse:core'
 import * as EventBridge from '@aws-sdk/client-eventbridge'
-import * as aws from 'synapse-provider:aws'
+import * as aws from 'terraform-provider:aws'
 import * as compute from 'synapse:srl/compute'
 import { LambdaFunction } from './lambda'
 import { Role, spPolicy } from './iam'

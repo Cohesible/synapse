@@ -1222,7 +1222,8 @@ registerTypedCommand(
         options: [
             ...buildTargetOptions,
             { name: 'no-deploy', type: 'boolean' },
-            { name: 'eval', type: 'string', hidden: true, aliases: ['e'] }
+            { name: 'eval', type: 'string', hidden: true, aliases: ['e'] },
+            { name: 'forceLoad', type: 'boolean', hidden: true },
         ],
     },
     (a, opt) => synapse.replCommand(a, {

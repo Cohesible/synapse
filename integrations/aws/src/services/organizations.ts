@@ -1,4 +1,4 @@
-import * as aws from 'synapse-provider:aws'
+import * as aws from 'terraform-provider:aws'
 import * as core from 'synapse:core'
 import * as Organizations from '@aws-sdk/client-organizations'
 

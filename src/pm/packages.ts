@@ -2,7 +2,7 @@ import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import { TargetsFile, readPointersFile } from '../compiler/host'
 import { getLogger, runTask } from '../logging'
-import { synapsePrefix, providerPrefix } from '../runtime/loader'
+import { synapsePrefix, providerPrefix, oldProviderPrefix } from '../runtime/loader'
 import type { DependencyTree, PackageInfo } from '../runtime/modules/serdes'
 import { SynapseConfiguration, getSynapseDir, getRootDirectory, getToolsDirectory, getUserSynapseDirectory, getWorkingDir, getGlobalCacheDirectory, resolveProgramBuildTarget, getPackageCacheDirectory } from '../workspaces'
 import { Mutable, acquireFsLock, createHasher, createMinHeap, deepClone, escapeRegExp, getHash, gunzip, isNonNullable, isRelativeSpecifier, isRunningInVsCode, isWindows, keyedMemoize, memoize, resolveRelative, sortRecord, strcmp, throwIfNotFileNotFoundError, tryReadJson } from '../utils'
@@ -20,7 +20,7 @@ import { getTerraformPath } from '../deploy/deployment'
 import { TypesFileData } from '../compiler/resourceGraph'
 import { coerceToPointer, createPointer, isDataPointer, isNullHash, pointerPrefix, toAbsolute, toDataPointer } from '../build-fs/pointers'
 import { ImportMap, SourceInfo, expandImportMap, flattenImportMap, hoistImportMap } from '../runtime/importMaps'
-import { PackageJson, ResolvedPackage, createSynapseProviderRequirement, diffPkgDeps, getCurrentPkg, getPackageJson, getRequired, isFileUrl, resolveFileSpecifier, resolveWorkspaces, runIfPkgChanged, setCompiledPkgJson } from './packageJson'
+import { PackageJson, ResolvedPackage, createTerraformProviderRequirement, diffPkgDeps, getCurrentPkg, getPackageJson, getRequired, isFileUrl, resolveFileSpecifier, resolveWorkspaces, runIfPkgChanged, setCompiledPkgJson } from './packageJson'
 import { QualifiedBuildTarget, resolveBuildTarget, toNodeArch, toNodePlatform } from '../build/builder'
 import { InstallSummary, createInstallView } from '../cli/views/install'
 import { VersionConstraint, compareConstraints, isCompatible, isExact, parseVersionConstraint } from './versions'
@@ -812,6 +812,11 @@ function createSprRepoWrapper(
             return _getProviderVersions(name.slice(providerPrefix.length))
         }
 
+        // TODO: remove this code
+        if (name.startsWith(oldProviderPrefix)) {
+            return _getProviderVersions(name.slice(oldProviderPrefix.length))
+        }
+
         if (name.startsWith(sprPrefix)) {
             return sprRepo.listVersions(name.slice(sprPrefix.length))
         }
@@ -844,6 +849,17 @@ function createSprRepoWrapper(
                 version,
                 dist: {
                     tarball: getProviderSource(name.slice(providerPrefix.length)),
+                    integrity: version, // TODO: use hash
+                },
+            }
+        }
+
+        if (name.startsWith(oldProviderPrefix)) {
+            return {
+                name: name.slice(oldProviderPrefix.length).split('/').pop()!,
+                version,
+                dist: {
+                    tarball: getProviderSource(name.slice(oldProviderPrefix.length)),
                     integrity: version, // TODO: use hash
                 },
             }
@@ -966,7 +982,7 @@ function createSprRepoWrapper(
             return fileRepo.getDependencies(name.slice('file:'.length), version)
         }
 
-        if (name.startsWith(providerPrefix)) {
+        if (name.startsWith(providerPrefix) || name.startsWith(oldProviderPrefix)) {
             return
         }
 
@@ -996,7 +1012,7 @@ function createSprRepoWrapper(
             return // TODO
         }
 
-        if (name.startsWith(providerPrefix)) {
+        if (name.startsWith(providerPrefix) || name.startsWith(oldProviderPrefix)) {
             return
         }
 
@@ -1335,8 +1351,10 @@ function rebuildTree(data: ReturnType<typeof flattenImportMap>): RebuiltRootTree
                     return `${githubPrefix}${data.name}`
                 case 'synapse-tool':
                     return `${toolPrefix}${data.name}`
-                case 'synapse-provider':
+                case 'terraform-provider':
                     return `${providerPrefix}${data.name}`
+                case 'synapse-provider':
+                    return `${oldProviderPrefix}${data.name}`
             }
 
             return data.name
@@ -2185,7 +2203,7 @@ export async function writeToNodeModules(
             }
         }
 
-        if (pkgInfo?.type === 'synapse-provider') {
+        if (pkgInfo?.type === 'synapse-provider' || pkgInfo?.type === 'terraform-provider') {
             noop.add(directory)
 
             if (mode !== 'none' && pkgInfo?.name && rootDeps.has(spec)) {
@@ -2390,7 +2408,7 @@ async function toPackageManifestFromTree(repo: PackageRepository, tree: { subtre
             return packageInfos.get(gid)!
         }
 
-        const isProvider = resolved.name.startsWith(providerPrefix)
+        const isProvider = resolved.name.startsWith(providerPrefix) || resolved.name.startsWith(oldProviderPrefix)
         const isTool = resolved.name.startsWith(toolPrefix)
         const parsed = getNameAndScheme(resolved.name)
         const type: PackageInfo['type'] = parsed.scheme as any ?? 'npm'
@@ -2492,7 +2510,7 @@ async function toPackageManifest(repo: PackageRepository, resolved: ResolveDepsR
 
         const pkgJson = await repo.getPackageJson(resolved.name, resolved.version)
 
-        const isProvider = resolved.name.startsWith(providerPrefix)
+        const isProvider = resolved.name.startsWith(providerPrefix) || resolved.name.startsWith(oldProviderPrefix)
         const isTool = resolved.name.startsWith(toolPrefix)
 
         const isSynapsePackage = !!pkgJson.synapse || pkgJson.dist.isSynapsePackage
@@ -2727,7 +2745,7 @@ export async function downloadAndInstall(
         ...pkg.data.dependencies,
         ...pkg.data.devDependencies,
         ...Object.fromEntries(Object.entries(csDeps).map(x => [x[0], `spr:${x[1]}`])),
-        ...Object.fromEntries(Object.entries(providers).map(x => createSynapseProviderRequirement(x[0], x[1]))),
+        ...Object.fromEntries(Object.entries(providers).map(x => createTerraformProviderRequirement(x[0], x[1]))),
         ...Object.fromEntries(Object.entries(tools).map(x => [`${toolPrefix}${x[0]}`, x[1]])),
         ...resolveWorkspaces(pkg.data.workspaces ?? [], pkg.directory)
     }
@@ -3342,10 +3360,10 @@ function createPackageResolver(
                 ? path.dirname(path.resolve(workingDirectory, location)) 
                 : workingDirectory
 
-            if (specifier.startsWith(providerPrefix)) {
+            if (specifier.startsWith(providerPrefix) || specifier.startsWith(oldProviderPrefix)) {
                 const info = moduleResolver.resolveProvider(specifier, lookupDir)
                 const packageInfo: PackageInfo = {
-                    type: 'synapse-provider',
+                    type: 'terraform-provider',
                     name: info.name,
                     version: info.version,
                     resolved: {
@@ -3437,7 +3455,7 @@ function getPackageDest(packagesDir: string, info: PackageInfo) {
         return location
     }
 
-    if (info.type === 'synapse-provider') {
+    if (info.type === 'synapse-provider' || info.type === 'terraform-provider') {
         const source = info.resolved!.url
 
         return path.resolve(packagesDir, info.type, source, `${info.name}-${info.version}`)
@@ -3542,8 +3560,9 @@ export function createPackageInstaller(params?: PackageInstallerParams) {
                 case 'spr':
                     await downloadSynapsePackage(info, dest)
                     break
+                case 'terraform-provider':
                 case 'synapse-provider':
-                    await downloadSynapseProvider(info, dest)
+                    await downloadTerraformProvider(info, dest)
                     break
                 case 'synapse-tool':
                     await downloadToolPackage(info, dest)
@@ -3564,7 +3583,7 @@ export function createPackageInstaller(params?: PackageInstallerParams) {
         return dest
     }
 
-    async function downloadSynapseProvider(info: PackageInfo, dest = getPackageDest(packagesDir, info)) {
+    async function downloadTerraformProvider(info: PackageInfo, dest = getPackageDest(packagesDir, info)) {
         const name = info.name
         const source = info.resolved!.url
         const version = info.version
@@ -3725,7 +3744,7 @@ export function createPackageInstaller(params?: PackageInstallerParams) {
 
         return {
             name: resolved.name,
-            type: 'synapse-provider',
+            type: 'terraform-provider',
             version: resolved.version,
             resolved: {
                 url: resolved.source,
@@ -3733,7 +3752,7 @@ export function createPackageInstaller(params?: PackageInstallerParams) {
         }
     }
 
-    async function installSynapseProvider(provider: ProviderConfig) {
+    async function installTerraformProvider(provider: ProviderConfig) {
         const info = await resolveProviderConfig(provider)
         const res = await ensurePackage(info)
         if (res?.type !== 'ok') {
@@ -3753,8 +3772,8 @@ export function createPackageInstaller(params?: PackageInstallerParams) {
     }
 
     async function downloadPackage(name: string, type: PackageInfo['type']) {
-        if (type === 'synapse-provider') {
-            await installSynapseProvider({ name })
+        if (type === 'synapse-provider' || type === 'terraform-provider') {
+            await installTerraformProvider({ name })
         } else {
             throw new Error(`Not implemented: ${type}`)
         }

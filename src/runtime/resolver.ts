@@ -11,7 +11,7 @@ import { createLookupTable, MapNode } from './lookup'
 
 const pointerPrefix = 'pointer:'
 export const synapsePrefix = 'synapse:'
-export const providerPrefix = 'synapse-provider:'
+const providerPrefix = 'synapse-provider:'
 
 export interface PatchedPackage {
     readonly name: string
@@ -59,7 +59,7 @@ export function createModuleResolver(fs: Pick<SyncFs, 'readFileSync' | 'fileExis
     }
 
     function resolveProvider(specifier: string, importer: string) {
-        const res = lookupTable.lookup(specifier, importer)
+        const res = lookupTable.lookup(specifier, importer) ?? lookupTable.lookup(specifier.replace(providerPrefix, 'terraform-provider:'), importer)
         if (!res) {
             throw new Error(`Failed to resolve provider: ${specifier} [${importer ?? workingDirectory}]`)
         }
@@ -196,10 +196,12 @@ export function createModuleResolver(fs: Pick<SyncFs, 'readFileSync' | 'fileExis
 
         const getLocation = () => importer ? path.dirname(lookupTable.resolve(importer)) : workingDirectory
 
-        if (specifier.startsWith(providerPrefix)) {
+        if (specifier.startsWith(providerPrefix) || specifier.startsWith('terraform-provider:')) {
             // FIXME: there _might_ be a really weird race condition where metadata is lost on pointers when coming from TF (?)
             // Looking up the specifier inside the working dir means we failed to resolve specifiers from metadata
             const res = lookupTable.lookup(specifier, importer ?? workingDirectory) ?? lookupTable.lookup(specifier, workingDirectory)
+                ?? lookupTable.lookup(specifier.replace(providerPrefix, 'terraform-provider:'), importer ?? workingDirectory) 
+                ?? lookupTable.lookup(specifier.replace(providerPrefix, 'terraform-provider:'), workingDirectory)
             if (!res) {
                 throw new Error(`Failed to resolve provider: ${specifier} [${importer ?? workingDirectory}]`)
             }

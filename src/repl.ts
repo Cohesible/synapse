@@ -9,7 +9,7 @@ import { getSocketsDirectory, getTargetDeploymentIdOrThrow, getUserSynapseDirect
 import { TfState } from './deploy/state'
 import { SessionContext } from './deploy/deployment'
 import { pointerPrefix } from './build-fs/pointers'
-import { getDisplay, printLine } from './cli/ui'
+import { format, getDisplay, printLine } from './cli/ui'
 import { getArtifactFs } from './artifacts'
 import { getBuildTargetOrThrow } from './execution'
 import { TypeInfo } from './compiler/resourceGraph'
@@ -215,9 +215,7 @@ export async function enterRepl(
 
         const ctx = vm.createContext(ctxObj)
         const result = await vm.runInContext(options.eval, ctx)
-        if (result !== undefined) {
-            printLine(result)
-        }
+        printLine(format(result))
 
         return {}
     }

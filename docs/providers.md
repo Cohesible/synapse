@@ -16,10 +16,10 @@ Providers can be installed by adding the name to the `synapse` section of your `
 }
 ```
 
-Then run `synapse install`. This will generate a module called `synapse-provider:<name>` that you can use like so:
+Then run `synapse install`. This will generate a module called `terraform-provider:<name>` that you can use like so:
 
 ```ts
-import * as aws from 'synapse-provider:aws'
+import * as aws from 'terraform-provider:aws'
 
 const bucket = new aws.S3Bucket()
 ```
@@ -28,7 +28,7 @@ This will use the default provider configuration. You can manually specify provi
 
 ```ts
 import { using } from 'synapse:core'
-import * as aws from 'synapse-provider:aws'
+import * as aws from 'terraform-provider:aws'
 
 const provider = new aws.AwsProvider({ region: 'us-west-2' })
 

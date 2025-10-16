@@ -20,7 +20,8 @@ import { waitForPromise } from '../zig/util'
 
 export const pointerPrefix = 'pointer:'
 export const synapsePrefix = 'synapse:'
-export const providerPrefix = 'synapse-provider:'
+export const providerPrefix = 'terraform-provider:'
+export const oldProviderPrefix = 'synapse-provider:'
 const seaAssetPrefix = 'sea-asset:'
 
 export function createContext(
@@ -870,7 +871,6 @@ export function createModuleLinker(fs: Pick<SyncFs, 'readFileSync'>, resolver: M
         meta.url = `file://${fileName}` // probably not valid on Windows
         meta.resolve = (spec) => `file://${resolver.resolve(spec, module.id)}`
 
-        // https://github.com/oven-sh/bun/issues/4667
         ;(meta as any).env = process.env
 
         // Needed for synthesis

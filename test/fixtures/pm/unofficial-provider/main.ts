@@ -1,4 +1,4 @@
-import * as alicloud from 'synapse-provider:alicloud'
+import * as alicloud from 'terraform-provider:alicloud'
 
 const disk = new alicloud.Disk()
 

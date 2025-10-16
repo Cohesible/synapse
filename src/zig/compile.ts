@@ -807,7 +807,14 @@ function renderSynapseBuiltin(params: SynapseBuiltinParams) {
         }
     }
 
-    return `pub const features = ${renderObject(params.features)};\n`
+    const lines: string[] = []
+    for (const [k, v] of Object.entries(params)) {
+        lines.push(`pub const ${k} = ${renderObject(v)};`)
+    }
+
+    lines.push('')
+
+    return lines.join('\n')
 }
 
 async function writeSynapseBuiltin(params: SynapseBuiltinParams) {

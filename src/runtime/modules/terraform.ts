@@ -1194,7 +1194,7 @@ export interface TerraformSourceMap {
 }
 
 export interface PackageInfo {
-    readonly type: 'npm' | 'cspm' | 'synapse-provider' | 'file' | 'jsr' | 'synapse-tool' | 'spr' | 'github'
+    readonly type: 'npm' | 'cspm' | 'synapse-provider' | 'terraform-provider' | 'file' | 'jsr' | 'synapse-tool' | 'spr' | 'github'
     readonly name: string
     readonly version: string
     readonly packageHash?: string // Only relevant for `synapse`

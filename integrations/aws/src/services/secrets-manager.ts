@@ -1,6 +1,6 @@
 import * as core from 'synapse:core'
 import * as SecretsManager from '@aws-sdk/client-secrets-manager'
-import * as aws from 'synapse-provider:aws'
+import * as aws from 'terraform-provider:aws'
 import * as storage from 'synapse:srl/storage'
 
 export class Secret<T = unknown> {

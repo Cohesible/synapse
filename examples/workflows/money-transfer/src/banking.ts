@@ -1,5 +1,7 @@
 import { Table } from 'synapse:srl/storage'
 import { defineResource } from 'synapse:core'
+import { SimpleLock } from 'synapse:srl/compute'
+import { suite, test, expectEqual } from 'synapse:test'
 
 interface Account {
   readonly id: string
@@ -8,6 +10,7 @@ interface Account {
 
 class Bank {
   private readonly accounts = new Table<Account['id'], Account>()
+  private readonly accountsLock = new SimpleLock()
 
   async findAccount(accountNumber: string) {
     return this.accounts.get(accountNumber)
@@ -30,7 +33,7 @@ class Bank {
     await this.accounts.delete(accountNumber)
   }
 
-  async updateBalance(accountNumber: string, delta: number) {
+  private async _updateBalance(accountNumber: string, delta: number) {
     const acc = await this.findAccount(accountNumber)
     if (!acc) {
       throw new InvalidAccountError()
@@ -45,7 +48,40 @@ class Bank {
 
     return { balance: newBalance }
   }
+
+  async updateBalance(accountNumber: string, delta: number) {
+    await this.accountsLock.lock(accountNumber, 5_000)
+    try {
+      return await this._updateBalance(accountNumber, delta)
+    } finally {
+      await this.accountsLock.unlock(accountNumber)
+    }
+  }
 }
+
+suite('Bank', () => {
+  const b = new Bank()
+
+  test('guards against multiple concurrent writers', async () => {
+    const acc: Account = { id: 'foo', balance: 1000 }
+    await b.addAccount(acc)
+    const results = await Promise.all([
+      b.updateBalance(acc.id, -1000).catch(err => err),
+      b.updateBalance(acc.id, -1000).catch(err => err),
+    ])
+
+    const errors = results.filter(x => x instanceof Error)
+    if (errors.length === 2) {
+      console.log(errors)
+      throw new Error('two errors :(')
+    }
+
+    expectEqual(results.filter(x => x instanceof InsufficientFundsError).length, 1)
+
+    const balance = await b.getAccountBalance(acc.id)
+    expectEqual(balance, 0)
+  })
+})
 
 export class InvalidAccountError extends Error {
   constructor() {

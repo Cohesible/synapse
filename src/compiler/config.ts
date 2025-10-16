@@ -390,13 +390,22 @@ function mergeConfigs<T>(...configs: (T | undefined)[]): Partial<T> {
     return res
 }
 
+// todo: generalize this for all file ops i.e. attach filename to the error 
+function handleJsonParseErr(filename: string, err: Error) {
+    if (err.name === 'SyntaxError') {
+        throw new Error(`Failed to parse file: ${filename}`, { cause: err })
+    }
+    throwIfNotFileNotFoundError(err)
+}
+
 export async function resolveProgramConfig(opt?: CompilerOptions, fs = getFs()): Promise<ResolvedProgramConfig> {
     patchTsSys()
 
     const bt = getBuildTargetOrThrow()
+    const pkgJsonPath = path.resolve(bt.workingDirectory, 'package.json')
     const [parsed, pkg, previousPkg] = await Promise.all([
         runTask('resolve', 'tsconfig', () => getTsConfigWithFiles(fs, bt.workingDirectory), 5),
-        getFs().readFile(path.resolve(bt.workingDirectory, 'package.json'), 'utf-8').then(JSON.parse).catch(throwIfNotFileNotFoundError),
+        getFs().readFile(pkgJsonPath, 'utf-8').then(JSON.parse).catch(err => handleJsonParseErr(pkgJsonPath, err)),
         getPreviousPkg()
     ])
 
@@ -446,7 +455,7 @@ export async function resolveProgramConfig(opt?: CompilerOptions, fs = getFs()):
         try {
             const dirs = (await fs.readDirectory(typesDir)).filter(f => f.type === 'directory')
     
-            return dirs.map(f => f.name).filter(n => n !== 'synapse-providers')
+            return dirs.map(f => f.name).filter(n => n !== 'synapse-providers' && n !== 'terraform-providers')
         } catch (e) {
             throwIfNotFileNotFoundError(e)
 

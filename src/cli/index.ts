@@ -329,7 +329,7 @@ export function main(...args: string[]) {
                 } else {
                     process.exit(handledError ? 1 : undefined)
                 }
-            }, 5000).unref()
+            }, 15_000).unref()
 
             process.exitCode = process.exitCode || (handledError ? 1 : 0)
 

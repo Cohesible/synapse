@@ -1,6 +1,6 @@
 import * as core from 'synapse:core'
 import * as SQS from '@aws-sdk/client-sqs'
-import * as aws from 'synapse-provider:aws'
+import * as aws from 'terraform-provider:aws'
 import { LambdaFunction } from './lambda'
 import { Fn } from 'synapse:terraform'
 import * as storage from 'synapse:srl/storage'
