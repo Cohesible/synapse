@@ -1388,6 +1388,12 @@ export function createBuildFsFragment(
         return createPointer(f.fileHash, f.storeHash)
     }
 
+    // careful: this directly touches the index (still gotta update the file index)
+    function putStore(key: string, hash: string) {
+        index.stores[key] = { hash }
+        didIndexChange = true
+    }
+
     function initStore(key: string, options?: OpenOptions) {
         if (opened[key]) {
             throw new Error(`Store "${key}" already initialized`)
@@ -1588,7 +1594,8 @@ export function createBuildFsFragment(
         clear: root.clear,
         flush, 
         getStore, 
-        deleteStore, 
+        deleteStore,
+        putStore,
         listStores, 
         listFiles, 
         getFilesFromStore,
@@ -2417,6 +2424,12 @@ function createRootFs(fs: Fs & SyncFs, rootDir: string, defaultId: string, opt?:
         fs.renameStore(r1.storeKey, r2.storeKey)
     }
 
+    // only used for repair scenarios
+    async function putStore(key: string, hash: string): Promise<void> {
+        const fs = await repo.getRootBuildFs(defaultId)
+        fs.putStore(key, hash)
+    }
+
     async function fileExists(fileName: string) {
         const r = resolve(fileName)
         if (r.type === 'file') {
@@ -2581,6 +2594,7 @@ function createRootFs(fs: Fs & SyncFs, rootDir: string, defaultId: string, opt?:
         writeJson,
         getMetadata,
         listStores,
+        putStore,
         rename,
         getPointerSync,
     }
@@ -4760,14 +4774,30 @@ export async function didFileMaybeChange(fileName: string, bt = getBuildTargetOr
     return currentFile?.fileHash !== previousFile?.hash
 }
 
-export async function readResourceState(resource: string) {
+// xxx: temp cache, only used for `readResourceState`
+const _readResourceStateCache = new Map<string, { parsed: Promise<{ state: any; deps: any }>, fs: ReturnType<typeof getDeploymentFs> }>()
+function _getReadResourceState(resource: string) {
     const { deploymentId } = getBuildTargetOrThrow()
     if (!deploymentId) {
         throw new Error(`No deployment id available to read resource: ${resource}`)
     }
 
+    const cached = _readResourceStateCache.get(deploymentId)
+    if (cached) {
+        return cached
+    }
+
     const deploymentFs = getDeploymentFs(deploymentId)
-    const { state, deps } = JSON.parse(await deploymentFs.readFile('state.json', 'utf-8'))
+    const parsed = deploymentFs.readFile('state.json', 'utf-8').then(JSON.parse)
+    const result = { parsed, fs: deploymentFs }
+    _readResourceStateCache.set(deploymentId, result)
+
+    return result
+}
+
+export async function readResourceState(resource: string) {
+    const { fs: deploymentFs, parsed } = _getReadResourceState(resource)
+    const { state, deps } = await parsed
     const hash = state[resource]
     if (!hash) {
         throw new Error(`No state found for resource: ${resource}`)
@@ -4778,9 +4808,10 @@ export async function readResourceState(resource: string) {
         throw new Error(`No metadata found for resource: ${resource}`)
     }
 
+    const _d = deploymentFs.readData(hash)
     const p = createPointer(hash, storeHash)
     const m = await deploymentFs.getMetadata(p)
-    const d = JSON.parse(decode(await deploymentFs.readData(hash), 'utf-8'))
+    const d = JSON.parse(decode(await _d, 'utf-8'))
     if (!m.pointers) {
         return d
     }
@@ -5163,7 +5194,7 @@ export async function commitProgram(repo = getDataRepository(), bt = getBuildTar
     await runTask('commit', `program ${bt.programId}`, () => repo.commitHead(toProgramRef(bt)), 1)
 }
 
-export type ProcessStore = ReturnType<typeof getDeploymentStore>
+export type DeploymentStore = ReturnType<typeof getDeploymentStore>
 export function getDeploymentStore(deploymentId: string, repo = getDataRepository()) {
     const fs = getDeploymentFs()
 
@@ -5197,8 +5228,8 @@ export function getDeploymentStore(deploymentId: string, repo = getDataRepositor
     async function applyMoved(moved: { from: string; to: string }[]): Promise<void> {
         const stores = new Set((await fs.listStores('[#deploy]')).map(x => x.name))
 
-        const csResources = moved.filter(r => r.from.startsWith('synapse_resource.'))
-        const mapped = Object.fromEntries(csResources.map(r => {
+        const synapseResources = moved.filter(r => r.from.startsWith('synapse_resource.'))
+        const mapped = Object.fromEntries(synapseResources.map(r => {
             const from = r.from.slice('synapse_resource.'.length)
             const to = r.to.slice('synapse_resource.'.length)
 
@@ -5218,13 +5249,13 @@ export function getDeploymentStore(deploymentId: string, repo = getDataRepositor
 
     async function commitState(state: TfState) {
         await runTask('artifacts', 'state', async () => {
-            const csResources = state.resources.filter(r => r.type === 'synapse_resource')
+            const synapseResources = state.resources.filter(r => r.type === 'synapse_resource')
 
             const fragment = await repo.getRootBuildFs(deploymentId)
             const stores = fragment.listStores()
             const published: Record<string, string> = {}
 
-            const rStores = new Set(Array.from(csResources).map(n => `/deploy/resource-${n.name}`))
+            const rStores = new Set(Array.from(synapseResources).map(n => `/deploy/resource-${n.name}`))
             for (const [k, v] of Object.entries(stores)) {
                 if (k.startsWith(`/deploy/resource-`) && !rStores.has(k)) {
                     fragment.deleteStore(k)
@@ -5257,10 +5288,6 @@ export function getDeploymentStore(deploymentId: string, repo = getDataRepositor
         }
     }
 
-    function isDeployed() {
-        return getState() !== undefined
-    }
-
     interface StateFile {
         state: Record<string, string>
         deps: Record<string, string>
@@ -5291,6 +5318,8 @@ export function getDeploymentStore(deploymentId: string, repo = getDataRepositor
             s.deps[resource] = storeHash
 
             saveState(s)
+
+            return { h: hash, sh: storeHash }
         }
 
         function remove(resource: string) {
@@ -5322,36 +5351,50 @@ export function getDeploymentStore(deploymentId: string, repo = getDataRepositor
 
     const getStateWriter = memoize(createStateWriter)
 
+    function repairState(events: Record<string, { h: string; sh: string } | null>) {
+        for (const [k, v] of Object.entries(events)) {
+            if (!v) {
+                getStateWriter().remove(k)
+                continue
+            }
+
+            getStateWriter().update(k, createPointer(v.h, v.sh))
+            const key = `/deploy/resource-${k}`
+            fs.putStore(key, v.sh)
+        }
+    }
+
     function saveResponse(resource: string, inputDeps: string[], resp: any, opType: 'data' | 'read' | 'create' | 'update' | 'delete' | 'import') {
         const [state, pointers, summary] = extractPointers(resp)
         if (opType === 'data') {
             return { state, pointers }
         }
 
-        if (opType !== 'delete') {
-            const key = `/deploy/resource-${resource}`
-            const dependencies = Object.entries(summary ?? {}).map(([k, v]) => v.map(h => `${k}:${h}`)).flat()
-            const pointer = fs.writeDataSync(`[#${key}]`, Buffer.from(JSON.stringify(state), 'utf-8'), {
-                metadata: {
-                    pointers,
-                    dependencies: Array.from(new Set([...dependencies, ...inputDeps])),
-                }
-            })
-            getStateWriter().update(resource, pointer)
-        } else {
+        if (opType === 'delete') {
             getStateWriter().remove(resource)
+            return { state, pointers }
         }
+
+        const key = `/deploy/resource-${resource}`
+        const dependencies = Object.entries(summary ?? {}).map(([k, v]) => v.map(h => `${k}:${h}`)).flat()
+        const pointer = fs.writeDataSync(`[#${key}]`, Buffer.from(JSON.stringify(state), 'utf-8'), {
+            metadata: {
+                pointers,
+                dependencies: Array.from(new Set([...dependencies, ...inputDeps])),
+            }
+        })
+        const hashes = getStateWriter().update(resource, pointer)
     
-        return { state, pointers }
+        return { state, pointers, hashes }
     }
 
     return {
         getState,
-        isDeployed,
         commitState,
         getResourceStore,
         createResourceStore,
         saveResponse,
+        repairState,
     }
 }
 

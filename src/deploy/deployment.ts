@@ -2,7 +2,7 @@ import * as path from 'node:path'
 import * as fs from 'node:fs/promises'
 import * as child_process from 'node:child_process'
 import { DeploymentContext, startService } from './server'
-import { BuildTarget, LocalWorkspace, getProviderCacheDir, getBuildDir } from '../workspaces'
+import { BuildTarget, LocalWorkspace, getProviderCacheDir, getBuildDir, getDeploymentBuildDirectory } from '../workspaces'
 import type { TfJson } from '../runtime/modules/terraform'
 import EventEmitter from 'node:events'
 import { Logger, OutputContext, getLogger, runTask } from '../logging'
@@ -33,6 +33,8 @@ export interface DeployOptions {
     useTests?: boolean
     target?: string
     sharedLib?: boolean
+    
+    stateLogPath?: string
 
     // Persists a session for repeat deployments
     keepAlive?: boolean
@@ -83,7 +85,7 @@ export function getSynapseResourceOutput(r: TfState['resources'][number]): any {
 }
 
 function maybeExtractError(takeError: (requestId: string) => unknown | undefined, reason?: string) {
-    const requestId = reason?.match(/x-synapse-request-id: ([\w]+)/)?.[1] // TODO: only need to check for this w/ custom resources
+    const requestId = reason?.match(/x-synapse-request-id: (\w+)/)?.[1] // TODO: only need to check for this w/ custom resources
     if (!requestId) {
         return
     }
@@ -91,7 +93,10 @@ function maybeExtractError(takeError: (requestId: string) => unknown | undefined
     const maybeError = takeError(requestId)
     if (isErrorLike(maybeError)) {
         return maybeError
-    }  
+    }
+
+    getLogger().warn(`unknown error`, maybeError)
+    return new Error(`Got unknown error`)
 }
 
 function createInitView() {
@@ -228,9 +233,8 @@ function createTerraformLogger(
             }
             case 'apply_errored': {
                 const resource = entry.hook.resource
-                logger.debug(`Failed to ${entry.hook.action}: ${resource.resource}`)
-
                 const reason = entry.hook.reason
+                logger.debug(`Failed to ${entry.hook.action}: ${resource.resource}`)
 
                 if (takeError) {
                     const maybeError = maybeExtractError(takeError, reason)
@@ -433,12 +437,10 @@ export async function startTerraformSession(
         ...process.env,
         TF_SYNAPSE_PROVIDER_ENDPOINT: `http://localhost:${server.port}`,
         TF_SYNAPSE_PROVIDER_WORKING_DIRECTORY: context.buildTarget.workingDirectory,
-        // TF_SYNAPSE_PROVIDER_OUTPUT_DIR: '',
-        // TF_SYNAPSE_PROVIDER_BUILD_DIR: '',
 
         TF_PLUGIN_CACHE_DIR: getProviderCacheDir(),
         TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE: '1',
-    
+
         TF_AWS_GLOBAL_TIME_MODIFIER: '0.25',
         // TF_LOG: 'TRACE',
     }
@@ -597,12 +599,14 @@ export async function startTerraformSession(
     return {
         apply: async (opt?: DeployOptions) => {
             isReady = false
+            opt = { ...opt, stateLogPath: path.resolve(getDeploymentBuildDirectory(context.buildTarget), 'state.log') }
             await write(`${['apply', ...getDeployOptionsArgs(opt)].join(' ')}\n`)
 
             return waitForResult()
         },
         destroy: async (opt?: DeployOptions) => {
             isReady = false
+            opt = { ...opt, stateLogPath: path.resolve(getDeploymentBuildDirectory(context.buildTarget), 'state.log') }
             await write(`${['apply', '-destroy', ...getDeployOptionsArgs(opt)].join(' ')}\n`)
 
             return waitForReady()
@@ -674,6 +678,10 @@ function getDeployOptionsArgs(opt: DeployOptions | undefined) {
 
     if (opt.autoApprove) {
         args.push('-auto-approve')
+    }
+
+    if (opt.stateLogPath) {
+        args.push('-state-log', opt.stateLogPath)
     }
 
     function addMultiValuedSwitch(switchName: string, val: string | string[]) {
@@ -1159,34 +1167,14 @@ export async function getTerraformPath() {
     throw new Error(`Missing binary. Corrupted installation?`)
 }
 
-// We mutate the state object directly
-export function createStatePersister(currentState: TfState | undefined, programHash: string, procFs = getDeploymentFs()) {
+export function createStatePersister(currentState: TfState | undefined, programHash: string, deployFs = getDeploymentFs()) {
     const getLineage = memoize(() => currentState?.lineage ?? randomUUID())
     const getNextSerial = memoize(() => (currentState?.serial ?? 0) + 1)
 
-    function createStateFile(resources: TfState['resources']): TfState {
-        const version = resources.length === 0 
-            ? (currentState?.version ?? 4)
-            : resources[0].state ? 5 : 4
-
-        return {
-            version,
-            serial: getNextSerial(),
-            lineage: getLineage(),
-            resources,
-        }
-    }
-
     // These hashes are used for incremental deploys
     const resourceHashes: Record<string, string | null> = {}
-    const stateMap: Record<string, TfState['resources'][number]> = {}
-    if (currentState) {
-        for (const r of currentState.resources) {
-            stateMap[`${r.type}.${r.name}`] = r
-        }
-    }
 
-    const getPreviousHashes = memoize(() => getResourceProgramHashes(procFs))
+    const getPreviousHashes = memoize(() => getResourceProgramHashes(deployFs))
 
     async function saveHashes() {
         const previous = await getPreviousHashes()
@@ -1196,15 +1184,11 @@ export function createStatePersister(currentState: TfState | undefined, programH
                 delete merged[k]
             }
         }
-        await setResourceProgramHashes(procFs, merged as Record<string, string>)
+        await setResourceProgramHashes(deployFs, merged as Record<string, string>)
     }
 
-    // FIXME: this should write out to a separate backup file in addition to the normal flow
     async function _saveState() {
-        await Promise.all([
-            saveHashes(),
-            putState(createStateFile(Object.values(stateMap)), procFs),
-        ])
+        return saveHashes()
     }
 
     let writeTimer: number | undefined
@@ -1218,17 +1202,7 @@ export function createStatePersister(currentState: TfState | undefined, programH
         writeTimer = +setTimeout(async () => {
             await pendingSave
             await saveState()
-        }, 10)
-    }
-
-    function updateResource(id: string, instanceState?: TfState['resources'][number]) {
-        if (!instanceState) {
-            delete stateMap[id]
-        } else {
-            stateMap[id] = instanceState
-        }
-
-        triggerSave()
+        }, 1_000)
     }
 
     const l = getLogger().onDeploy(ev => {
@@ -1236,10 +1210,6 @@ export function createStatePersister(currentState: TfState | undefined, programH
             resourceHashes[ev.resource] = programHash
         }
         if (ev.status !== 'complete' || ev.resource.startsWith('data.')) return
-
-        if (ev.action !== 'read' && ev.action !== 'noop') {
-            updateResource(ev.resource, ev.state)
-        }
 
         if (ev.action !== 'read') {
             if (ev.action === 'delete') {
@@ -1272,11 +1242,8 @@ export function createStatePersister(currentState: TfState | undefined, programH
         l2.dispose()
         clearTimeout(writeTimer)
 
-        if (writeTimer && !pendingSave) {
-            await saveState()
-        } else {
-            await pendingSave
-        }
+        await pendingSave
+        await saveState()
     }
 
     return { getLineage, getNextSerial, dispose }

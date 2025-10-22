@@ -79,10 +79,6 @@ interface BareReference extends Expression {
 // FIXME: this cannot be trapped/captured
 // const hasOwnProperty = Object.prototype.hasOwnProperty
 
-function isNonNullObjectLike(o: any) {
-    return (typeof o === 'object' || typeof o === 'function') && !!o
-}
-
 function isCustomSerializeable(o: object | Function) {
     if (moveable in o || isRegExp(o)) {
         return true
@@ -193,35 +189,37 @@ const serializeableSymbols = new Set([permissions, browserImpl, objectId, stubWh
 const reflectionType = Symbol.for('reflectionType')
 
 function getSymbols(o: any) {
-    const symbols = Object.getOwnPropertySymbols(o).filter(s => s.description).filter(s => serializeableSymbols.has(s))
+    const symbols = Object.getOwnPropertySymbols(o).filter(s => s.description && serializeableSymbols.has(s))
 
     return symbols.length > 0 ? Object.fromEntries(symbols.map(s => [s.description!, o[s]])) : undefined
 }
 
-function decomposeObject(o: any, keys = new Set(Object.keys(o))): any {
-    const props = Object.getOwnPropertyNames(o)
-    const descriptors = Object.getOwnPropertyDescriptors(o)
-
+function decomposeObject(o: any, unproxied: any): any {
     // If the object isn't unwrapped then you can get weird cases of self-references
-    const actualProperties = Object.fromEntries(
-        props.filter(k => keys.has(k)).map(k => [k, unwrapProxy(o)[k]])
-    )
+    const descriptors = Object.getOwnPropertyDescriptors(unproxied)
 
-    // `prototype` is read-only for functions!!!
-    // THIS DOESN'T WORK CORRECTLY
-    const includePrototype = (typeof o === 'function' && isNonNullObjectLike(o.prototype) && Object.keys(o.prototype).length > 0)
-    const actualDescriptors = Object.fromEntries(
-        Object.entries(descriptors)
-            .filter(([k]) => (keys.has(k) && !props.includes(k)) || (includePrototype && k === 'prototype'))
-    )
+    const filteredProperties: [string, any][] = []
+    const filteredDescriptors: [string, PropertyDescriptor][] = []
+    for (const k of Object.keys(descriptors)) {
+        const d = descriptors[k]
+        if (d.get || d.set || !d.writable || !d.configurable || !d.enumerable) {
+            filteredDescriptors.push([k, d])
+        } else {
+            filteredProperties.push([k, d.value])
+        }
+    }
 
+    // we prefer using the constructor whenever possible
+    const ctor = unproxied.constructor
     const prototypeSlot = Object.getPrototypeOf(o)
 
+    // `__prototype` refers to [[prototype]] here 
+
     return {
-        __constructor: o.constructor?.name !== 'Object' ? o.constructor : undefined,
-        __prototype: !isObjectOrNullPrototype(prototypeSlot) ? prototypeSlot : undefined,
-        properties: Object.keys(actualProperties).length > 0 ? actualProperties : undefined,
-        descriptors: Object.keys(actualDescriptors).length > 0 ? actualDescriptors : undefined,
+        __constructor: ctor?.name !== 'Object' ? ctor : undefined,
+        __prototype: prototypeSlot !== ctor?.prototype && !isObjectOrNullPrototype(prototypeSlot) ? prototypeSlot : undefined,
+        properties: filteredProperties.length > 0 ? Object.fromEntries(filteredProperties) : undefined,
+        descriptors: filteredDescriptors.length > 0 ? Object.fromEntries(filteredDescriptors) : undefined,
         symbols: getSymbols(o),
     }
 }
@@ -233,7 +231,7 @@ function isDataPointer(h: string): h is DataPointer {
 }
 
 export function isRegExp(o: any): o is RegExp {
-    return o instanceof RegExp || (typeof o === 'object' && !!o && 'source' in o && Symbol.match in o)
+    return o instanceof RegExp || (typeof o === 'object' && o !== null && 'source' in o && Symbol.match in o)
 }
 
 type Ref = { [tableRefSym]: () => any }
@@ -442,7 +440,7 @@ export function createSerializer(
 
     function withContext(ctx: Context) {
         function peekReflectionType(obj: any) {
-            if (!obj || (typeof obj !== 'object' && typeof obj !== 'function')) {
+            if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) {
                 return
             }
     
@@ -563,22 +561,28 @@ export function createSerializer(
                     }
                 }
     
-                const desc = resolveMoveableDescription(obj)
+                const desc = resolveMoveableDescription(obj, id)
                 if (desc?.type === 'direct') {
-                    return serializeObjectLiteral({ ...desc.data, id })
+                    if (desc.data.properties) {
+                        // we want to re-capture the value now
+                        for (const k of Object.keys(desc.data.properties)) {
+                            desc.data.properties[k] = unproxied[k]
+                        }
+                    }
+                    return serializeObjectLiteral(desc.data, true)
                 }
     
                 if (typeof obj.constructor === 'function') {
-                    const ctorDesc = resolveMoveableDescription(obj.constructor)
+                    const ctorDesc = resolveMoveableDescription(obj.constructor, id)
     
                     if (ctorDesc?.type === 'direct') {
-                        return serializeFullObject(id, obj)
+                        return serializeFullObject(id, obj, unproxied)
                     }
                 }
     
                 // This is a best-effort serialization...
                 if (desc?.type === 'reflection') {
-                    return serializeObjectLiteral({ ...desc.data, id })
+                    return serializeObjectLiteral(desc.data, true)
                 }
     
                 if (isJsonSerializeable(obj)) {
@@ -604,10 +608,10 @@ export function createSerializer(
                             }
                         }
     
-                        return serializeFullObject(boundId, obj)
+                        return serializeFullObject(boundId, obj, unproxied)
                     }
     
-                    return serializeFullObject(id, obj)
+                    return serializeFullObject(id, obj, unproxied)
                 }
     
                 if (typeof obj === 'function') {
@@ -710,29 +714,30 @@ export function createSerializer(
                     }
                 }
 
-                return serializeFullObject(id, obj)
+                return serializeFullObject(id, obj, unproxied)
             }
         }
     
-        function resolveMoveableDescription(obj: any) {
-            const symbols = getSymbols(obj)
+        // passing in `id` is an optimization
+        function resolveMoveableDescription(obj: any, id: string) {
             const direct = typeof obj[moveable] === 'function' ? obj[moveable]() : undefined
-            const reflection = typeof obj[moveable2] === 'function' ? obj[moveable2]() : undefined
-    
-            if ((!direct && reflection)) {
-                const desc = symbols ? { symbols, ...reflection } : reflection
-    
-                return { type: 'reflection' as const, data: desc }
-            }
-    
             if (direct) {
-                const desc = symbols ? { symbols, ...direct } : direct
+                const symbols = getSymbols(obj)
+                const desc = symbols ? { symbols, ...direct, id } : { ...direct, id }
     
                 return { type: 'direct' as const, data: desc }
             }
+
+            const reflection = typeof obj[moveable2] === 'function' ? obj[moveable2]() : undefined
+            if (reflection) {
+                const symbols = getSymbols(obj)
+                const desc = symbols ? { symbols, ...reflection, id } : { ...reflection, id }
+    
+                return { type: 'reflection' as const, data: desc }
+            }
         }
     
-        function serializeObjectLiteral(obj: any) {
+        function serializeObjectLiteral(obj: any, inplace = false) {
             if (!obj) {
                 return
             }
@@ -740,23 +745,16 @@ export function createSerializer(
             // `Object.keys` is the fastest way to iterate over an object in v8
             // For whatever reason, it also appears to make `Object.entries` faster
             // after v8 optimizes the code.
-            const r: any = {}
+            const r: any = inplace ? obj : {}
             for (const k of Object.keys(obj)) {
                 r[k] = serialize(obj[k])
             }
             return r
         }
     
-        function serializeFullObject(id: number | string, obj: any) {
-            const decomposed = decomposeObject(obj)
-    
-            // Note: `prototype` refers to [[prototype]] here
-            const ctor = decomposed.__constructor ?? decomposed.__prototype?.constructor
-            if (ctor && moveable in ctor) {
-                delete decomposed['__prototype']
-                ;(decomposed as any).__constructor = ctor
-            }
-    
+        function serializeFullObject(id: number | string, obj: any, unproxied: any) {
+            const decomposed = decomposeObject(obj, unproxied)
+
             const finalDesc = typeof obj[serializeSym] === 'function'
                 ? obj[serializeSym](decomposed) 
                 : decomposed
@@ -1421,7 +1419,7 @@ function toSnakeCase(str: string) {
 
 export function isElement(o: unknown): o is { [internalState]: TerraformElement } {
     return (
-        !!o &&
+        o !== null &&
         (typeof o === 'object' || typeof o === 'function') &&
         internalState in o &&
         typeof o[internalState] === 'object'

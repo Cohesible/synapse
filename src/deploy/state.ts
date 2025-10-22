@@ -41,7 +41,3 @@ export interface TfState {
     resources: TfResource[]
 }
 
-export interface AnnotatedTfState extends TfState {
-    serial: number
-    lineage: string
-}

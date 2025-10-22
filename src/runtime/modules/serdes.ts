@@ -29,7 +29,7 @@ export interface ExternalValue {
     readonly operations?: ReflectionOperation[] // Only applicable to `reflection`
     readonly symbols?: Record<string, any>
     readonly packageInfo?: PackageInfo // Only used for `reflection` type right now
-    readonly decorators?: any[]
+    readonly decorators?: any[] // unused
 
     // Refers to the values of a bound function
     readonly boundTarget?: any
@@ -39,6 +39,10 @@ export interface ExternalValue {
     // For reference bindings
     readonly key?: string
     readonly value?: number | string
+
+    // Applied over the result
+    readonly properties?: Record<string, any>
+    readonly descriptors?: Record<string, any>
 }
 
 export interface PackageInfo {
@@ -166,8 +170,10 @@ export function resolveValue(
     dataTable: Record<string | number, any> = {},
     context = globalThis,
 ): any {
+    // todo: revisit this, does it help perf or is it outdated?
     function loadFunction(val: any, params: any[]) {
         switch (params.length) {
+            case 0:     return val()
             case 1:     return val(params[0])
             case 2:     return val(params[0], params[1])
             case 3:     return val(params[0], params[1], params[2])
@@ -297,6 +303,7 @@ export function resolveValue(
         }
 
         if (Array.isArray(o)) {
+            // TODO: shouldn't this set `objectCache` to a pre-initialized array?
             let isPromise = false
             const a = o.map(x => {
                 const e = resolve(x)
@@ -319,7 +326,7 @@ export function resolveValue(
         if (payload === undefined) {
             let isPromise = false
             const r: Record<string, any> = {}
-            objectCache.set(o, r)
+            objectCache.set(o, r) // todo: is this needed still? we never overwrite the object cache ?
 
             for (const [k, v] of Object.entries(o)) {
                 r[k] = resolve(v)
@@ -396,6 +403,8 @@ export function resolveValue(
                         return payload.boundTarget!.bind(payload.boundThisArg, ...payload.boundArgs!)
                 }
 
+                // case 'function'
+
                 const module = typeof payload.module === 'object' || payload.module.startsWith(pointerPrefix)
                     ? payload.module 
                     : `${pointerPrefix}${payload.module}`
@@ -426,7 +435,36 @@ export function resolveValue(
         }
 
         const isReference = payload.id !== undefined && payload.valueType === undefined
-        const resolvedPayload = resolve(isReference ? dataTable[payload.id] : payload)
+        const _payload = isReference ? dataTable[payload.id] : payload
+
+        // only used for static fields on classes currently (TODO: could be nicer)
+        if (_payload.valueType === 'function' && _payload.properties) {
+            const props = { ..._payload.properties }
+            delete _payload.properties
+
+            const resolvedPayload = resolve(_payload)
+            const resolvedValue = resolvedPayload instanceof Promise ? resolvedPayload.then(finalize) : finalize(resolvedPayload)
+
+            if (resolvedValue instanceof Promise) {
+                return resolvedValue.then(async x => {
+                    const resolvedProps = await resolve(props)
+                    _payload.properties = props
+
+                    return Object.assign(x, resolvedProps)
+                })
+            }
+
+            _payload.properties = props
+
+            const resolvedProps = resolve(props)
+            if (resolvedProps instanceof Promise) {
+                return resolvedProps.then(x => Object.assign(resolvedValue, x))
+            }
+
+            return Object.assign(resolvedValue, resolvedProps)
+        }
+
+        const resolvedPayload = resolve(_payload)
         if (resolvedPayload instanceof Promise) {
             return resolvedPayload.then(finalize)
         }

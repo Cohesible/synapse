@@ -315,11 +315,6 @@ export function main(...args: string[]) {
                 handleUnknownError(e)
             }
         } finally {
-            await dispose()
-            await disposable?.dispose() // No more log events will be emitted
-
-            await profiler?.dispose()
-
             setTimeout(() => {
                 process.stderr.write(`Forcibly shutting down\n`)
                 if (process.env['SYNAPSE_DEBUG'] || process.env['CI']) {
@@ -329,7 +324,12 @@ export function main(...args: string[]) {
                 } else {
                     process.exit(handledError ? 1 : undefined)
                 }
-            }, 15_000).unref()
+            }, 30_000).unref()
+
+            await dispose()
+            await disposable?.dispose() // No more log events will be emitted.
+
+            await profiler?.dispose()
 
             process.exitCode = process.exitCode || (handledError ? 1 : 0)
 

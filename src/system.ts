@@ -105,7 +105,6 @@ function createFileHandle(writeFile: WriteFileFn, close: () => Promise<void>): F
                 tasks.forEach(t => t.callback(e))
                 closingCallback?.(e)
             }
-
         }
 
         isWorking = false

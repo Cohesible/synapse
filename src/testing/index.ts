@@ -149,6 +149,8 @@ export function createTestRunner(
             emitStatus(test, 'failed', err)
             
             return err
+        } finally {
+            loader.unloadModule(test.resolved.pointer)
         }
     }
 

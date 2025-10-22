@@ -8,7 +8,7 @@ import { bundleClosure, createDataExport, getImportMap, isDeduped, normalizeSymb
 import { getLogger } from '../logging'
 import { ModuleResolver, createImportMap } from '../runtime/resolver'
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { BuildFsFragment, ProcessStore } from '../artifacts'
+import { BuildFsFragment, DeploymentStore } from '../artifacts'
 import { PackageService } from '../pm/packages'
 import { TerraformPackageManifest } from '../runtime/modules/terraform'
 import { Fs, SyncFs, readDirRecursive } from '../system'
@@ -20,7 +20,7 @@ import { apiRegistrationResourceType, getServiceRegistry } from './registry'
 
 export interface DeploymentContext {
     readonly fs: Fs & SyncFs
-    readonly processStore: ProcessStore
+    readonly processStore: DeploymentStore
     readonly dataDir: string
     readonly packageManifest: TerraformPackageManifest
     readonly packageService: PackageService
@@ -34,6 +34,7 @@ export interface ModuleLoader {
     loadModule: (id: string, origin?: string) => Promise<any>
     registerMapping(mapping: ImportMap, location: string): void
     runWithContext: <T>(namedContexts: Record<string, any>, fn: () => Promise<T> | T) => Promise<T>
+    unloadModule: (id: string, origin?: string) => void
 }
 
 
@@ -596,6 +597,7 @@ function createProviderRoute(ctx: DeploymentContext, handlers: Handlers) {
     interface ProviderResponse<T> {
         readonly state: T
         readonly pointers?: Pointers
+        // readonly hashes?: { h: string; sh: string }
     }
 
     async function runResourceRequestWithArtifactFs<T>(payload: ProviderRequest, fn: (payload: ProviderRequest) => Promise<T>): Promise<ProviderResponse<T>> {
@@ -606,6 +608,16 @@ function createProviderRoute(ctx: DeploymentContext, handlers: Handlers) {
             // FIXME: `resp ?? null` is not entirely correct here. We have no way to serialize `undefined`
             return ctx.processStore.saveResponse(payload.resourceName, Array.from(inputDeps), resp ?? null, payload.operation)
         }).catch(e => {
+            // need to cast into an error-like (FIXME: check for `name` and `message` too)
+            if (typeof e !== 'function' && (typeof e !== 'object' || e === null)) {
+                e = String(e)
+            }
+
+            // it's pretty easy to accidentally write `reject('some err msg')`
+            if (typeof e === 'string') {
+                e = new Error(e)
+            }
+
             const resourceId = `synapse_resource.${payload.resourceName}`
             throw Object.assign(e, { [resourceIdSymbol]: resourceId })
         })

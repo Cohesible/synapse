@@ -16,7 +16,7 @@ interface ObjectLiteralInput {
     [key: string]: Literal | Literal[]
 }
 
-type Literal = boolean | string | number | ts.Expression | ObjectLiteralInput | undefined
+type Literal = boolean | string | number | ts.Expression | ObjectLiteralInput | undefined | null
 type NonNullableLiteral = NonNullable<Literal> | Literal[]
 
 export function isNode(obj: unknown): obj is ts.Node {
@@ -509,7 +509,7 @@ export function hashNode(node: ts.Node) {
     const original = ts.getOriginalNode(node)
     const text = original.getText(original.getSourceFile())
 
-    return getHash(text).slice(16)
+    return getHash(text)
 }
 
 export interface MemoziedFunction<T> {
@@ -1241,13 +1241,18 @@ export function createRwMutex() {
     }
 
     function release(id: number) {
-        if (!data.has(id)) {
+        const lockData = data.get(id)
+        if (!lockData) {
             return
         }
 
-        const lastLockType = data.get(id)!.type
         data.delete(id)
 
+        if (!lockData.acquired) {
+            return
+        }
+
+        const lastLockType = lockData.type
         const readers = getAcquired().filter(x => x.type === 'read')
         let nextLockType = readers.length === 0 ? 'write' : lastLockType
 

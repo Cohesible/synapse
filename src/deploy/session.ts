@@ -1,6 +1,6 @@
 import * as path from 'node:path'
 import { getLogger, LogLevel, runTask } from '../logging'
-import { createMountedFs, getPublished, getDeploymentFs, getDataRepository, getDeploymentStore, readState, toFsFromIndex, createTempMountedFs, getFsFromHash, toFsFromHash, getProgramFs, getProgramHash, DataRepository } from '../artifacts'
+import { createMountedFs, getPublished, getDeploymentFs, getDataRepository, getDeploymentStore, readState, toFsFromIndex, createTempMountedFs, getFsFromHash, toFsFromHash, getProgramFs, getProgramHash, DataRepository, getArtifactFs } from '../artifacts'
 import { getAuth } from '../auth'
 import { getBackendClient } from '../backendClient'
 import { isDataPointer } from '../build-fs/pointers'
@@ -22,10 +22,11 @@ import { printLine } from '../cli/ui'
 import { formatWithOptions } from 'node:util'
 import { getDeployables, getEntrypointsFile } from '../compiler/programBuilder'
 import { ModuleLoader } from './server'
-import { Fs, SyncFs } from '../system'
 import { ModuleResolver } from '../runtime/resolver'
 import { getServiceRegistry } from './registry'
 import { maybeLoadEnvironmentVariables } from '../runtime/env'
+import { randomUUID } from 'node:crypto'
+import { didLogEnd, tryRepairState } from './stateLog'
 
 export async function loadBuildState(bt: BuildTarget, repo = getDataRepository()) {
     const mergedFs = await createMergedView(bt.programId, bt.deploymentId)
@@ -154,6 +155,7 @@ export async function getModuleLoader(wrapConsole = true, useThisContext = false
             loadModule,
             runWithContext,
             registerMapping: resolver.registerMapping,
+            unloadModule: (id, origin) => loader.unload(id, origin, loaderContext?.ctx),
         }
     }
 
@@ -294,6 +296,7 @@ export async function createSessionContext(programHash?: string): Promise<Sessio
             runWithContext: async <T>(namedContexts: Record<string, any>, fn: () => Promise<T> | T) => {
                 return loaderContext.runWithNamedContexts(namedContexts, fn)
             },
+            unloadModule: (id, origin) => loader.unload(id, origin, loaderContext.ctx),
         }
     }
 
@@ -339,9 +342,34 @@ export async function createSession(ctx: SessionContext, opt?: DeployOptions) {
         await persister?.dispose()
         persister = undefined
 
-        state = await readState()
+        const deploymentDir = getDeploymentBuildDirectory(ctx.buildTarget)
+        const _maybeStateLog = getFs().readFile(path.resolve(deploymentDir, 'state.log'), 'utf-8').catch(throwIfNotFileNotFoundError)
+
+        state = await readState() ?? {
+            lineage: randomUUID(),
+            resources: [],
+            serial: 0,
+            version: 4,
+        }
+
+        const promises: Promise<void>[] = []
+        const maybeStateLog = await _maybeStateLog
+        if (maybeStateLog) {
+            if (didLogEnd(maybeStateLog)) {
+                promises.push(getFs().deleteFile(path.resolve(deploymentDir, 'state.log')))
+            } else {
+                if (state) {
+                    state = tryRepairState(state, ctx.processStore, maybeStateLog)
+                    state.serial += 1
+                    const afs = await getArtifactFs()
+                    await afs.commit(state, programHash, opt?.useTests ? true : undefined)
+                    await getFs().deleteFile(path.resolve(deploymentDir, 'state.log'))
+                }
+            }
+        }
+
         if (state) {
-            const stateDest = path.resolve(getDeploymentBuildDirectory(ctx.buildTarget), 'state.json')
+            const stateDest = path.resolve(deploymentDir, 'state.json')
             await getFs().writeFile(stateDest, JSON.stringify(state))
             try {
                 await session.setState(stateDest)
@@ -357,6 +385,8 @@ export async function createSession(ctx: SessionContext, opt?: DeployOptions) {
         if (!noSave) {
             ensurePersister()
         }
+
+        await Promise.all(promises)
 
         return state
     }

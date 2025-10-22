@@ -1394,8 +1394,9 @@ registerTypedCommand(
 )
 
 registerTypedCommand(
-    'query-logs',  
+    'logs',  
     {
+        aliases: ['query-logs'], // deprecated name
         category: 'debugging',
         args: [{ name: 'symbol-path', type: 'string', allowMultiple: true }],
         options: [{ name: 'system', type: 'boolean', description: 'Shows system log messages' }],

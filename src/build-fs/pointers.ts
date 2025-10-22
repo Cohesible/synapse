@@ -69,7 +69,7 @@ class Pointer extends String {
     }
 }
 
-export function createPointer(hash: string, source: { id: string; close: () => string } | string): DataPointer {
+export function createPointer(hash: string, source: string | { id: string; close: () => string }): DataPointer {
     return new Pointer(hash, source) as any as DataPointer
 }
 

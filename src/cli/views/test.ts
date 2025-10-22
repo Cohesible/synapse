@@ -5,14 +5,19 @@ import { colorize, format, printLine } from '../ui'
 
 // We should output the filename for each suite/test
 export function createTestView() {
-    const startTimes = new Map<string, Date>()
-    function getDuration(id: string, endTime: Date) {
+    const startTimes = new Map<string, number>()
+    const usePerformance = false
+
+    function getDuration(id: string, endTime: number) {
         const startTime = startTimes.get(id)
         if (!startTime) {
             return
         }
 
-        const dur = endTime.getTime() - startTime.getTime()
+        const dur = endTime - startTime
+        if (usePerformance) {
+            return dur.toFixed(3)
+        }
 
         return dur < 5 ? 0 : dur
     }
@@ -54,7 +59,7 @@ export function createTestView() {
                 printLine(`${getIndent(ev)}- ${ev.name}`)
             }
 
-            return startTimes.set(ev.id, ev.timestamp)
+            return startTimes.set(ev.id, usePerformance ? performance.now() : ev.timestamp.getTime())
         }
 
         if (ev.itemType === 'suite') {
@@ -62,7 +67,7 @@ export function createTestView() {
         }
 
         const duration = ev.status === 'passed' || ev.status === 'failed'
-            ? getDuration(ev.id, new Date())
+            ? getDuration(ev.id, usePerformance ? performance.now() : Date.now())
             : undefined
 
         const durationText = duration ? colorize('gray', ` (${duration}ms)`) : ''

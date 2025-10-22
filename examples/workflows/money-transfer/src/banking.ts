@@ -50,6 +50,9 @@ class Bank {
   }
 
   async updateBalance(accountNumber: string, delta: number) {
+    // note: this lock does not guarantee isolation in the critical section beyond the duration provided 
+    // due to the force-release functionality. A general purpose distributed lock that's also robust towards
+    // process crashes w/o a timeout would need a supervisor layer, which we currently do not have.
     await this.accountsLock.lock(accountNumber, 5_000)
     try {
       return await this._updateBalance(accountNumber, delta)

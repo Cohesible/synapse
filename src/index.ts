@@ -957,7 +957,7 @@ export async function runTests(targets: string[], opt?: TestOptions) {
     }
 
     const testRunner = createTestRunner(session.moduleLoader, session.ctx.packageService, opt)
-    const resolvedSuites = await testRunner.loadTestSuites(suites, tests)
+    const resolvedSuites = await runTask('test', 'load suites', () => testRunner.loadTestSuites(suites, tests), 0)
 
     const failures: FailedTestEvent[] = []
     getLogger().onTest(ev => {

@@ -74,7 +74,7 @@ async function moneyTransfer(details: PaymentDetails): Promise<string> {
 const workflows = createWorkflowService()
 const moneyTransferWorkflow = workflows.register(moneyTransfer)
 
-export async function main() {
+export async function main(invoiceId = '1') {
     const details: PaymentDetails = {
         amount: 400,
         sourceAccount: '85-150',
@@ -83,7 +83,7 @@ export async function main() {
     }
 
     try {
-        const resp = await moneyTransferWorkflow.run('pay-invoice-804', details)
+        const resp = await moneyTransferWorkflow.run(`pay-invoice-${invoiceId}`, details)
         console.log(resp)
     } finally {
         const bank1 = new BankingService('bank1.example.com')

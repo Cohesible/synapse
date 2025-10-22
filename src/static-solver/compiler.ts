@@ -19,12 +19,15 @@ function createMovablePropertyName(factory = ts.factory) {
     return createSymbolPropertyName('__moveable__', factory)
 }
 
-function createSerializationData(
-    targetModule: string,
-    captured: ts.Expression[],
-    factory = ts.factory,
-    moduleType: 'esm' | 'cjs'
-) {
+// seeing if this speeds up emit (brittle)
+const cachedFactoryExpressions = new Map<string, ts.Expression>()
+function getFileNameNode(factory: ts.NodeFactory, moduleType: 'esm' | 'cjs') {
+    const key = `${moduleType}:filename`
+    const cached = cachedFactoryExpressions.get(key)
+    if (cached) {
+        return cached
+    }
+
     const filename = moduleType === 'cjs'
         ? factory.createIdentifier('__filename')
         : factory.createPropertyAccessExpression(
@@ -32,8 +35,33 @@ function createSerializationData(
             'filename'
         )
 
+    cachedFactoryExpressions.set(key, filename)
+
+    return filename
+}
+
+function getCachedIdent(factory: ts.NodeFactory, name: string) {
+    const cached = cachedFactoryExpressions.get(name)
+    if (cached) {
+        return cached as ts.Identifier
+    }
+
+    const ident = factory.createIdentifier(name)
+    cachedFactoryExpressions.set(name, ident)
+
+    return ident
+}
+
+function createSerializationData(
+    targetModule: string,
+    captured: ts.Expression[],
+    factory = ts.factory,
+    moduleType: 'esm' | 'cjs'
+) {
+    const filename = getFileNameNode(factory, moduleType)
+
     const moduleExpression = factory.createCallExpression(
-        factory.createIdentifier('__getPointer'),
+        getCachedIdent(factory, '__getPointer'),
         undefined,
         [
             filename,
@@ -45,6 +73,32 @@ function createSerializationData(
         valueType: 'function',
         module: moduleExpression,
         captured,
+    }, factory)
+}
+
+function createClassSerializationData(
+    targetModule: string,
+    captured: ts.Expression[],
+    factory = ts.factory,
+    moduleType: 'esm' | 'cjs',
+    properties: string[]
+) {
+    const filename = getFileNameNode(factory, moduleType)
+
+    const moduleExpression = factory.createCallExpression(
+        getCachedIdent(factory, '__getPointer'),
+        undefined,
+        [
+            filename,
+            factory.createStringLiteral(targetModule)
+        ]
+    )
+
+    return createObjectLiteral({
+        valueType: 'function',
+        module: moduleExpression,
+        captured,
+        properties: Object.fromEntries(properties.map(k => [k, null])),
     }, factory)
 }
 
@@ -2256,7 +2310,7 @@ export function createSerializer(
                 return name
             }
 
-            return name.slice(`${namePrefix}::`.length)
+            return name.slice(namePrefix.length + 2) // 2 is from `::`
         }
 
         const visited = new Map<ts.Node, ts.Node>()
@@ -2329,12 +2383,20 @@ export function createSerializer(
 
             return addSerializerSymbolToClass(
                 visitedClass,
-                createSerializationData(
-                    getRelativeName(name),
-                    renderCapturedSymbols(r.captured, r.assets),
-                    factory,
-                    moduleType,
-                ),
+                (staticFields) => staticFields.length 
+                    ? createClassSerializationData(
+                        getRelativeName(name),
+                        renderCapturedSymbols(r.captured, r.assets),
+                        factory,
+                        moduleType,
+                        staticFields,
+                    )
+                    : createSerializationData(
+                        getRelativeName(name),
+                        renderCapturedSymbols(r.captured, r.assets),
+                        factory,
+                        moduleType,
+                    ),
                 r.clauseReplacement,
                 staticStatements,
                 context,
@@ -2580,7 +2642,8 @@ function updateClass(node: ts.ClassDeclaration | ts.ClassExpression, props: Clas
 
 function addSerializerSymbolToClass(
     node: ts.ClassDeclaration | ts.ClassExpression,
-    serializationData: ts.Expression,
+    // TODO: don't pass in a cb for this...
+    getSerializationData: (staticFields: string[]) => ts.Expression,
     clauseReplacement: [clause: ts.HeritageClause, ident: ts.Identifier] | undefined,
     staticStatements: ts.Statement[],
     context: ts.TransformationContext,
@@ -2589,11 +2652,28 @@ function addSerializerSymbolToClass(
     const serializeSymbol = createSymbolPropertyName('serialize')
     const moveableSymbol = createSymbolPropertyName('__moveable__')
 
-    const privateFields = Object.fromEntries(getPrivateFields(node).map(n => [
-        (n.name! as ts.PrivateIdentifier).text,
+    const _privateFields: (ts.PropertyDeclaration & { name: ts.PrivateIdentifier })[] = []
+    const staticFields: string[] = []
+    for (let i = 0; i < node.members.length; i++) {
+        const m = node.members[i]
+        if (isPrivateField(m)) {
+            _privateFields.push(m)
+        } else if (ts.isPropertyDeclaration(m) && m.modifiers?.some(x => x.kind === ts.SyntaxKind.StaticKeyword) && m.name && ts.isIdentifier(m.name)) {
+            // we'll assume anything marked readonly is... readonly
+            if (m.modifiers?.some(x => x.kind === ts.SyntaxKind.ReadonlyKeyword)) {
+                continue
+            }
+            staticFields.push(m.name.text)
+        }
+    }
+
+    const serializationData = getSerializationData(staticFields)
+
+    const privateFields = Object.fromEntries(_privateFields.map(n => [
+        n.name.text,
         factory.createPropertyAccessExpression(
             factory.createThis(),
-            (n.name! as ts.PrivateIdentifier).text
+            n.name.text
         )
     ]))
 

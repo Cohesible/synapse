@@ -332,6 +332,25 @@ export function parseCjsExports(text: string, parseTypescriptLib = false) {
     }
 
     if (!parseTypescriptLib) {
+        // xxx: extremely hacky, need a proper parser...
+        let lineEnd = lastSemicolon
+        let lineStart = text.lastIndexOf('\n', lineEnd-1)
+
+        const exports: string[] = []
+        while (lineStart !== -1) {
+            const line = text.slice(lineStart+1, lineEnd)
+            const match = line.match(/exports\.(\w+) = /)
+            if (!match) break
+        
+            exports.push(match[1])
+            lineEnd = lineStart
+            lineStart = text.lastIndexOf('\n', lineEnd-1)
+        }
+
+        if (exports.length) {
+            return { exports, reexports: [] }
+        }
+
         return
     }
 
@@ -675,8 +694,10 @@ export function createModuleLinker(fs: Pick<SyncFs, 'readFileSync'>, resolver: M
         }
 
         const resolved = resolver.resolveVirtualWithHint(spec, importer)
-        const hasTypeHint = typeof resolved !== 'string' // Array.isArray(resolved)
+        const hasTypeHint = typeof resolved !== 'string'
         const id = hasTypeHint ? resolved[0] : resolved
+        // todo: decide if we should _ever_ cache based on pointer metadata, or if we expect the data to handle this
+        // const key = hasTypeHint && resolved[1] === 'pointer' ? toAbsolute(id as DataPointer) : id
         if (modules[id]) {
             return modules[id]
         }
@@ -1298,10 +1319,15 @@ export function createModuleLoader(
         return esm.evaluate() 
     } 
 
+    function unload(id: string, location = dummyEntrypoint, ctx = getDefaultContext()) {
+        getLinker(ctx).deleteCacheEntry(location, id)
+    }
+
     // XXX: too lazy to update dependencies
     return Object.assign(_createRequire, {
         loadEsm,
         loadCjs,
+        unload,
     })
 }
 
