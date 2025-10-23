@@ -1,6 +1,6 @@
 {
     "name": "synapse",
-    "version": "0.0.22",
+    "version": "0.0.23",
     "bin": "./src/cli/index.ts",
     "dependencies": {
         "esbuild": "^0.20.2",

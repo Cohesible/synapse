@@ -25,11 +25,20 @@ interface CommitDestroyEntry {
     readonly d: string // resource addr
 }
 
+interface StartEntry {
+    readonly k: 199
+    readonly d: {
+        readonly l: string
+        readonly s: number
+    }
+}
+
 interface EndEntry {
     readonly k: 200
 }
 
 type LogEntry = 
+    | StartEntry
     | WriteAheadEntry
     | CommitEntry
     | CommitDestroyEntry
@@ -159,6 +168,29 @@ export function didLogEnd(txt: string) {
     }
 
     return parsed.entry?.k === 200
+}
+
+export function tryParseLogStart(txt: string) {
+    const firstLine = txt.indexOf('\n')
+    if (firstLine === -1) {
+        return
+    }
+
+    const line = txt.slice(0, firstLine)
+    const parsed = tryParseLogLine(line)
+    if (parsed.err) {
+        getLogger().warn('state log parse error', parsed.err)
+        return
+    }
+
+    if (parsed.entry?.k !== 199) {
+        return
+    }
+
+    return {
+        lineage: parsed.entry.d.l,
+        serial: parsed.entry.d.s,
+    }
 }
 
 export async function gatherStateLogs(bt: BuildTarget) {

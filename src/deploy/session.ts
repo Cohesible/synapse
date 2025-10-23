@@ -26,7 +26,7 @@ import { ModuleResolver } from '../runtime/resolver'
 import { getServiceRegistry } from './registry'
 import { maybeLoadEnvironmentVariables } from '../runtime/env'
 import { randomUUID } from 'node:crypto'
-import { didLogEnd, tryRepairState } from './stateLog'
+import { didLogEnd, tryParseLogStart, tryRepairState } from './stateLog'
 
 export async function loadBuildState(bt: BuildTarget, repo = getDataRepository()) {
     const mergedFs = await createMergedView(bt.programId, bt.deploymentId)
@@ -358,9 +358,13 @@ export async function createSession(ctx: SessionContext, opt?: DeployOptions) {
             if (didLogEnd(maybeStateLog)) {
                 promises.push(getFs().deleteFile(path.resolve(deploymentDir, 'state.log')))
             } else {
-                if (state) {
+                const start = tryParseLogStart(maybeStateLog)
+                if (start?.serial === state.serial && (state.serial === 0 || state.lineage === start.lineage)) {
                     state = tryRepairState(state, ctx.processStore, maybeStateLog)
                     state.serial += 1
+                    if (start.serial === 0) {
+                        state.lineage = start.lineage
+                    }
                     const afs = await getArtifactFs()
                     await afs.commit(state, programHash, opt?.useTests ? true : undefined)
                     await getFs().deleteFile(path.resolve(deploymentDir, 'state.log'))
