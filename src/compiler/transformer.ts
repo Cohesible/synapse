@@ -370,7 +370,6 @@ export function createTransformer(
         visitSourceFile,
         visitAsInfraChunk,
         bindings,
-        getReflectionTransformer: () => createReflectionTransformer(graphCompiler, schemaFactory),
         getDeltas: (node: ts.Node) => sourceDeltas.get(node),
     }
 }

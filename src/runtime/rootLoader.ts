@@ -22,7 +22,11 @@ export function createBasicDataRepo(repo: DataRepository): BasicDataRepository {
         return encoding ? data.toString(encoding) : data
     }
 
-    return { getDataSync, getMetadata: repo.getMetadata }
+    function getDiskPath(fileName: string) {
+        return repo.resolveArtifact(fileName, { sync: true })
+    }
+
+    return { getDataSync, getMetadata: repo.getMetadata, getDiskPath }
 }
 
 export function createModuleResolverForBundling(fs: Fs & SyncFs, workingDirectory: string): ModuleResolver {

@@ -1068,7 +1068,6 @@ export async function plan(targets: string[], opt: PlanOptions = {}) {
             consoleLogger: true, 
             disableRefresh: !opt?.forceRefresh,
             ...opt,
-            // useCachedPlan: true,
         }
     )
 

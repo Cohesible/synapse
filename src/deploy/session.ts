@@ -352,45 +352,37 @@ export async function createSession(ctx: SessionContext, opt?: DeployOptions) {
             version: 4,
         }
 
-        const promises: Promise<void>[] = []
         const maybeStateLog = await _maybeStateLog
-        if (maybeStateLog) {
-            if (didLogEnd(maybeStateLog)) {
-                promises.push(getFs().deleteFile(path.resolve(deploymentDir, 'state.log')))
-            } else {
-                const start = tryParseLogStart(maybeStateLog)
-                if (start?.serial === state.serial && (state.serial === 0 || state.lineage === start.lineage)) {
-                    state = tryRepairState(state, ctx.processStore, maybeStateLog)
-                    state.serial += 1
-                    if (start.serial === 0) {
-                        state.lineage = start.lineage
-                    }
-                    const afs = await getArtifactFs()
-                    await afs.commit(state, programHash, opt?.useTests ? true : undefined)
-                    await getFs().deleteFile(path.resolve(deploymentDir, 'state.log'))
+        if (maybeStateLog && !didLogEnd(maybeStateLog)) {
+            const start = tryParseLogStart(maybeStateLog)
+            if (start?.serial === state.serial && (state.serial === 0 || state.lineage === start.lineage)) {
+                getLogger().log('Repairing deployment state', start.lineage)
+                state = tryRepairState(state, ctx.processStore, maybeStateLog)
+                state.serial += 1
+                if (start.serial === 0) {
+                    state.lineage = start.lineage
                 }
+                const afs = await getArtifactFs()
+                await afs.commit(state, programHash, opt?.useTests ? true : undefined)
+                await getFs().deleteFile(path.resolve(deploymentDir, 'state.log'))
             }
         }
 
-        if (state) {
-            const stateDest = path.resolve(deploymentDir, 'state.json')
-            await getFs().writeFile(stateDest, JSON.stringify(state))
-            try {
-                await session.setState(stateDest)
-            } finally {
-                await getFs().deleteFile(stateDest)
-            }
+        const stateDest = path.resolve(deploymentDir, 'state.json')
+        await getFs().writeFile(stateDest, JSON.stringify(state))
+        try {
+            await session.setState(stateDest)
+        } finally {
+            await getFs().deleteFile(stateDest)
+        }
 
-            if (opt?.loadRegistry) {
-                await getServiceRegistry().loadFromState(ctx, state)
-            }
+        if (opt?.loadRegistry) {
+            await getServiceRegistry().loadFromState(ctx, state)
         }
 
         if (!noSave) {
             ensurePersister()
         }
-
-        await Promise.all(promises)
 
         return state
     }

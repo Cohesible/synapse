@@ -312,10 +312,10 @@ function typeToSchema(typeChecker: ts.TypeChecker, typeOrNode: ts.Type | ts.Type
         const required: string[] = []
     
         for (const prop of symbols) {
-            if (!prop.valueDeclaration) {
-                throw new Error(`Symbol "${prop.name}" does not have a value declaration`)
-            }
-            const propType = typeChecker.getTypeOfSymbolAtLocation(prop, prop.valueDeclaration)
+            const propType = prop.valueDeclaration 
+                ? typeChecker.getTypeOfSymbolAtLocation(prop, prop.valueDeclaration)
+                : typeChecker.getTypeOfSymbol(prop)
+
             const nonNullableType = propType.getNonNullableType()
             properties[prop.name] = typeToSchema(typeChecker, nonNullableType)
     
@@ -360,6 +360,10 @@ function typeToSchema(typeChecker: ts.TypeChecker, typeOrNode: ts.Type | ts.Type
                 // Assume return type position
                 return typeToSchema(typeChecker, args[0])
             }
+        }
+
+        if ((type.flags & ts.TypeFlags.Object)) {
+            return convertSymbols(typeChecker.getPropertiesOfType(type))
         }
     } else if (ts.isArrayTypeNode(typeNode)) {
         const args = typeChecker.getTypeArguments(type as ts.TypeReference)

@@ -2626,8 +2626,8 @@ export function createTempMountedFs(
 
     function getDiskPath(fileName: string) {
         try {
-            const pointer = bfs.getPointer(fileName)
-            
+            const pointer = isDataPointer(fileName) ? fileName : bfs.getPointer(fileName)
+
             return bfs.resolveArtifact(pointer, { sync: true })
         } catch(e) {
             throwIfNotFileNotFoundError(e)

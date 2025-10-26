@@ -1,5 +1,6 @@
 //@internal
 //# moduleId = synapse:validation
+//# transform = persist
 // TODO: turn this into a 'reify' lib
 
 type PrimitiveType = 'null' | 'boolean' | 'object' | 'array' | 'number' | 'string' // | 'integer'

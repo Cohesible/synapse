@@ -91,8 +91,8 @@ if (isSea) {
 export function main(...args: string[]) {
     // Check if node-like options were passed
     const arg0 = args[0]
-    if (arg0?.startsWith('--')) {
-        if (arg0 === '--version') {
+    if (arg0?.[0] === '-') {
+        if (arg0 === '-v' || arg0 === '--version') {
             const version = getCurrentVersion()
             if (args[1] === '--json') {
                 process.stdout.write(JSON.stringify(version, undefined, 4) + '\n')
@@ -104,19 +104,21 @@ export function main(...args: string[]) {
             return
         }
 
-        const nodeOpt: Record<string, string | boolean> = {}
-        while (args.length && args[0].startsWith('--')) {
-            const opt = args.shift()!.slice(2)
-            nodeOpt[opt] = true
-        }
+        if (arg0[1] === '-') {
+            const nodeOpt: Record<string, string | boolean> = {}
+            while (args.length && args[0].startsWith('--')) {
+                const opt = args.shift()!.slice(2)
+                nodeOpt[opt] = true
+            }
 
-        if (nodeOpt['inspect']) {
-            const inspector = require('node:inspector') as typeof import('node:inspector')
-            inspector.open()
-            inspector.waitForDebugger()
-        }
+            if (nodeOpt['inspect']) {
+                const inspector = require('node:inspector') as typeof import('node:inspector')
+                inspector.open()
+                inspector.waitForDebugger()
+            }
 
-        return main(...args)
+            return main(...args)
+        }
     }
 
     if (process.env['SYNAPSE_USE_DEV_LOADER'] && isSea) {

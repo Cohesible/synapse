@@ -3,7 +3,6 @@
 
 import type { Schema, TypedObjectSchema, TypedArraySchema, TypedStringSchema, TypedNumberSchema } from 'synapse:validation'
 
-
 export declare function schema(): never
 export declare function schema<const T extends any[]>(): TypedArraySchema<T>
 export declare function schema<const T extends object>(): TypedObjectSchema<T>

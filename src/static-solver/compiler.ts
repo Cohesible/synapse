@@ -3,7 +3,7 @@ import { SourceMapHost, createVariableStatement, emitChunk, extract, failOnNode,
 import { isAssignmentExpression, Symbol, Scope, createGraphOmitGlobal, getContainingScope, unwrapScope, getSubscopeDfs, getReferencesInScope, getRootSymbol, RootScope, createGraph, getSubscopeContaining, getImmediatelyCapturedSymbols, getRootAndSuccessorSymbol, printSymbol } from './scopes'
 import { createLiteral, createObjectLiteral, createPropertyAssignment, createSymbolPropertyName, createSyntheticComment, hashNode, memoize, removeModifiers } from '../utils'
 import { SourceMapV3 } from '../runtime/sourceMaps'
-import { liftScope } from './scopes'
+import { getScopeEnvironment } from './scopes'
 import { ResourceTypeChecker } from '../compiler/resourceGraph'
 import { throwIfCancelled, CancelError } from '../execution'
 
@@ -1102,7 +1102,6 @@ const replacementStacks = new Map<Symbol, ts.Expression[]>()
 function rewriteCapturedSymbols(
     scope: Scope, 
     captured: Symbol[], 
-    globals: Symbol[],
     circularRefs: Set<Symbol>,
     runtimeTransformer?: (node: ts.Node) => ts.Node,
     infraTransformer?: (node: ts.Node, depth: number) => ts.Node,
@@ -1113,7 +1112,7 @@ function rewriteCapturedSymbols(
     const isMethod = ts.isMethodDeclaration(inner)
 
     const refs = new Map<Symbol, ts.Node[]>(
-        [...captured, ...globals].map(c => [c, getReferencesInScope(c, scope)]),
+        captured.map(c => [c, getReferencesInScope(c, scope)]),
     )
 
     // Any symbol that is reassigned cannot be directly replaced
@@ -1207,13 +1206,15 @@ function rewriteCapturedSymbols(
             }
 
             const bindings = importClause.namedBindings
-            if (!bindings) {
+            if (!bindings || !ts.isNamespaceImport(bindings)) {
                 reduced.set(root, getReferencesInScope(root, scope))
 
                 continue
             }
 
-            if (!ts.isNamespaceImport(bindings)) {
+            // XXX: do not reduce built-in modules
+            const spec = importClause.parent.moduleSpecifier as ts.StringLiteral
+            if (spec.text.startsWith('node:')) {
                 reduced.set(root, getReferencesInScope(root, scope))
 
                 continue
@@ -1716,7 +1717,7 @@ export function createGraphCompiler(
             failOnNode('Got source file graph', node)
         }
 
-        const { captured } = liftScope(targetGraph)
+        const { captured } = getScopeEnvironment(targetGraph)
 
         return captured
     }
@@ -1725,7 +1726,7 @@ export function createGraphCompiler(
         return getAllDependencies(nextSymbol).has(currentSymbol)
     }
 
-    function liftNode(
+    function lowerNode(
         node: ts.Node, 
         factory: ts.NodeFactory, 
         runtimeTransformer?: (node: ts.Node) => ts.Node,
@@ -1747,23 +1748,20 @@ export function createGraphCompiler(
             failOnNode('Got source file graph', node)
         }
 
-        const { globals, captured } = liftScope(
+        const res = getScopeEnvironment(
             targetGraph, 
-            [], // ['console']
             excluded.map(n => ts.getOriginalNode(n)).map(n => getSubscopeDfs(graph, n)!)
         )
 
-        // process.stdout.write(`${globals.length}, ${captured.length}\n`)
         const extracted: ts.Node[] = []
 
         const circularRefs = !targetGraph.symbol 
             ? new Set<Symbol>() 
-            : new Set(captured.filter(s => isCircularReference(targetGraph.symbol!, s)))
+            : new Set(res.captured.filter(s => isCircularReference(targetGraph.symbol!, s)))
 
         const rewritten = rewriteCapturedSymbols(
             targetGraph,
-            captured,
-            globals,
+            res.captured,
             circularRefs,
             runtimeTransformer,
             infraTransformer,
@@ -1913,7 +1911,7 @@ export function createGraphCompiler(
         }
 
         function doCompile() {
-            const { extracted, extractedInfra, parameters, assets } = liftNode(node, factory, runtimeTransformer, infraTransformer, clauseReplacement, jsxRuntime, excluded, depth)
+            const { extracted, extractedInfra, parameters, assets } = lowerNode(node, factory, runtimeTransformer, infraTransformer, clauseReplacement, jsxRuntime, excluded, depth)
             const outfile = sourceFile.fileName.replace(/\.(t|j)(sx?)$/, `-${name}.$1$2`)
 
             const result = emitChunk(sourceMapHost, sourceFile, extracted as ts.Statement[], { emitSourceMap }) 
@@ -1939,7 +1937,7 @@ export function createGraphCompiler(
         }
     }
 
-    return { getSymbol, getJsxRuntime, liftNode, compileNode, compiled, onEmitFile, isDeclared, getAllDependencies, getCaptured2, moduleType }
+    return { getSymbol, getJsxRuntime, compileNode, compiled, onEmitFile, isDeclared, getAllDependencies, getCaptured2, moduleType }
 }
 
 interface StatementUpdate {

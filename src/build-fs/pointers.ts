@@ -13,7 +13,7 @@ export type DataPointer = string & {
 }
 
 export function isDataPointer(h: string): h is DataPointer {
-    return typeof h === 'object' && !!h && pointerSymbol in h
+    return typeof h === 'object' && h !== null && pointerSymbol in h
 }
 
 // This version only beats `startsWith` after ~100k calls

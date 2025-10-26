@@ -558,44 +558,6 @@ export async function startTerraformSession(
 
     await waitForReady()
 
-    const init = async () => {
-        isReady = false
-        await write(`${['init'].join(' ')}\n`)
-
-        return waitForReady()
-    }
-
-    async function needsInit() {
-        const tfDir = path.dirname(templateFile)
-        const cacheDir = getProviderCacheDir()
-        const stateFile = path.resolve(tfDir, '.terraform', 'terraform.tfstate')
-
-        const [hasPluginCache, hasLockFile, hasStateFile] = await Promise.all([
-            getFs().fileExists(cacheDir),
-            lockFileExists(tfDir),
-            getFs().fileExists(stateFile),
-        ])
-
-        if (!hasPluginCache) {
-            await fs.mkdir(cacheDir, { recursive: true })
-            if (hasStateFile) {
-                getLogger().warn(`Provider cache is missing but state file exists. Deleting previously installed providers.`)
-                await getFs().deleteFile(path.dirname(stateFile))
-            }
-
-            return true
-        }
-
-        return !hasLockFile || !hasStateFile
-    }
-
-    await runTask('init', 'terraform', async () => {
-        if (await needsInit()) {
-            getLogger().log(`Initializing providers`)
-            await init()
-        } 
-    }, 10)
-
     return {
         apply: async (opt?: DeployOptions) => {
             isReady = false

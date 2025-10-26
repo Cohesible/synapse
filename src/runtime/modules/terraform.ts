@@ -1307,7 +1307,7 @@ function emitTerraformJson(
             if (!tfJson.terraform.required_providers[element.type]) {
                 tfJson.terraform.required_providers[element.type] = { 
                     source: element.source,
-                    // version?
+                    version: element.version,
                 }
             }
         }

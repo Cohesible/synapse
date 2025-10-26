@@ -9,6 +9,7 @@ import { pushDisposable } from '../execution'
 // Determines what's needed in `package.json` based on module specifiers
 // TODO: skip adding types entirely when running in "script mode"
 // FIXME: we need to add the core `synapse` package if _any_ file is requires "synapse" compilation
+// FIXME: this can cause issues when referencing transitive packages (it breaks `synapse-react` when using `react` in a dependent)
 export async function getNeededDependencies(deps: Set<string>, pkg: PackageJson, synapseConfig?: SynapseConfiguration) {
     const dependencies: Record<string, string> = {}
     const devDependencies: Record<string, string> = {}
@@ -62,7 +63,6 @@ export async function getNeededDependencies(deps: Set<string>, pkg: PackageJson,
             devDependencies[`@cohesible/${name}`] = `spr:#${name}`
         } else {
             // TODO: parallelize or defer by writing `latest` to version constraint
-            // TODO: this can cause issues when referencing transitive packages
             const latest = await getLatestVersion(nameWithScope).catch(err => {
                 getLogger().warn(`Failed to resolve specifier "${spec}"`, err)
             })

@@ -1265,20 +1265,16 @@ export function isAssignmentExpression(node: ts.BinaryExpression) {
 // Transforms a graph into a function declaration that passes in captured symbols by argument
 // Function/class declarations are placed inside, and stateful declarations are made into arguments
 
-export function liftScope(scope: Scope, capturedGlobals?: string[], excluded: Scope[] = []) {
+export function getScopeEnvironment(scope: Scope, excluded: Scope[] = []) {
     const capturedSymbols = new Set<Symbol>()
-    const globals = new Set<Symbol>()
+    // const globals = new Set<Symbol>()
 
     const captured = getImmediatelyCapturedSymbols(scope, excluded)
     for (const c of captured) {
         const rootSym = getRootSymbol(c)
         const val = rootSym.declaration
         if (val === undefined) {
-            if (capturedGlobals && capturedGlobals.includes(rootSym.name)) {
-                globals.add(rootSym)
-            } else {
-                // outerScopes.add(rootScope)
-            }
+            // globals.add(rootSym)
             continue
         }
 
@@ -1286,7 +1282,7 @@ export function liftScope(scope: Scope, capturedGlobals?: string[], excluded: Sc
     }
 
     return { 
-        globals: Array.from(globals),
+        // globals: Array.from(globals),
         captured: Array.from(capturedSymbols), 
     }
 }

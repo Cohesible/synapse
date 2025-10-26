@@ -1,5 +1,5 @@
 import ts from 'typescript'
-import { type Symbol, createGraph, getContainingScope, liftScope } from './static-solver/scopes'
+import { type Symbol, createGraph, getContainingScope, getScopeEnvironment } from './static-solver/scopes'
 import { getNullTransformationContext, printNodes, toSnakeCase } from './utils'
 import type { ExternalValue, ResourceValue, SerializedObject } from './runtime/modules/serdes'
 import { isDataPointer } from './build-fs/pointers'
@@ -79,7 +79,7 @@ function pruneClassInitializers(sf: ts.SourceFile) {
         throw new Error(`Missing symbol for node: ${classDecl.name?.getText()}`)
     }
     const scope = getContainingScope(sym)
-    const res = liftScope(scope)
+    const res = getScopeEnvironment(scope)
 
     const newCaptured = res.captured
     const captured = closure.parameters

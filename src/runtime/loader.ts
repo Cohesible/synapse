@@ -165,7 +165,11 @@ function createDefaultDataRepo(fs: Pick<SyncFs, 'readFileSync'>, dataDir: string
         return m
     }
 
-    return { getDataSync, getMetadata }
+    function getDiskPath(fileName: string) {
+        return getObjectPath(dataDir, fileName)
+    }
+
+    return { getDataSync, getMetadata, getDiskPath }
 }
 
 export function hydratePointers(repo: BasicDataRepository, id: DataPointer) {
@@ -1032,6 +1036,8 @@ export function createModuleLoader(
                 return wrapFsPromises(require(id), dataRepository)
             case 'node:child_process':
                 return wrapChildProcess(require(id))
+            case 'node:worker_threads':
+                return wrapWorkerThreads(require(id), dataRepository)
         }
 
         return require(id)
@@ -1852,6 +1858,19 @@ function wrapPath(path: typeof import('node:path')): typeof import('node:path') 
     }
 
     return createModuleWrap(path, overrides)
+}
+
+function wrapWorkerThreads(worker_threads: typeof import('node:worker_threads'), repo: BasicDataRepository): typeof import('node:worker_threads') {
+    class Worker extends worker_threads.Worker {
+        constructor(...args: any[]) {
+            const arg0 = isDataPointer(args[0]) 
+                ? repo.getDiskPath?.(args[0]) ?? args[0] 
+                : args[0]
+            super(arg0, ...args.slice(1))
+        }
+    }
+
+    return createModuleWrap(worker_threads, { Worker })
 }
 
 function wrapFsPromises(fs: typeof import('node:fs/promises'), repo: BasicDataRepository): typeof import('node:fs/promises') {
